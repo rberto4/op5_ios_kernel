@@ -179,3 +179,18 @@ pass `sweetrtc_offset=<UTC - counter>`, measured in TWRP from `/sys/class/rtc/rt
 (`date -u +%s` on the host at the same moment). Measured 1694365716 here. Result: correct date and
 time on the lock screen; log line `SWEET RTC: apid=0x5a counter=99810261 offset=1694365716 -> UTC 1794175977`.
 `setGMTTimeOfDay` only moves the offset in RAM, so it is lost at reboot.
+
+## Battery and charging (patch 0091, tested 2026-11-08)
+
+`SweetBattery` reads the PMI8998 (SID 2) over SPMI v3 observer channels, read only: fuel-gauge
+monotonic SOC (0x4009 + shadow 0x400a), VBATT 0x41a0, IBATT 0x41a2, BATT_TEMP 0x4150, SMB2 charger
+state 0x1006/0x1007, USBIN plug-in 0x1310 and power path 0x160b. Terminate or inhibit with a cable
+attached counts as full. Result: real percentage that falls on battery and rises with the green
+charging icon on cable. OnePlus's Android shows the bq27541's SOC (I2C 0x55 on BLSP2 QUP1), which
+can differ by a few percent near full; not used. `sweetbattery=0` restores the static source.
+
+Display Zoom is not supported: with it, backboardd renders 640x1136 and needs AppleM2ScalerCSCDriver,
+so the screen stays black. It is stored in
+`/private/var/mobile/Library/Preferences/com.apple.iokit.IOMobileGraphicsFamily.plist`
+(`canvas_width`/`canvas_height`; 750x1334 = standard). Never write inside `root.img` with TWRP's
+`dd`: it has no `conv=notrunc` and truncates the output file.
