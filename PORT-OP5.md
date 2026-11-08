@@ -116,7 +116,44 @@ Rules: never move, copy over, truncate or defragment `root.img` from Android (it
 
 Other ways, not recommended: shrinking `userdata` (f2fs cannot shrink, and full-disk encryption keeps a footer at the end), or a USB stick over OTG (needs a USB host driver first; topaz-woa has one to port later).
 
+## Probe results on a second unit (2026-11-08)
+
+A second A5000 (6 GB, stock OxygenOS 10.0.1, bootloader unlocked) ran the stage 0 probe
+(`shim/out/shim-boot.img`, default build, built on macOS with Homebrew `aarch64-elf-gcc` 16.2).
+Observed (photos, not in git):
+
+- Display: text from the top edge, no shift: splash at `0x9d400000` (ABL patches the
+  `splash_region@9d600000` node to base `0x9D400000`, size `0x2400000`).
+- CPU: Silver MIDR `0x51AF8014` MMFR0 `0x1122` (tg16 0); Gold MIDR `0x51AF8001` MMFR0
+  `0x101122` (tg16 1). Gold hand-off, GIC (vtimer, SGI1 10/10, GICR 0x101-0x103) OK. Page 1/4
+  (per-core table) was not photographed.
+- Clocks: both OSMs disabled; silver PLL L `0x51`, gold PLL L `0x20`, both locked; gold RCG
+  switch to GPLL0 / gold PLL works (ticks `0x753008` / `0x7270E2`).
+- ABL passes the v0 ramdisk: INITRD `0x455FE000`-`0x455FE065` (the 101-byte probe ramdisk).
+- RAM: `<0x40000000 0xC0000000>`, `<0x1_00000000 0xBD8C0000>` (6 GB), same as the first unit;
+  all carve-outs below 4 GB.
+- PMIC: SPMI v3, PM8998 (REVID type `0x51` sub `0x14` rev4 `0x02`); vol-/vol+ GPIO5/6 st1
+  `0x81` idle. Key presses were not captured by the live view. BLSP1/QUP5 clocks off, TLMM
+  87/88/89/125 func 0. The L28/L6 lines use SID 0 PPIDs and do not reflect the touch rails.
+- UFS: UFSHCI `0x210`, cap `0x1587001F`, HCE 1, HCS `0x10F`; TUR/READ CAPACITY/READ rc 0;
+  LUN0 last LBA `0xD7D7FF`; GPT 32 entries; userdata LBA `0x14F40`, 54920 MiB, ext4.
+- After the last page this unit booted Android instead of fastboot: its ABL (OOS 10.0.1)
+  ignores the `0x77665500` IMEM restart reason. Re-enter fastboot with power + vol up.
+
+Every measured value matches the first unit.
+
+Stage 1 on the same unit (2026-11-08, video): kernel `kernel-run40186605448` (0089, sha256
+`66f2a902...`), `mkadt.py --highmem`, boot-args `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress
+rd=ufsroot0 wdt=-1 wdt_test=no_user_checkin sweetlog=0 sweettouch=0` (UFS read-only, touch and its
+RPM rail votes off). XNU came up on gold `0x100` (`1/1 CPUs initialized`), AppleCLCD 1080x1920
+at `0x9d400000` presented as 750x1334, `SWEET UFS: "userdata" ... 54920 MiB, read-only`, `SWEET
+KEYS` started (arb `0x30000000`, vol-/vol+ `0x81`), then `BSD root: ufsroot0` and the expected
+`unknown Volume Signature : 20a5` / `mount(N) failed` loop (43 retries, no panic).
+
 ## Open questions the probe answers
+
+All answered on 2026-10-23 (first unit) and confirmed on 2026-11-08 (second unit), see above
+and NOTES.md.
 
 - Gold `TGran16` (page 1 VERDICT); Silver too (if yes, all 8 cores could run).
 - Does the command-mode panel show CPU writes (any page visible at all), and is `0x9d400000` the right base (the OnePlus kernel's own DT says `0x9d600000`; text shifted up by about 485 rows would mean that one)?
