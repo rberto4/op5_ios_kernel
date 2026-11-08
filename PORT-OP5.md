@@ -170,3 +170,12 @@ and NOTES.md.
 - Touch rails and I2C clocks left on by ABL, page 3.
 - Gold clock after PSCI `CPU_ON` (`SPEED` line, `~MHz` on page 1, rough: it assumes one add per cycle).
 - UFS host state as ABL leaves it, page 4.
+
+## RTC (patch 0090, tested 2026-11-08)
+
+`SweetPlatformExpert` reads the PM8998 RTC (PPID 0x060, APID 0x5a on this unit) through the SPMI
+arbiter v3 observer channel, read only, and publishes `IORTC`. The counter is not wall-clock time:
+pass `sweetrtc_offset=<UTC - counter>`, measured in TWRP from `/sys/class/rtc/rtc0/since_epoch`
+(`date -u +%s` on the host at the same moment). Measured 1694365716 here. Result: correct date and
+time on the lock screen; log line `SWEET RTC: apid=0x5a counter=99810261 offset=1694365716 -> UTC 1794175977`.
+`setGMTTimeOfDay` only moves the offset in RAM, so it is lost at reboot.
