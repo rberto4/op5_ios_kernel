@@ -1,0 +1,21 @@
+name: runner-probe
+
+# Lists the Xcode versions on GitHub's macOS runners (which one still has an
+# Xcode 15 iig for xnu-8796, see xnu.yml).
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: |
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          for x in /Applications/Xcode*.app; do
+            echo "== $x"; DEVELOPER_DIR=$x/Contents/Developer xcodebuild -version | head -1
+          done
