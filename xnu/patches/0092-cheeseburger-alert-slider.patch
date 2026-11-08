@@ -1,0 +1,212 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index ae23c28..e6d8d76 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -11,6 +11,14 @@
+  * Home button (HID consumer Menu).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ *
++ * Alert slider (OnePlus tri-state key, polled on the same thread): TLMM
++ * EAST tile GPIO40 = top (mute), GPIO42 = middle (do not disturb), GPIO26
++ * = bottom (ring), active low, exactly one low at rest (OnePlus
++ * tri_state_key.c). The pins are only read (GPIO_IN_OUT bit 0); their
++ * config is logged, never written. A position counts after 5 identical
++ * polls (100 ms; the contacts bounce). iPhone ringer switch: top and
++ * middle = silent, bottom = ring; sweetslider=0 disables it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -23,6 +31,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern int sweet_hid_ringer(int silent);  /* clients reached */
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0800f000u
+@@ -34,6 +43,8 @@ void sweet_keys_init(void);
+ #define KEYS_VOLDN_ST1   0xc408u        /* PM8998 GPIO5 STATUS1 */
+ #define KEYS_VOLUP_ST1   0xc508u        /* PM8998 GPIO6 STATUS1 */
+ #define KEYS_NO_APID     0xffffu
++#define SLIDER_EAST_PA   0x03d00000u    /* TLMM 0x3400000 + EAST 0x900000 */
++#define SLIDER_STABLE    5u
+ 
+ /* sweet_hid_key() index: Power, VolumeIncrement, VolumeDecrement, Menu */
+ enum { KEY_POWER, KEY_VOLUP, KEY_VOLDN, KEY_HOME, KEY_COUNT };
+@@ -45,6 +56,72 @@ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
++/* Slider pins top, middle, bottom; one mapped TLMM page each. */
++static const unsigned slider_pin[3] = { 40, 42, 26 };
++static vm_offset_t slider_io[3];
++static bool slider_on;
++
++static void
++slider_init(void)
++{
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetslider", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET SLIDER: disabled (sweetslider=0)\n");
++		return;
++	}
++	for (int i = 0; i < 3; ++i) {
++		slider_io[i] = ml_io_map(SLIDER_EAST_PA + 0x1000u * slider_pin[i], 0x1000);
++		if (!slider_io[i]) {
++			printf("SWEET SLIDER: MMIO mapping failed\n");
++			return;
++		}
++	}
++	slider_on = true;
++	printf("SWEET SLIDER: gpio40 cfg=%#x io=%#x gpio42 cfg=%#x io=%#x gpio26 cfg=%#x io=%#x\n",
++	    keys_rd(slider_io[0], 0), keys_rd(slider_io[0], 4),
++	    keys_rd(slider_io[1], 0), keys_rd(slider_io[1], 4),
++	    keys_rd(slider_io[2], 0), keys_rd(slider_io[2], 4));
++}
++
++/* 0 top, 1 middle, 2 bottom; -1 while moving or not exactly one pin low. */
++static int
++slider_read(void)
++{
++	int pos = -1;
++	for (int i = 0; i < 3; ++i) {
++		if (!(keys_rd(slider_io[i], 4) & 1u)) {
++			if (pos >= 0) {
++				return -1;
++			}
++			pos = i;
++		}
++	}
++	return pos;
++}
++
++static void
++slider_poll(int *reported, int *candidate, unsigned *count)
++{
++	static const char *const names[3] = { "top (mute)", "middle (do not disturb)", "bottom (ring)" };
++	int pos = slider_read();
++	if (pos < 0 || pos != *candidate) {
++		*candidate = pos;
++		*count = 0;
++		return;
++	}
++	if (++*count < SLIDER_STABLE || pos == *reported) {
++		return;
++	}
++	/* Until backboardd has opened the buttons service, retry every 100 ms. */
++	if (sweet_hid_ringer(pos != 2) <= 0) {
++		*count = 0;
++		return;
++	}
++	*reported = pos;
++	printf("SWEET SLIDER: %s -> ringer %s\n", names[pos], pos == 2 ? "on" : "silent");
++}
++
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -128,6 +205,8 @@ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[KEY_COUNT] = {0, 0, 0, 0};
++	int slider_reported = -1, slider_candidate = -1;
++	unsigned slider_count = 0;
+ 	bool chord = false;
+ 	unsigned errors = 0;
+ 	(void)arg;
+@@ -165,6 +244,9 @@ keys_thread(void *arg, wait_result_t result)
+ 			keys_report(state, KEY_VOLUP, vup);
+ 			keys_report(state, KEY_VOLDN, vdn);
+ 		}
++		if (slider_on) {
++			slider_poll(&slider_reported, &slider_candidate, &slider_count);
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -209,6 +291,7 @@ sweet_keys_init(void)
+ 	if (!pok && !dok && !uok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	slider_init();
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index aa6662d..bfa0c2b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -12,8 +12,8 @@
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
+  *
+- * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * Hardware drivers feed them through the C entry points sweet_hid_key(),
++ * sweet_hid_ringer() and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+@@ -330,6 +330,7 @@ class SweetHIDButtons : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	unsigned ringer(bool silent);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -409,6 +410,39 @@ SweetHIDButtons::key(UInt32 usage, bool down)
+ 	}
+ }
+ 
++/*
++ * Ring/silent switch: telephony page RingEnable, the usage IOHIDFamily's
++ * HIDButtonLoggingServiceFilter lists for the button that replaced the
++ * switch (Staccato). Key down = ringer on; sweetringerinv=1 swaps it.
++ * Returns the number of clients the event went to.
++ */
++#define SWEET_HID_PAGE_TELEPHONY  0x0b
++#define SWEET_HID_TFON_RINGENABLE 0x2d
++unsigned
++SweetHIDButtons::ringer(bool silent)
++{
++	static int inv = -1;
++	if (inv < 0) {
++		inv = 0;
++		(void)PE_parse_boot_argn("sweetringerinv", &inv, sizeof(inv));
++	}
++	unsigned clients = _clients ? _clients->getCount() : 0;
++	if (!clients) {
++		return 0;
++	}
++	bool down = !silent ^ (inv != 0);
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(),
++	    SWEET_HID_PAGE_TELEPHONY, SWEET_HID_TFON_RINGENABLE, down);
++	if (!event) {
++		return 0;
++	}
++	IOLog("SWEET HID: ringer %s (RingEnable %s, %u clients)\n", silent ? "silent" : "on",
++	    down ? "down" : "up", clients);
++	dispatchEvent(event);
++	event->release();
++	return clients;
++}
++
+ void
+ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -557,6 +591,12 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++extern "C" int
++sweet_hid_ringer(int silent)
++{
++	return gSweetButtons ? (int)gSweetButtons->ringer(silent != 0) : 0;
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
