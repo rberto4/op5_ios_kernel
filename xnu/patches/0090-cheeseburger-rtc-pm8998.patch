@@ -1,0 +1,233 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..64989fa 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -2,6 +2,8 @@
+  * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
+  * Uses XNU's normal platform, power-domain and nub initialization. Hardware
+  * interrupt and power-management services are supplied by separate drivers.
++ *
++ * cheeseburger: the time of day comes from the PM8998 RTC (see below).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -9,6 +11,10 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <pexpert/pexpert.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,10 +24,162 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * cheeseburger RTC: PM8998 RTC_RW (SID 0, peripheral 0x60, PPID 0x060),
++ * Linux rtc-pm8xxx "qcom,pm8941-rtc" layout: EN_CTL 0x46 bit 7 = running,
++ * RDATA0..3 at 0x48..0x4b = seconds, little endian. Read through the SPMI
++ * arbiter v3 observer channel of its APID, as sweet_keys.c does (core
++ * 0x800f000: APID map at +0x800, owners at cnfg 0x800a000 + 0x700, one
++ * 0x8000 observer page per APID at 0x9400000). PMIC access is READ ONLY:
++ * the only MMIO store issues EXT_READL on the observer channel.
++ *
++ * The counter is not wall-clock time on this phone (Android keeps the
++ * difference in its own time daemon's file), so the boot-arg
++ * sweetrtc_offset=<seconds> (UTC minus counter, measured from TWRP's
++ * /sys/class/rtc/rtc0/since_epoch) is added. setGMTTimeOfDay (e.g. network
++ * time) only moves that offset in RAM; nothing is written to the PMIC.
++ * Publishing IORTC also ends IOKitInitializeTime's 30 s wait for one.
++ * sweetrtc=0 disables all of it (calendar starts at 0 as before).
++ */
++#define RTC_CORE_PA     0x0800f000u
++#define RTC_OBS_PA      0x09400000u
++#define RTC_CNFG_PA     0x0800a000u
++#define RTC_OBS_STRIDE  0x8000u
++#define RTC_APIDS       512u
++#define RTC_PPID        0x060u
++#define RTC_EN_CTL      0x46u
++#define RTC_RDATA0      0x48u
++#define RTC_NO_APID     0xffffu
++
++static vm_offset_t rtc_obs;
++static IOLock *rtc_lock;
++static bool rtc_ok;
++static int64_t rtc_offset;
++
++static uint32_t
++rtc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++rtc_find_apid(vm_offset_t core, vm_offset_t cnfg, uint16_t ppid)
++{
++	uint16_t found = RTC_NO_APID;
++	for (uint32_t i = 0; i < RTC_APIDS; ++i) {
++		uint32_t map = rtc_rd(core, 0x800u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = rtc_rd(cnfg, 0x700u + 4u * i) & 7u;
++		if (found == RTC_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++rtc_read8(uint8_t addr, uint8_t *out)
++{
++	uint32_t cmd = (1u << 27) | ((uint32_t)addr << 4); /* EXT_READL, one byte */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)rtc_obs = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = rtc_rd(rtc_obs, 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)rtc_rd(rtc_obs, 0x18u);
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++/* Seconds counter; re-read when byte 0 rolled over in between (rtc-pm8xxx). */
++static bool
++rtc_read_counter(uint32_t *secs)
++{
++	uint8_t b[4], again;
++	for (int tries = 0; tries < 3; ++tries) {
++		for (int i = 0; i < 4; ++i) {
++			if (!rtc_read8((uint8_t)(RTC_RDATA0 + i), &b[i])) {
++				return false;
++			}
++		}
++		if (!rtc_read8(RTC_RDATA0, &again)) {
++			return false;
++		}
++		if (again == b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 |
++			    (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++rtc_init(void)
++{
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetrtc", &enabled, sizeof(enabled));
++	if (!enabled) {
++		IOLog("SWEET RTC: disabled (sweetrtc=0)\n");
++		return;
++	}
++	vm_offset_t core = ml_io_map(RTC_CORE_PA, 0x1000);
++	vm_offset_t cnfg = ml_io_map(RTC_CNFG_PA, 0x1000);
++	if (!core || !cnfg) {
++		IOLog("SWEET RTC: MMIO mapping failed\n");
++		return;
++	}
++	uint32_t version = rtc_rd(core, 0);
++	if (version < 0x30000000u || version >= 0x50000000u) {
++		IOLog("SWEET RTC: unsupported arbiter version=%#x (want v3)\n", version);
++		return;
++	}
++	uint16_t apid = rtc_find_apid(core, cnfg, RTC_PPID);
++	if (apid == RTC_NO_APID) {
++		IOLog("SWEET RTC: PPID %#x not in the APID map\n", RTC_PPID);
++		return;
++	}
++	rtc_obs = ml_io_map(RTC_OBS_PA + RTC_OBS_STRIDE * apid, 0x1000);
++	rtc_lock = IOLockAlloc();
++	if (!rtc_obs || !rtc_lock) {
++		IOLog("SWEET RTC: observer mapping or lock failed\n");
++		return;
++	}
++	uint8_t en = 0;
++	uint32_t counter = 0;
++	if (!rtc_read8(RTC_EN_CTL, &en) || !(en & 0x80u)) {
++		IOLog("SWEET RTC: apid=%#x EN_CTL=%#x: not running\n", apid, en);
++		return;
++	}
++	if (!rtc_read_counter(&counter)) {
++		IOLog("SWEET RTC: apid=%#x counter read failed\n", apid);
++		return;
++	}
++	long long offset = 0;
++	(void)PE_parse_boot_argn("sweetrtc_offset", &offset, sizeof(offset));
++	rtc_offset = offset;
++	rtc_ok = true;
++	IOLog("SWEET RTC: apid=%#x counter=%u offset=%lld -> UTC %lld\n",
++	    apid, counter, offset, (long long)counter + offset);
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,11 +187,45 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	rtc_init();
+ 	registerService();
++	if (rtc_ok) {
++		publishResource("IORTC", this);
++	}
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
+ 
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t counter = 0;
++	if (!rtc_ok) {
++		return 0;
++	}
++	IOLockLock(rtc_lock);
++	bool ok = rtc_read_counter(&counter);
++	int64_t offset = rtc_offset;
++	IOLockUnlock(rtc_lock);
++	return ok ? (long)((int64_t)counter + offset) : 0;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t counter = 0;
++	if (!rtc_ok) {
++		return;
++	}
++	IOLockLock(rtc_lock);
++	if (rtc_read_counter(&counter)) {
++		rtc_offset = (int64_t)secs - counter;
++	}
++	int64_t offset = rtc_offset;
++	IOLockUnlock(rtc_lock);
++	IOLog("SWEET RTC: time set to %ld (offset now %lld, PMIC untouched)\n", secs, (long long)offset);
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
