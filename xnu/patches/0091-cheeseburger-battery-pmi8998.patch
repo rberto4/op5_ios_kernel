@@ -154,7 +154,7 @@ index 1981490..4b4296a 100644
  			return 0;
  		}
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..34d4ffd 100644
+index 9969739..feba3ce 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -1,8 +1,12 @@
@@ -287,7 +287,7 @@ index 9969739..34d4ffd 100644
  			return false;
  		}
  		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
-@@ -183,67 +193,83 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+@@ -183,67 +193,84 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
  	return false;
  }
  
@@ -375,7 +375,8 @@ index 9969739..34d4ffd 100644
 +	unsigned state = charger & 7u;                          /* BATTERY_CHARGER_STATUS_1 */
 +	/* Trickle..taper charge; no battery OV/missing, not too hot or cold. */
 +	bool charging = capable && state <= 4 && !(error & 0x30u) && !(error & 0x03u);
-+	bool full = external && state == 5;                     /* TERMINATE_CHARGE */
++	/* TERMINATE_CHARGE, or INHIBIT_CHARGE (above the recharge threshold). */
++	bool full = external && (state == 5 || state == 6);
  	int ma = 0;
 -	uint8_t subtype;
  	uint16_t rawCurrent;
@@ -413,7 +414,7 @@ index 9969739..34d4ffd 100644
  }
  
  void
-@@ -262,7 +288,7 @@ SweetBattery::start(IOService *provider)
+@@ -262,7 +289,7 @@ SweetBattery::start(IOService *provider)
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
