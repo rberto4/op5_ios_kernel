@@ -150,6 +150,15 @@ at `0x9d400000` presented as 750x1334, `SWEET UFS: "userdata" ... 54920 MiB, rea
 KEYS` started (arb `0x30000000`, vol-/vol+ `0x81`), then `BSD root: ufsroot0` and the expected
 `unknown Volume Signature : 20a5` / `mount(N) failed` loop (43 retries, no panic).
 
+Stage 2 on the same unit (2026-11-08, videos): root image built on macOS with
+`tools/mkiosroot-macos.sh` (iPhone10,1 16.7.16 20H392, 16 GiB + 8 MiB, sha256 `c0a46efb...`),
+streamed into `/data/ios/root.img` from TWRP (`ioscont check` OK on OxygenOS 10 FBE; 137 extents),
+ADT `--highmem --container`, kernel 0089, boot-args as stage 2 with `cpus=4 sweetfb_hwscale=0`,
+gold at 614.4 MHz, touch on. Observed: `4/4 CPUs initialized`, Apple logo, iPhone 8 home screen,
+App Library; touch and volume keys work; the two default widgets stay white ("Waiting...").
+Note: `adb exec-in` dropped the last 51363 bytes of the 16 GiB stream (all zero); always check
+size and sha256 on the phone after the copy.
+
 ## Open questions the probe answers
 
 All answered on 2026-10-23 (first unit) and confirmed on 2026-11-08 (second unit), see above
