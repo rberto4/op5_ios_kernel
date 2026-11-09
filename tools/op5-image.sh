@@ -11,7 +11,8 @@
 #           `ioscont map` and research/ipsw-8/d20ap.adt; cpus=4, writable
 #           container, sweetfb_hwscale=0
 #
-# Environment: CPUS (stage2, default 4), GOLD_L / GOLD_MV (passed to
+# Environment: CPUS (stage2, default 4), RTC_OFFSET (stage2, PM8998 RTC
+# counter -> UTC seconds, measured in TWRP; NOTES-OP5.md "Test RTC 0090"), GOLD_L / GOLD_MV (passed to
 # shim/build.sh), PATH must provide the aarch64-linux-gnu-* tools and
 # mkbootimg (see NOTES-OP5.md: toolbin/), UNPACK = AOSP unpack_bootimg.py
 # for the check (skipped when unset).
@@ -33,7 +34,7 @@ stage2)
 	[[ -f research/root.map ]] || { echo "research/root.map missing (ioscont map)" >&2; exit 1; }
 	[[ -f research/ipsw-8/d20ap.adt ]] || { echo "research/ipsw-8/d20ap.adt missing" >&2; exit 1; }
 	adt_args=(--highmem --container research/root.map)
-	args="cpus=${CPUS:-4} debug=0xc serial=3 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_hwscale=0"
+	args="cpus=${CPUS:-4} debug=0xc serial=3 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_hwscale=0 sweetrtc_offset=${RTC_OFFSET:-1694365716}"
 	;;
 *)
 	echo "stage must be stage1 or stage2" >&2; exit 2

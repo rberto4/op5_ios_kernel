@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -331,6 +331,8 @@
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
+ 	unsigned ringer(bool silent);
++private:
++	void addRingerUsagePair();
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -391,6 +393,7 @@
+ 			fTest->setTimeoutMS(fTestSecs * 1000);
+ 		}
+ 	}
++	addRingerUsagePair();
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -411,13 +414,40 @@
+ }
+ 
+ /*
+- * Ring/silent switch: telephony page RingEnable, the usage IOHIDFamily's
+- * HIDButtonLoggingServiceFilter lists for the button that replaced the
+- * switch (Staccato). Key down = ringer on; sweetringerinv=1 swaps it.
++ * Ring/silent switch: telephony page Phone Mute (0x0b/0x2e), the usage
++ * the iPhone 8 kernel's AppleM68Buttons registers for its "ringerab"
++ * button (RingEnable 0x2d is the Staccato button). Key down = silent;
++ * sweetringerinv=1 swaps it.
+  * Returns the number of clients the event went to.
+  */
+ #define SWEET_HID_PAGE_TELEPHONY  0x0b
+-#define SWEET_HID_TFON_RINGENABLE 0x2d
++#define SWEET_HID_TFON_PHONEMUTE  0x2e
++/*
++ * Advertise the ringer usage next to the consumer pair, as AppleM68Buttons
++ * does, so HID filters matching DeviceUsagePairs see the switch.
++ */
++void
++SweetHIDButtons::addRingerUsagePair()
++{
++	OSArray *old = OSDynamicCast(OSArray, getProperty(kIOHIDDeviceUsagePairsKey));
++	OSArray *pairs = old ? OSArray::withArray(old, old->getCount() + 1) : OSArray::withCapacity(1);
++	OSDictionary *pair = OSDictionary::withCapacity(2);
++	OSNumber *page = OSNumber::withNumber(SWEET_HID_PAGE_TELEPHONY, 32);
++	OSNumber *usage = OSNumber::withNumber(SWEET_HID_TFON_PHONEMUTE, 32);
++	if (pairs && pair && page && usage) {
++		pair->setObject(kIOHIDDeviceUsagePageKey, page);
++		pair->setObject(kIOHIDDeviceUsageKey, usage);
++		pairs->setObject(pair);
++		setProperty(kIOHIDDeviceUsagePairsKey, pairs);
++	} else {
++		IOLog("SWEET HID: ringer usage pair not added (no memory)\n");
++	}
++	OSSafeReleaseNULL(pairs);
++	OSSafeReleaseNULL(pair);
++	OSSafeReleaseNULL(page);
++	OSSafeReleaseNULL(usage);
++}
++
+ unsigned
+ SweetHIDButtons::ringer(bool silent)
+ {
+@@ -430,13 +460,13 @@
+ 	if (!clients) {
+ 		return 0;
+ 	}
+-	bool down = !silent ^ (inv != 0);
++	bool down = silent ^ (inv != 0);
+ 	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(),
+-	    SWEET_HID_PAGE_TELEPHONY, SWEET_HID_TFON_RINGENABLE, down);
++	    SWEET_HID_PAGE_TELEPHONY, SWEET_HID_TFON_PHONEMUTE, down);
+ 	if (!event) {
+ 		return 0;
+ 	}
+-	IOLog("SWEET HID: ringer %s (RingEnable %s, %u clients)\n", silent ? "silent" : "on",
++	IOLog("SWEET HID: ringer %s (PhoneMute %s, %u clients)\n", silent ? "silent" : "on",
+ 	    down ? "down" : "up", clients);
+ 	dispatchEvent(event);
+ 	event->release();
