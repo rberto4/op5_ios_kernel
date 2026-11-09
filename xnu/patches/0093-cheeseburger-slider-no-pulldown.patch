@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,8 +15,11 @@
+  * Alert slider (OnePlus tri-state key, polled on the same thread): TLMM
+  * EAST tile GPIO40 = top (mute), GPIO42 = middle (do not disturb), GPIO26
+  * = bottom (ring), active low, exactly one low at rest (OnePlus
+- * tri_state_key.c). The pins are only read (GPIO_IN_OUT bit 0); their
+- * config is logged, never written. A position counts after 5 identical
++ * tri_state_key.c). The boot loader leaves the TLMM pull-down on, which
++ * beats the external pull-up (all three read 0), so init clears only the
++ * pull bits [1:0] of GPIO_CFG, as Android's bias-disable pinctrl does;
++ * function, drive and OE are kept. Otherwise the pins are only read
++ * (GPIO_IN_OUT bit 0). A position counts after 5 identical
+  * polls (100 ms; the contacts bounce). iPhone ringer switch: top and
+  * middle = silent, bottom = ring; sweetslider=0 disables it.
+  */
+@@ -45,6 +48,8 @@
+ #define KEYS_NO_APID     0xffffu
+ #define SLIDER_EAST_PA   0x03d00000u    /* TLMM 0x3400000 + EAST 0x900000 */
+ #define SLIDER_STABLE    5u
++#define SLIDER_PULL_MASK 0x3u           /* GPIO_CFG pull: 0 none, 1 down */
++#define SLIDER_RAW_LOGS  64u
+ 
+ /* sweet_hid_key() index: Power, VolumeIncrement, VolumeDecrement, Menu */
+ enum { KEY_POWER, KEY_VOLUP, KEY_VOLDN, KEY_HOME, KEY_COUNT };
+@@ -135,10 +140,23 @@
+ 		if (!slider_io[i]) {
+ 			printf("SWEET SLIDER: MMIO mapping failed\n");
+ 			return;
++		}
++	}
++	printf("SWEET SLIDER: before gpio40 cfg=%#x io=%#x gpio42 cfg=%#x io=%#x gpio26 cfg=%#x io=%#x\n",
++	    keys_rd(slider_io[0], 0), keys_rd(slider_io[0], 4),
++	    keys_rd(slider_io[1], 0), keys_rd(slider_io[1], 4),
++	    keys_rd(slider_io[2], 0), keys_rd(slider_io[2], 4));
++	for (int i = 0; i < 3; ++i) {
++		uint32_t cfg = keys_rd(slider_io[i], 0);
++		if (cfg & SLIDER_PULL_MASK) {
++			__asm__ volatile("dmb oshst" ::: "memory");
++			*(volatile uint32_t *)slider_io[i] = cfg & ~SLIDER_PULL_MASK;
++			__asm__ volatile("dsb osh" ::: "memory");
+ 		}
+ 	}
++	delay(1000);  /* let the external pull-ups charge the lines */
+ 	slider_on = true;
+-	printf("SWEET SLIDER: gpio40 cfg=%#x io=%#x gpio42 cfg=%#x io=%#x gpio26 cfg=%#x io=%#x\n",
++	printf("SWEET SLIDER: after  gpio40 cfg=%#x io=%#x gpio42 cfg=%#x io=%#x gpio26 cfg=%#x io=%#x\n",
+ 	    keys_rd(slider_io[0], 0), keys_rd(slider_io[0], 4),
+ 	    keys_rd(slider_io[1], 0), keys_rd(slider_io[1], 4),
+ 	    keys_rd(slider_io[2], 0), keys_rd(slider_io[2], 4));
+@@ -160,10 +178,28 @@
+ 	return pos;
+ }
+ 
++/* Raw pin levels as bits top|middle<<1|bottom<<2; changes are logged. */
+ static void
++slider_log_raw(void)
++{
++	static unsigned last = ~0u, logged;
++	unsigned raw = 0;
++	for (int i = 0; i < 3; ++i) {
++		raw |= (keys_rd(slider_io[i], 4) & 1u) << i;
++	}
++	if (raw != last && logged < SLIDER_RAW_LOGS) {
++		++logged;
++		printf("SWEET SLIDER: raw gpio40=%u gpio42=%u gpio26=%u\n",
++		    raw & 1u, (raw >> 1) & 1u, (raw >> 2) & 1u);
++	}
++	last = raw;
++}
++
++static void
+ slider_poll(int *reported, int *candidate, unsigned *count)
+ {
+ 	static const char *const names[3] = { "top (mute)", "middle (do not disturb)", "bottom (ring)" };
++	slider_log_raw();
+ 	int pos = slider_read();
+ 	if (pos < 0 || pos != *candidate) {
+ 		*candidate = pos;
