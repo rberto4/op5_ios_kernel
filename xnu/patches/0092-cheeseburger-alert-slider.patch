@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
-index ae23c28..e6d8d76 100644
+index ae23c28..3986f5b 100644
 --- a/bsd/dev/sweet_keys.c
 +++ b/bsd/dev/sweet_keys.c
 @@ -11,6 +11,14 @@
@@ -34,9 +34,9 @@ index ae23c28..e6d8d76 100644
  
  /* sweet_hid_key() index: Power, VolumeIncrement, VolumeDecrement, Menu */
  enum { KEY_POWER, KEY_VOLUP, KEY_VOLDN, KEY_HOME, KEY_COUNT };
-@@ -45,6 +56,72 @@ static uint32_t keys_version, keys_last_status;
- static bool keys_started;
- static int keys_sleep_chan;
+@@ -105,6 +116,72 @@ keys_read(vm_offset_t ch, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
  
 +/* Slider pins top, middle, bottom; one mapped TLMM page each. */
 +static const unsigned slider_pin[3] = { 40, 42, 26 };
@@ -104,8 +104,8 @@ index ae23c28..e6d8d76 100644
 +	printf("SWEET SLIDER: %s -> ringer %s\n", names[pos], pos == 2 ? "on" : "silent");
 +}
 +
- static uint32_t
- keys_rd(vm_offset_t base, uint32_t off)
+ static void
+ keys_wait(void)
  {
 @@ -128,6 +205,8 @@ static void
  keys_thread(void *arg, wait_result_t result)
