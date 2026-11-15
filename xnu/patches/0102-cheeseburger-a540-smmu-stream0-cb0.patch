@@ -1,0 +1,119 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -3,7 +3,7 @@
+  *
+  * Runs only on request, from a process (the GPU must already be powered by
+  * stage A, boot-arg sweetgpu=2):
+- *   sysctl kern.sweetgpu_stage=1   SMMU bypass, CP microcode, ME_INIT,
++ *   sysctl kern.sweetgpu_stage=1   SMMU stream 0 untranslated (=2: SMMU untouched), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -363,7 +363,6 @@ rb_flush_wait(const char *what)
+ #define SMMU_S2CR(i)    (0xc00u + 4u * (i))
+ #define SCR0_USFCFG     (1u << 10)
+ #define SMR_VALID       (1u << 31)
+-#define S2CR_BYPASS     (1u << 16)
+ 
+ static uint32_t
+ srd(uint32_t off)
+@@ -378,27 +377,39 @@ swr(uint32_t off, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++#define SMMU_CBAR(n)    (0x1000u + 4u * (n))
++#define SMMU_CB(n)      (0x8000u + 0x1000u * (n))
++#define CB_SCTLR        0x00u
++#define CB_FSR          0x58u
++#define CBAR_TYPE_S1    (1u << 16)      /* stage 1 context, stage 2 bypass */
++
+ /*
+- * Let the GPU reach physical memory untranslated. First sCR0.USFCFG = 0
+- * (unmatched streams bypass); if that write does not stick, SMR0 matching
+- * every stream id + S2CR0 type bypass. Each write is read back and logged.
++ * Let the GPU reach physical memory untranslated. On this phone the
++ * hypervisor filters the GPU SMMU global space: sCR0.USFCFG does not
++ * change, S2CR type "bypass" is forced to "fault" and SMRs with a wide
++ * mask are dropped (test 0101). What it accepts: SMR0 = valid, stream 0,
++ * mask 0 (the GPU's stream in the DT), S2CR0 = translate into CB0, CBAR0 =
++ * stage-1 context. With CB0 SCTLR.M = 0 the context bank does not
++ * translate, so GPU addresses are physical addresses.
+  */
+ static bool
+-smmu_bypass(void)
++smmu_setup(void)
+ {
+-	uint32_t before = srd(SMMU_SCR0);
+-	swr(SMMU_SCR0, before & ~SCR0_USFCFG);
+-	uint32_t after = srd(SMMU_SCR0);
+-	printf("SWEET GPU B: SMMU sCR0 0x%08x -> 0x%08x\n", before, after);
+-	if (!(after & SCR0_USFCFG)) {
++	uint32_t cr0 = srd(SMMU_SCR0);
++	swr(SMMU_SCR0, cr0 & ~SCR0_USFCFG);
++	if (!(srd(SMMU_SCR0) & SCR0_USFCFG)) {
++		printf("SWEET GPU B: SMMU sCR0 0x%08x -> 0x%08x (unmatched bypass)\n", cr0, srd(SMMU_SCR0));
+ 		return true;
+ 	}
+-	uint32_t s2cr = srd(SMMU_S2CR(0)), smr = srd(SMMU_SMR(0));
+-	swr(SMMU_S2CR(0), S2CR_BYPASS);
+-	swr(SMMU_SMR(0), SMR_VALID | (0x7fffu << 16));
+-	printf("SWEET GPU B: SMMU S2CR0 0x%08x -> 0x%08x, SMR0 0x%08x -> 0x%08x\n",
+-	    s2cr, srd(SMMU_S2CR(0)), smr, srd(SMMU_SMR(0)));
+-	return (srd(SMMU_SMR(0)) & SMR_VALID) && ((srd(SMMU_S2CR(0)) >> 16) & 3u) == 1u;
++	swr(SMMU_CB(0) + CB_SCTLR, 0);
++	swr(SMMU_CBAR(0), CBAR_TYPE_S1);
++	swr(SMMU_S2CR(0), 0);           /* translate, CBNDX 0 */
++	swr(SMMU_SMR(0), SMR_VALID);    /* stream 0, mask 0 */
++	uint32_t smr = srd(SMMU_SMR(0)), s2cr = srd(SMMU_S2CR(0)), cbar = srd(SMMU_CBAR(0));
++	uint32_t sctlr = srd(SMMU_CB(0) + CB_SCTLR);
++	printf("SWEET GPU B: SMMU sCR0 0x%08x fixed; SMR0 0x%08x S2CR0 0x%08x CBAR0 0x%08x CB0 SCTLR 0x%08x\n",
++	    cr0, smr, s2cr, cbar, sctlr);
++	return smr == SMR_VALID && s2cr == 0 && ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u);
+ }
+ 
+ /* ---- stage B ---- */
+@@ -459,7 +470,7 @@ hw_init(void)
+ }
+ 
+ static int
+-stage_b(void)
++stage_b(int mode)
+ {
+ 	if (!sweet_a540_powered()) {
+ 		printf("SWEET GPU B: GPU not powered (boot with sweetgpu=2)\n");
+@@ -479,8 +490,11 @@ stage_b(void)
+ 	}
+ 	printf("SWEET GPU B: DMA area 0x%llx (%u KiB)\n", dma_pa, (unsigned)(DMA_SIZE / 1024));
+ 
+-	/* 1. GPU SMMU bypass */
+-	if (!smmu_bypass()) {
++	/* 1. GPU SMMU: stream 0 untranslated (mode 2: keep what kern.sweetgpu_val set up) */
++	if (mode == 2) {
++		printf("SWEET GPU B: SMMU left as is: SMR0 0x%08x S2CR0 0x%08x CB0 SCTLR 0x%08x\n",
++		    srd(SMMU_SMR(0)), srd(SMMU_S2CR(0)), srd(SMMU_CB(0) + CB_SCTLR));
++	} else if (!smmu_setup()) {
+ 		return -3;
+ 	}
+ 
+@@ -554,6 +568,7 @@ stage_b(void)
+ 	printf("SWEET GPU B: scratch at 0x%llx = 0x%08x (%s)\n", target, got,
+ 	    got == 0xc0ffee01 ? "GPU WROTE IT" : "unchanged");
+ 	gpu_dump("end");
++	printf("SWEET GPU B: SMMU sGFSR 0x%08x CB0 FSR 0x%08x\n", srd(0x48), srd(SMMU_CB(0) + CB_FSR));
+ 	return got == 0xc0ffee01 ? 6 : -9;
+ }
+ 
+@@ -566,9 +581,9 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value == 1) {
+-		printf("SWEET GPU B: stage B requested by pid %d\n", proc_selfpid());
+-		stage_result = stage_b();
++	if (value == 1 || value == 2) {
++		printf("SWEET GPU B: stage B (mode %d) requested by pid %d\n", value, proc_selfpid());
++		stage_result = stage_b(value);
+ 		printf("SWEET GPU B: stage B result %d\n", stage_result);
+ 	}
+ 	return 0;
