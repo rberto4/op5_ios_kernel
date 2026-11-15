@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -56,6 +56,8 @@
+ 	{ "aggre-axi", 0x82024 },
+ 	{ "ahb2phy", 0x6a004 },
+ 	{ "clkref", 0x88008 },
++	{ "usb3-aux", 0x50000 },
++	{ "usb3-pipe", 0x50004 },
+ };
+ 
+ #define DWC3_PA                 0x0a800000
+@@ -144,6 +146,11 @@
+  * ep0.c).
+  */
+ #define GCTL            0xc110
++#define GUSB2PHYCFG     0xc200
++#define   U2_SUSPHY     (1u << 6)
++#define   U2_ENBLSLPM   (1u << 8)
++#define GUSB3PIPECTL    0xc2c0
++#define   U3_SUSPHY     (1u << 17)
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+@@ -270,7 +277,8 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	/* 20 ms (Linux waits up to 5000 polls of 1 us; be generous). */
++	for (int i = 0; i < 20000; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -282,7 +290,8 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	printf("SWEET USB: ep%u cmd 0x%x timeout (DEPCMD 0x%08x DSTS 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x)\n",
++	    ep, cmd & 0xf, dwc_rd(DEPCMD(ep)), dwc_rd(DSTS), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL));
+ 	return -1;
+ }
+ 
+@@ -830,17 +839,42 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+-		return;
++	/*
++	 * cheeseburger: after a core soft reset the DWC3 3.00a timed out on the
++	 * first endpoint command (0096). Default now: no soft reset, only stop
++	 * the device controller ABL left configured (sweetusbrst=1 restores the
++	 * reset). The USB3 PHY is not used (high speed only, its pipe clock may
++	 * be off), so it may suspend (U3 SUSPHY set, as Linux dwc3_phy_setup
++	 * does by default); the USB2 PHY must not suspend while endpoint
++	 * commands run (Linux clears U2 SUSPHY around them; msm8998 DT has
++	 * snps,dis_u2_susphy_quirk and snps,dis_enblslpm_quirk).
++	 */
++	int i, rst = 0;
++	PE_parse_boot_argn("sweetusbrst", &rst, sizeof(rst));
++	printf("SWEET USB: before: GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(DCTL), dwc_rd(DSTS));
++	if (rst) {
++		dwc_wr(DCTL, DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++		    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++		if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++			return;
++		}
++	} else {
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		for (i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++			delay(1000);
++		}
++		printf("SWEET USB: no soft reset (sweetusbrst=0); controller %s after %d ms\n",
++		    (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ? "halted" : "NOT halted", i);
+ 	}
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~(U2_SUSPHY | U2_ENBLSLPM));
++	dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) | U3_SUSPHY);
++	printf("SWEET USB: after:  GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++	    dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL));
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
