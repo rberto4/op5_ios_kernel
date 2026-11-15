@@ -1,0 +1,594 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_a540.c			standard
++bsd/dev/sweet_a540_b.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_a540.c b/bsd/dev/sweet_a540.c
+--- a/bsd/dev/sweet_a540.c
++++ b/bsd/dev/sweet_a540.c
+@@ -25,6 +25,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_a540_init(void);
++bool sweet_a540_powered(void);
+ 
+ #define GCC_PA          0x00100000u
+ #define GCC_SIZE        0x00090000u
+@@ -58,6 +59,7 @@ void sweet_a540_init(void);
+ #define S1_MV           700u            /* inside the DT's 524-1100 mV */
+ 
+ static vm_offset_t gcc, gpucc, gpu, smmu;
++static bool powered;     /* stage A brought the GPU up (sweetgpu=2) */
+ 
+ static inline uint32_t
+ rd(vm_offset_t base, uint32_t off)
+@@ -301,10 +303,21 @@ sweet_a540_init(void)
+ 		return;
+ 	}
+ 	if (gpu_power_on()) {
++		powered = true;
+ 		gpu_report();
+ 		printf("SWEET GPU: Adreno 540 powered; stage A done\n");
+ 	} else {
+ 		printf("SWEET GPU: power-up stopped (see above)\n");
+ 	}
+ }
++
++/* For stage B (sweet_a540_b.c): powered by us, GX GDSC on, gfx3d clock running. */
++bool
++sweet_a540_powered(void)
++{
++	if (!powered || !gpucc) {
++		return false;
++	}
++	return (rd(gpucc, GPUCC_GX_GDSC) >> 31) && !(rd(gpucc, GPUCC_GFX3D_CBC) >> 31);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a540_b.c
+@@ -0,0 +1,537 @@
++/*
++ * cheeseburger (MSM8998): Adreno 540, stage B - command processor + zap.
++ *
++ * Runs only on request, from a process (the GPU must already be powered by
++ * stage A, boot-arg sweetgpu=2):
++ *   sysctl kern.sweetgpu_stage=1   SMMU bypass, CP microcode, ME_INIT,
++ *                                  zap shader (TrustZone PAS 13), leave
++ *                                  secure mode, one CP_MEM_WRITE test
++ * Reading kern.sweetgpu_stage returns the last step reached (negative =
++ * failed at that step). Everything is logged as "SWEET GPU B:".
++ *
++ * Firmware is read from the root file system, never built in (Qualcomm
++ * files, not redistributable): /usr/local/share/op5fw/{a530_pm4.fw,
++ * a530_pfp.fw, a540_zap.mdt, a540_zap.b02} (copied from the phone's own
++ * /vendor/firmware).
++ *
++ * Sequence after Linux drivers/gpu/drm/msm/adreno/a5xx_gpu.c (a5xx_hw_init,
++ * a5xx_me_init, zap), adreno_gpu.c (zap_shader_load_mdt),
++ * drivers/soc/qcom/mdt_loader.c and drivers/firmware/qcom_scm*.c
++ * (SMCCC SIP calls, QCOM_SCM_ARGS encoding). Register offsets from
++ * a5xx.xml.h. Hardware clock gating, GPMU/limits management, preemption
++ * and interrupts are not set up (polled, low clock).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++bool sweet_a540_powered(void);
++
++#define GPU_PA          0x05000000u
++#define SMMU_PA         0x05040000u
++#define ZAP_PA          0x95600000u     /* gpu_mem / pil_ipa_gpu carve-out */
++#define ZAP_SIZE        0x00100000u
++#define ZAP_MDATA_OFF   0x00080000u     /* metadata copy, outside the zap span */
++#define ZAP_PAS_ID      13u
++#define FW_DIR          "/usr/local/share/op5fw/"
++
++/* A5XX registers (dword offsets) */
++#define R_VBIF_RR_QOS_ARB       0x3049
++#define R_VBIF_GATE_OFF_WRREQ   0x302a
++#define R_RBBM_AHB_CNTL0        0x0093
++#define R_RBBM_AHB_CNTL1        0x0094
++#define R_RBBM_AHB_CNTL2        0x0095
++#define R_RBBM_INT_0_MASK       0x0038
++#define R_RBBM_INT_0_STATUS     0x04e1
++#define R_RBBM_STATUS           0x04f5
++#define R_RBBM_PERFCTR_CNTL     0x0464
++#define R_CP_PERFCTR_CP_SEL_0   0x0bb0
++#define R_UCHE_CACHE_WAYS       0x0e96
++#define R_UCHE_WRITE_THRU_LO    0x0e87
++#define R_UCHE_WRITE_THRU_HI    0x0e88
++#define R_UCHE_TRAP_LO          0x0e89
++#define R_UCHE_TRAP_HI          0x0e8a
++#define R_UCHE_GMEM_MIN_LO      0x0e8b
++#define R_UCHE_GMEM_MIN_HI      0x0e8c
++#define R_UCHE_GMEM_MAX_LO      0x0e8d
++#define R_UCHE_GMEM_MAX_HI      0x0e8e
++#define R_UCHE_DBG_ECO_CNTL_2   0x0e8f
++#define R_UCHE_MODE_CNTL        0x0e81
++#define R_CP_MEQ_THRESHOLDS     0x0825
++#define R_CP_MERCIU_SIZE        0x0826
++#define R_CP_ROQ_THRESHOLDS_1   0x081f
++#define R_CP_ROQ_THRESHOLDS_2   0x0820
++#define R_PC_DBG_ECO_CNTL       0x0d00
++#define R_CP_CHICKEN_DBG        0x0833
++#define R_TPL1_MODE_CNTL        0x0f02
++#define R_RB_MODE_CNTL          0x0cc6
++#define R_VPC_DBG_ECO_CNTL      0x0e60
++#define R_CP_PROTECT_CNTL       0x08a0
++#define R_CP_PROTECT_0          0x0880   /* CP_PROTECT(i) = 0x880 + i */
++#define R_SECVID_TSB_CNTL       0xf803
++#define R_SECVID_TSB_BASE_LO    0xf800
++#define R_SECVID_TSB_BASE_HI    0xf801
++#define R_SECVID_TSB_SIZE       0xf802
++#define R_SECVID_TSB_ADDR_MODE  0xf810
++#define R_CP_ME_INSTR_BASE_LO   0x0838
++#define R_CP_PFP_INSTR_BASE_LO  0x0835
++#define R_CP_RB_BASE            0x0800
++#define R_CP_RB_CNTL            0x0802
++#define R_CP_RB_RPTR            0x0806
++#define R_CP_RB_WPTR            0x0807
++#define R_CP_PFP_ME_CNTL        0x0832
++#define R_CP_HW_FAULT           0x0b1a
++#define R_CP_INTERRUPT_STATUS   0x0b18
++#define R_CP_PROTECT_STATUS     0x0b1c
++
++static const uint16_t addr_mode_regs[] = {
++	0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */,
++	0x0d01 /* PC */, 0x0e05 /* HLSQ */, 0x0e41 /* VFD */, 0x0e61 /* VPC */,
++	0x0e80 /* UCHE */, 0x0ec1 /* SP */, 0x0f01 /* TPL1 */,
++};
++
++/* PM4 */
++#define CP_TYPE7_PKT            0x70000000u
++#define CP_ME_INIT              72
++#define CP_MEM_WRITE            61
++#define CP_SET_SECURE_MODE      102
++#define RB_SIZE                 0x8000u     /* 32 KiB */
++#define RB_CNTL_NO_UPDATE       0x08000000u
++
++/* DMA area (kernel memory, physically contiguous, cleaned for the GPU) */
++#define DMA_RB          0x00000
++#define DMA_PM4         0x08000
++#define DMA_PFP         0x10000
++#define DMA_SCRATCH     0x18000
++#define DMA_SIZE        0x20000
++
++static vm_offset_t gpu, smmu, dma;
++static uint64_t dma_pa;
++static int stage_result;
++
++static inline uint32_t
++grd(uint32_t reg)
++{
++	uint32_t v = *(volatile uint32_t *)(gpu + 4u * reg);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++gwr(uint32_t reg, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(gpu + 4u * reg) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static inline void
++gwr64(uint32_t reg_lo, uint64_t v)
++{
++	gwr(reg_lo, (uint32_t)v);
++	gwr(reg_lo + 1, (uint32_t)(v >> 32));
++}
++
++static void
++gpu_dump(const char *why)
++{
++	printf("SWEET GPU B: %s: RBBM_STATUS 0x%08x INT_0 0x%08x CP_HW_FAULT 0x%08x CP_INT 0x%08x "
++	    "CP_PROTECT_STATUS 0x%08x RPTR %u WPTR %u SMMU gFSR 0x%08x CB0 FSR 0x%08x\n",
++	    why, grd(R_RBBM_STATUS), grd(R_RBBM_INT_0_STATUS), grd(R_CP_HW_FAULT),
++	    grd(R_CP_INTERRUPT_STATUS), grd(R_CP_PROTECT_STATUS), grd(R_CP_RB_RPTR), grd(R_CP_RB_WPTR),
++	    *(volatile uint32_t *)(smmu + 0x48), *(volatile uint32_t *)(smmu + 0x8000 + 0x58));
++}
++
++/* ---- firmware files ---- */
++
++#define FW_MAX 0x40000u
++
++static void *
++fw_read(const char *name, size_t *size_out)
++{
++	char path[96];
++	snprintf(path, sizeof(path), "%s%s", FW_DIR, name);
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err) {
++		printf("SWEET GPU B: %s: open error %d\n", path, err);
++		return NULL;
++	}
++	uint8_t *buf = kalloc_data(FW_MAX, Z_WAITOK | Z_ZERO);
++	int resid = 0;
++	if (buf) {
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)FW_MAX, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_close(vp, FREAD, ctx);
++	if (!buf) {
++		return NULL;
++	}
++	size_t size = FW_MAX - (size_t)resid;
++	if (err || size == 0 || size == FW_MAX) {
++		printf("SWEET GPU B: %s: read error %d, %zu bytes\n", path, err, size);
++		kfree_data(buf, FW_MAX);
++		return NULL;
++	}
++	*size_out = size;
++	printf("SWEET GPU B: %s: %zu bytes\n", path, size);
++	return buf;
++}
++
++/* Device memory: aligned 32-bit stores only. */
++static void
++io_copy(vm_offset_t dst, const uint8_t *src, size_t len)
++{
++	for (size_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (size_t k = 0; k < 4 && i + k < len; k++) {
++			w |= (uint32_t)src[i + k] << (8 * k);
++		}
++		*(volatile uint32_t *)(dst + i) = w;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---- TrustZone (SMCCC SIP, 64-bit standard calls) ---- */
++
++struct scm_res {
++	uint64_t a0, a1, a2, a3;
++};
++
++static struct scm_res
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)(svc & 0xff) << 8) | (cmd & 0xff);
++	uint64_t session = 0;
++	struct scm_res r;
++	do {
++		register uint64_t x0 __asm__("x0") = fn;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a2;
++		register uint64_t x3 __asm__("x3") = a3;
++		register uint64_t x4 __asm__("x4") = a4;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++		    :
++		    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
++		    "memory");
++		r.a0 = x0;
++		r.a1 = x1;
++		r.a2 = x2;
++		r.a3 = x3;
++		session = x6;
++		fn = 1;         /* QCOM_SCM_INTERRUPTED: resume with the session in x6 */
++	} while (r.a0 == 1);
++	return r;
++}
++
++#define SCM_SVC_PIL             2
++#define PAS_INIT_IMAGE          1
++#define PAS_MEM_SETUP           2
++#define PAS_AUTH_AND_RESET      5
++#define PAS_IS_SUPPORTED        7
++#define SCM_ARGS(n, a, b, c)    ((n) | ((a) << 4) | ((b) << 6) | ((c) << 8))
++#define SCM_VAL                 0
++#define SCM_RW                  2
++
++/* Linux zap_shader_load_mdt + qcom_mdt_load for the split a540_zap files. */
++static int
++zap_load(void)
++{
++	size_t mdt_len = 0, seg_len = 0;
++	uint8_t *mdt = fw_read("a540_zap.mdt", &mdt_len);
++	uint8_t *seg = fw_read("a540_zap.b02", &seg_len);
++	int ret = -1;
++	if (!mdt || !seg || mdt_len < 52 + 3 * 32 || mdt_len > ZAP_SIZE - ZAP_MDATA_OFF) {
++		goto out;
++	}
++	/* ELF32: the one PT_LOAD segment (index 2), relocatable (flags bit 27) */
++	const uint32_t *ph = (const uint32_t *)(const void *)(mdt + 52 + 2 * 32);
++	uint32_t p_type = ph[0], p_paddr = ph[3], p_filesz = ph[4], p_memsz = ph[5], p_flags = ph[6];
++	printf("SWEET GPU B: zap segment type %u paddr 0x%x filesz 0x%x memsz 0x%x flags 0x%x\n",
++	    p_type, p_paddr, p_filesz, p_memsz, p_flags);
++	if (p_type != 1 || !(p_flags & (1u << 27)) || p_filesz != seg_len || p_memsz < p_filesz ||
++	    p_memsz > ZAP_MDATA_OFF) {
++		printf("SWEET GPU B: zap layout not as expected; not loading\n");
++		goto out;
++	}
++	struct scm_res r = scm_call(SCM_SVC_PIL, PAS_IS_SUPPORTED, SCM_ARGS(1, SCM_VAL, 0, 0),
++	    ZAP_PAS_ID, 0, 0);
++	printf("SWEET GPU B: SCM PAS is_supported(13): a0 %lld a1 %lld\n", (long long)r.a0, (long long)r.a1);
++	if (r.a0 != 0 || r.a1 != 1) {
++		goto out;
++	}
++	vm_offset_t zap = ml_io_map(ZAP_PA, ZAP_SIZE);
++	if (!zap) {
++		goto out;
++	}
++	io_copy(zap + ZAP_MDATA_OFF, mdt, mdt_len);
++	r = scm_call(SCM_SVC_PIL, PAS_INIT_IMAGE, SCM_ARGS(2, SCM_VAL, SCM_RW, 0),
++	    ZAP_PAS_ID, ZAP_PA + ZAP_MDATA_OFF, 0);
++	printf("SWEET GPU B: SCM PAS init_image: a0 %lld a1 %lld\n", (long long)r.a0, (long long)r.a1);
++	if (r.a0 != 0 || r.a1 != 0) {
++		goto out;
++	}
++	uint32_t span = (p_memsz + 0xfffu) & ~0xfffu;
++	r = scm_call(SCM_SVC_PIL, PAS_MEM_SETUP, SCM_ARGS(3, SCM_VAL, SCM_VAL, SCM_VAL),
++	    ZAP_PAS_ID, ZAP_PA, span);
++	printf("SWEET GPU B: SCM PAS mem_setup(0x%x, 0x%x): a0 %lld a1 %lld\n", ZAP_PA, span,
++	    (long long)r.a0, (long long)r.a1);
++	if (r.a0 != 0 || r.a1 != 0) {
++		goto out;
++	}
++	io_copy(zap, seg, seg_len);
++	r = scm_call(SCM_SVC_PIL, PAS_AUTH_AND_RESET, SCM_ARGS(1, SCM_VAL, 0, 0), ZAP_PAS_ID, 0, 0);
++	printf("SWEET GPU B: SCM PAS auth_and_reset: a0 %lld a1 %lld\n", (long long)r.a0, (long long)r.a1);
++	ret = (r.a0 == 0 && r.a1 == 0) ? 0 : -1;
++out:
++	if (mdt) {
++		kfree_data(mdt, FW_MAX);
++	}
++	if (seg) {
++		kfree_data(seg, FW_MAX);
++	}
++	return ret;
++}
++
++/* ---- ring ---- */
++
++static uint32_t rb_wptr;
++
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	       (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static void
++rb_out(uint32_t v)
++{
++	((volatile uint32_t *)(dma + DMA_RB))[rb_wptr] = v;
++	rb_wptr = (rb_wptr + 1) % (RB_SIZE / 4);
++}
++
++static void
++rb_pkt7(uint32_t opcode, uint32_t cnt)
++{
++	rb_out(CP_TYPE7_PKT | cnt | (pm4_parity(cnt) << 15) | ((opcode & 0x7f) << 16) |
++	    (pm4_parity(opcode) << 23));
++}
++
++/* Make the ring visible to the GPU, kick it and wait until it is drained and idle. */
++static bool
++rb_flush_wait(const char *what)
++{
++	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
++	gwr(R_CP_RB_WPTR, rb_wptr);
++	for (int i = 0; i < 20000; i++) {
++		if (grd(R_CP_RB_RPTR) == rb_wptr && !(grd(R_RBBM_STATUS) & ~1u) &&
++		    !(grd(R_RBBM_INT_0_STATUS) & 0x00800000u)) {
++			printf("SWEET GPU B: %s: done after %d x 50 us (RPTR %u)\n", what, i, rb_wptr);
++			return true;
++		}
++		delay(50);
++	}
++	gpu_dump(what);
++	return false;
++}
++
++/* ---- stage B ---- */
++
++static void
++hw_init(void)
++{
++	gwr(R_VBIF_RR_QOS_ARB, 0x3);
++	gwr(R_VBIF_GATE_OFF_WRREQ, 0x9);
++	gwr(R_RBBM_AHB_CNTL0, 0x1);
++	gwr(R_RBBM_PERFCTR_CNTL, 0x1);
++	gwr(R_CP_PERFCTR_CP_SEL_0, 0);  /* PERF_CP_ALWAYS_COUNT */
++	gwr(R_UCHE_CACHE_WAYS, 0x02);
++	gwr(R_UCHE_TRAP_LO, 0xffff0000);
++	gwr(R_UCHE_TRAP_HI, 0x0001ffff);
++	gwr(R_UCHE_WRITE_THRU_LO, 0xffff0000);
++	gwr(R_UCHE_WRITE_THRU_HI, 0x0001ffff);
++	gwr(R_UCHE_GMEM_MIN_LO, 0x00100000);
++	gwr(R_UCHE_GMEM_MIN_HI, 0);
++	gwr(R_UCHE_GMEM_MAX_LO, 0x00100000 + 0x100000 - 1);    /* A540: 1 MiB GMEM */
++	gwr(R_UCHE_GMEM_MAX_HI, 0);
++	gwr(R_CP_MEQ_THRESHOLDS, 0x40);
++	gwr(R_CP_MERCIU_SIZE, 0x400);
++	gwr(R_CP_ROQ_THRESHOLDS_2, 0x80000060);
++	gwr(R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	gwr(R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++	gwr(R_UCHE_MODE_CNTL, 1u << 29);
++	gwr(R_CP_CHICKEN_DBG, 0x02000000);
++	gwr(R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	gwr(R_RBBM_AHB_CNTL2, 0x0000003f);
++	gwr(R_TPL1_MODE_CNTL, 2u << 7);
++	gwr(R_RB_MODE_CNTL, 2u << 1);
++	gwr(R_UCHE_DBG_ECO_CNTL_2, 2);
++	gwr(R_VPC_DBG_ECO_CNTL, grd(R_VPC_DBG_ECO_CNTL) | (1u << 10));
++	/* CP register protection, as Linux (ADRENO_PROTECT_RW(reg, cnt)) */
++	static const uint32_t prot[][2] = {
++		{ 0x04, 4 }, { 0x08, 8 }, { 0x10, 16 }, { 0x20, 32 }, { 0x40, 64 }, { 0x80, 64 },
++		{ R_SECVID_TSB_BASE_LO, 16 }, { 0xf400, 2 }, { 0x800, 64 }, { 0x840, 8 },
++		{ 0x880, 32 }, { 0xaa0, 1 }, { 0xcc0, 1 }, { 0xcf0, 2 }, { 0xe68, 8 }, { 0xe70, 16 },
++		{ 0xe80, 16 }, { 0x10000, 0x8000 },
++	};
++	gwr(R_CP_PROTECT_CNTL, 0x7);
++	for (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
++		uint32_t cnt = prot[i][1], log2 = 0;
++		while ((2u << log2) <= cnt) {   /* ilog2 */
++			log2++;
++		}
++		gwr(R_CP_PROTECT_0 + i, (1u << 30) | (1u << 29) | ((log2 & 0x1f) << 24) |
++		    ((prot[i][0] << 2) & 0xfffff));
++	}
++	gwr(R_SECVID_TSB_CNTL, 0);
++	gwr64(R_SECVID_TSB_BASE_LO, 0);
++	gwr(R_SECVID_TSB_SIZE, 0);
++	for (unsigned i = 0; i < sizeof(addr_mode_regs) / sizeof(addr_mode_regs[0]); i++) {
++		gwr(addr_mode_regs[i], 1);
++	}
++	gwr(R_SECVID_TSB_ADDR_MODE, 1);
++}
++
++static int
++stage_b(void)
++{
++	if (!sweet_a540_powered()) {
++		printf("SWEET GPU B: GPU not powered (boot with sweetgpu=2)\n");
++		return -1;
++	}
++	gpu = ml_io_map(GPU_PA, 0x40000);
++	smmu = ml_io_map(SMMU_PA, 0x10000);
++	if (!gpu || !smmu) {
++		return -1;
++	}
++	if (!dma) {
++		if (kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return -2;
++		}
++		dma_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)dma)) | (dma & PAGE_MASK);
++	}
++	printf("SWEET GPU B: DMA area 0x%llx (%u KiB)\n", dma_pa, (unsigned)(DMA_SIZE / 1024));
++
++	/* 1. GPU SMMU: unmatched streams bypass instead of fault (sCR0.USFCFG) */
++	volatile uint32_t *cr0 = (volatile uint32_t *)smmu;
++	uint32_t before = *cr0;
++	*cr0 = before & ~(1u << 10);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET GPU B: SMMU sCR0 0x%08x -> 0x%08x\n", before, *cr0);
++	if (*cr0 & (1u << 10)) {
++		return -3;
++	}
++
++	/* 2. microcode (first dword of each file is the version, skipped) */
++	size_t pm4_len = 0, pfp_len = 0;
++	uint8_t *pm4 = fw_read("a530_pm4.fw", &pm4_len);
++	uint8_t *pfp = fw_read("a530_pfp.fw", &pfp_len);
++	if (!pm4 || !pfp || pm4_len < 8 || pfp_len < 8 || pm4_len - 4 > 0x8000 || pfp_len - 4 > 0x8000) {
++		return -4;
++	}
++	memcpy((void *)(dma + DMA_PM4), pm4 + 4, pm4_len - 4);
++	memcpy((void *)(dma + DMA_PFP), pfp + 4, pfp_len - 4);
++	printf("SWEET GPU B: PM4 version 0x%08x, PFP version 0x%08x\n",
++	    *(uint32_t *)(void *)pm4, *(uint32_t *)(void *)pfp);
++	kfree_data(pm4, FW_MAX);
++	kfree_data(pfp, FW_MAX);
++	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
++	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
++	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
++
++	/* 3. hardware init, ring, start the micro engine */
++	hw_init();
++	gwr64(R_CP_ME_INSTR_BASE_LO, dma_pa + DMA_PM4);
++	gwr64(R_CP_PFP_INSTR_BASE_LO, dma_pa + DMA_PFP);
++	gwr64(R_CP_RB_BASE, dma_pa + DMA_RB);
++	gwr(R_CP_RB_CNTL, 12u | (2u << 8) | RB_CNTL_NO_UPDATE);  /* 32 KiB, 32-byte blocks */
++	gwr(R_RBBM_INT_0_MASK, 0);
++	rb_wptr = 0;
++	gwr(R_CP_RB_WPTR, 0);
++	gwr(R_CP_PFP_ME_CNTL, 0);
++	delay(100);
++	printf("SWEET GPU B: CP started: RBBM_STATUS 0x%08x RPTR %u\n", grd(R_RBBM_STATUS),
++	    grd(R_CP_RB_RPTR));
++
++	/* 4. ME_INIT */
++	rb_pkt7(CP_ME_INIT, 8);
++	rb_out(0x0000002f);
++	rb_out(0x00000003);
++	rb_out(0x20000000);
++	rb_out(0);
++	rb_out(0);
++	rb_out(0);      /* no microcode workarounds (A540) */
++	rb_out(0);
++	rb_out(0);
++	if (!rb_flush_wait("ME_INIT")) {
++		return -5;
++	}
++
++	/* 5. zap shader, then leave secure mode */
++	if (zap_load() != 0) {
++		gpu_dump("zap");
++		return -6;
++	}
++	rb_pkt7(CP_SET_SECURE_MODE, 1);
++	rb_out(0);
++	if (!rb_flush_wait("SET_SECURE_MODE 0")) {
++		return -7;
++	}
++
++	/* 6. the GPU writes a value into our memory */
++	uint64_t target = dma_pa + DMA_SCRATCH;
++	rb_pkt7(CP_MEM_WRITE, 3);
++	rb_out((uint32_t)target);
++	rb_out((uint32_t)(target >> 32));
++	rb_out(0xc0ffee01);
++	if (!rb_flush_wait("MEM_WRITE")) {
++		return -8;
++	}
++	flush_dcache64(target, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
++	printf("SWEET GPU B: scratch at 0x%llx = 0x%08x (%s)\n", target, got,
++	    got == 0xc0ffee01 ? "GPU WROTE IT" : "unchanged");
++	gpu_dump("end");
++	return got == 0xc0ffee01 ? 6 : -9;
++}
++
++static int
++sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = stage_result;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (value == 1) {
++		printf("SWEET GPU B: stage B requested by pid %d\n", proc_selfpid());
++		stage_result = stage_b();
++		printf("SWEET GPU B: stage B result %d\n", stage_result);
++	}
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweetgpu_stage, "I", "SWEET Adreno 540 stage B (write 1)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
