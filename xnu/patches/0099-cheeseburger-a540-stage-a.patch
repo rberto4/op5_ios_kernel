@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_a540.c b/bsd/dev/sweet_a540.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_a540.c
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,310 @@
 +/*
 + * cheeseburger (MSM8998): Adreno 540, stage A - power and read-back.
 + *
@@ -54,6 +54,7 @@ new file mode 100644
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
