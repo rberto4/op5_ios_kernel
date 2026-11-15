@@ -1,0 +1,95 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -766,15 +766,14 @@
+ 	/*
+ 	 * cheeseburger: keys read PM8998 over SPMI v3 (sweet_keys.c), touch is
+ 	 * the S3508 on QUP5 with RPM rail votes (sweet_touch.c, sweet_rpm.c).
+-	 * USB is still the SM7150 driver.
++	 * USB: sweet_usb.c ported to the MSM8998 addresses; it runs by default
++	 * (sweetusb=1 only reports state, sweetusb=2 starts the USB Ethernet
++	 * device, sweetusb=0 skips it).
+ 	 */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+-	if (hw == 1) {
+-		sweet_usb_probe();
+-	} else {
+-		printf("SWEET UFS: USB skipped (sweethw=0)\n");
+-	}
++	(void)hw;
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1,10 +1,11 @@
+ /*
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
++ * cheeseburger (MSM8998): the USB is a Synopsys DWC3 at 0x0a800000 behind
++ * Qualcomm's wrapper (QSCRATCH 0x0a8f8800), with a QUSB2 PHY at 0x0c012000
++ * (Linux msm8998.dtsi); it is run at high speed only. Its power domain is
++ * the USB_30 GDSC and its clocks come from GCC (offsets from Linux
++ * gcc-msm8998.c, QUSB2 layout from phy-qcom-qusb2.c msm8998_regs_layout). ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -48,18 +49,18 @@
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
++	{ "master", 0x0f008 },
++	{ "sleep", 0x0f00c },
++	{ "utmi", 0x0f010 },
++	{ "cfg-noc-axi", 0x05018 },
++	{ "aggre-axi", 0x82024 },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x88008 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
++#define DWC3_PA                 0x0a800000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
++#define QUSB2_PA                0x0c012000
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -124,11 +125,10 @@
+ 	if (phy == 0) {
+ 		return;
+ 	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	/* msm8998 (Linux phy-qcom-qusb2.c): PLL_STATUS 0x1a0, POWERDOWN 0x210,
++	 * PORT_TUNE1 0x23c, PORT_TEST1 0x24c. */
++	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x POWERDOWN 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
++	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x23c), usb_rd(phy, 0x24c));
+ }
+ 
+ /*
+@@ -164,7 +164,7 @@
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_PA             0x0a8f8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
