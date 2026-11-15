@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -60,6 +60,7 @@ bool sweet_a540_powered(void);
+ #define R_RBBM_INT_0_MASK       0x0038
+ #define R_RBBM_INT_0_STATUS     0x04e1
+ #define R_RBBM_STATUS           0x04f5
++#define R_RBBM_SW_RESET_CMD     0x0043
+ #define R_RBBM_PERFCTR_CNTL     0x0464
+ #define R_CP_PERFCTR_CP_SEL_0   0x0bb0
+ #define R_UCHE_CACHE_WAYS       0x0e96
+@@ -381,6 +382,8 @@ swr(uint32_t off, uint32_t v)
+ #define SMMU_CB(n)      (0x8000u + 0x1000u * (n))
+ #define CB_SCTLR        0x00u
+ #define CB_FSR          0x58u
++#define SMMU_CBA2R(n)   (0x1800u + 4u * (n))
++#define CBA2R_VA64      1u
+ #define CBAR_TYPE_S1    (1u << 16)      /* stage 1 context, stage 2 bypass */
+ 
+ /*
+@@ -402,6 +405,8 @@ smmu_setup(void)
+ 		return true;
+ 	}
+ 	swr(SMMU_CB(0) + CB_SCTLR, 0);
++	swr(SMMU_CBA2R(0), CBA2R_VA64);  /* AArch64 format: GPU addresses above 4 GiB (test 0102: FAR 0x1_04128000 TF) */
++	swr(SMMU_CB(0) + CB_FSR, srd(SMMU_CB(0) + CB_FSR));     /* clear old faults */
+ 	swr(SMMU_CBAR(0), CBAR_TYPE_S1);
+ 	swr(SMMU_S2CR(0), 0);           /* translate, CBNDX 0 */
+ 	swr(SMMU_SMR(0), SMR_VALID);    /* stream 0, mask 0 */
+@@ -409,7 +414,9 @@ smmu_setup(void)
+ 	uint32_t sctlr = srd(SMMU_CB(0) + CB_SCTLR);
+ 	printf("SWEET GPU B: SMMU sCR0 0x%08x fixed; SMR0 0x%08x S2CR0 0x%08x CBAR0 0x%08x CB0 SCTLR 0x%08x\n",
+ 	    cr0, smr, s2cr, cbar, sctlr);
+-	return smr == SMR_VALID && s2cr == 0 && ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u);
++	printf("SWEET GPU B: SMMU CBA2R0 0x%08x CB0 FSR 0x%08x\n", srd(SMMU_CBA2R(0)), srd(SMMU_CB(0) + CB_FSR));
++	return smr == SMR_VALID && s2cr == 0 && ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u) &&
++	    (srd(SMMU_CBA2R(0)) & CBA2R_VA64);
+ }
+ 
+ /* ---- stage B ---- */
+@@ -482,7 +489,8 @@ stage_b(int mode)
+ 		return -1;
+ 	}
+ 	if (!dma) {
+-		if (kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK, 0, 0,
++		if (kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK,
++		    (ppnum_t)(((1ull << 32) >> PAGE_SHIFT) - 1), 0,
+ 		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			return -2;
+ 		}
+@@ -515,7 +523,13 @@ stage_b(int mode)
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+ 
+-	/* 3. hardware init, ring, start the micro engine */
++	/* 3. soft reset (clears what an earlier attempt left), hardware init, ring, micro engine */
++	gwr(R_RBBM_SW_RESET_CMD, 1);
++	(void)grd(R_RBBM_SW_RESET_CMD);
++	delay(10);
++	gwr(R_RBBM_SW_RESET_CMD, 0);
++	delay(10);
++	printf("SWEET GPU B: after soft reset RBBM_STATUS 0x%08x\n", grd(R_RBBM_STATUS));
+ 	hw_init();
+ 	gwr64(R_CP_ME_INSTR_BASE_LO, dma_pa + DMA_PM4);
+ 	gwr64(R_CP_PFP_INSTR_BASE_LO, dma_pa + DMA_PFP);
