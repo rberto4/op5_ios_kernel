@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -8,6 +8,7 @@
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+  * failed at that step). Everything is logged as "SWEET GPU B:".
++ * kern.sweetgpu_addr / kern.sweetgpu_val: debug register access (see end).
+  *
+  * Firmware is read from the root file system, never built in (Qualcomm
+  * files, not redistributable): /usr/local/share/op5fw/{a530_pm4.fw,
+@@ -25,6 +26,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
++#include <sys/errno.h>
+ #include <sys/vnode.h>
+ #include <sys/fcntl.h>
+ #include <sys/kauth.h>
+@@ -354,6 +356,51 @@ rb_flush_wait(const char *what)
+ 	return false;
+ }
+ 
++/* ---- GPU SMMU ---- */
++
++#define SMMU_SCR0       0x000u
++#define SMMU_SMR(i)     (0x800u + 4u * (i))
++#define SMMU_S2CR(i)    (0xc00u + 4u * (i))
++#define SCR0_USFCFG     (1u << 10)
++#define SMR_VALID       (1u << 31)
++#define S2CR_BYPASS     (1u << 16)
++
++static uint32_t
++srd(uint32_t off)
++{
++	return *(volatile uint32_t *)(smmu + off);
++}
++
++static void
++swr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(smmu + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Let the GPU reach physical memory untranslated. First sCR0.USFCFG = 0
++ * (unmatched streams bypass); if that write does not stick, SMR0 matching
++ * every stream id + S2CR0 type bypass. Each write is read back and logged.
++ */
++static bool
++smmu_bypass(void)
++{
++	uint32_t before = srd(SMMU_SCR0);
++	swr(SMMU_SCR0, before & ~SCR0_USFCFG);
++	uint32_t after = srd(SMMU_SCR0);
++	printf("SWEET GPU B: SMMU sCR0 0x%08x -> 0x%08x\n", before, after);
++	if (!(after & SCR0_USFCFG)) {
++		return true;
++	}
++	uint32_t s2cr = srd(SMMU_S2CR(0)), smr = srd(SMMU_SMR(0));
++	swr(SMMU_S2CR(0), S2CR_BYPASS);
++	swr(SMMU_SMR(0), SMR_VALID | (0x7fffu << 16));
++	printf("SWEET GPU B: SMMU S2CR0 0x%08x -> 0x%08x, SMR0 0x%08x -> 0x%08x\n",
++	    s2cr, srd(SMMU_S2CR(0)), smr, srd(SMMU_SMR(0)));
++	return (srd(SMMU_SMR(0)) & SMR_VALID) && ((srd(SMMU_S2CR(0)) >> 16) & 3u) == 1u;
++}
++
+ /* ---- stage B ---- */
+ 
+ static void
+@@ -432,13 +479,8 @@ stage_b(void)
+ 	}
+ 	printf("SWEET GPU B: DMA area 0x%llx (%u KiB)\n", dma_pa, (unsigned)(DMA_SIZE / 1024));
+ 
+-	/* 1. GPU SMMU: unmatched streams bypass instead of fault (sCR0.USFCFG) */
+-	volatile uint32_t *cr0 = (volatile uint32_t *)smmu;
+-	uint32_t before = *cr0;
+-	*cr0 = before & ~(1u << 10);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	printf("SWEET GPU B: SMMU sCR0 0x%08x -> 0x%08x\n", before, *cr0);
+-	if (*cr0 & (1u << 10)) {
++	/* 1. GPU SMMU bypass */
++	if (!smmu_bypass()) {
+ 		return -3;
+ 	}
+ 
+@@ -534,4 +576,51 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweetgpu_stage, "I", "SWEET Adreno 540 stage B (write 1)");
++/*
++ * Debug register access in the GPU block (root only, GPU powered by stage A):
++ *   sysctl kern.sweetgpu_addr=<offset from 0x05000000, 4-aligned, < 0x70000>
++ *   read  kern.sweetgpu_val   -> 32-bit read at that offset
++ *   write kern.sweetgpu_val=v -> 32-bit write, logged with the value read back
++ * Covers GPU 0x05000000, SMMU 0x05040000 and GPUCC 0x05065000.
++ */
++#define DBG_SPAN        0x70000u
++static vm_offset_t dbg_base;
++static int dbg_addr;
++
++static bool
++dbg_ready(void)
++{
++	if (!sweet_a540_powered() || dbg_addr < 0 || (uint32_t)dbg_addr >= DBG_SPAN || (dbg_addr & 3)) {
++		return false;
++	}
++	if (!dbg_base) {
++		dbg_base = ml_io_map(GPU_PA, DBG_SPAN);
++	}
++	return dbg_base != 0;
++}
++
++static int
++sysctl_sweetgpu_val SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	if (!dbg_ready()) {
++		return ENXIO;
++	}
++	volatile uint32_t *reg = (volatile uint32_t *)(dbg_base + (uint32_t)dbg_addr);
++	int value = (int)*reg;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	*reg = (uint32_t)value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET GPU B: poke 0x%08x = 0x%08x, reads 0x%08x\n", GPU_PA + (uint32_t)dbg_addr,
++	    (uint32_t)value, *reg);
++	return 0;
++}
++
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_addr, CTLFLAG_RW | CTLFLAG_LOCKED, &dbg_addr, 0,
++    "SWEET GPU debug: register offset from 0x05000000");
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_val, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweetgpu_val, "I", "SWEET GPU debug: register at kern.sweetgpu_addr");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
