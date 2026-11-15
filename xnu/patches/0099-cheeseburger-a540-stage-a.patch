@@ -1,0 +1,344 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_a540.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -61,6 +61,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++void sweet_a540_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -774,6 +775,7 @@
+ 	sweet_touch_init();
+ 	(void)hw;
+ 	sweet_usb_probe();
++	sweet_a540_init();     /* sweet_a540.c, boot-arg sweetgpu (default off) */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_a540.c b/bsd/dev/sweet_a540.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a540.c
+@@ -0,0 +1,309 @@
++/*
++ * cheeseburger (MSM8998): Adreno 540, stage A - power and read-back.
++ *
++ * Boot-arg sweetgpu:
++ *   0 (default)  nothing
++ *   1            read only: GCC/GPUCC/PM8005 S1 status; GPU and SMMU
++ *                registers only if the GX power domain is already on
++ *   2            power up, then read back: GCC gpu clocks, PM8005 S1
++ *                (vdd_gfx) enabled at 700 mV only if it is off and this EE
++ *                owns it, CX GDSC, gfx3d root on XO (19.2 MHz), GX GDSC,
++ *                gfx3d + rbbmtimer clocks; then RBBM, CP and SMMU state
++ *
++ * Sequence and offsets as the OnePlus 5 shim (shim/probe.c probe_gpu, run
++ * on two OnePlus 5 units: "registers answer"), which follows Linux
++ * gcc-msm8998.c, gpucc-msm8998.c, gdsc.c and the downstream
++ * msm8998-gpu.dtsi. SMMU-v2 register names from the ARM SMMU architecture
++ * (Linux arm-smmu.h). No interrupt is enabled, no GPU command is issued.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_a540_init(void);
++
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x00090000u
++#define GCC_GPU_CFG_AHB 0x71004u
++#define GCC_BIMC_GFX    0x46040u
++#define GCC_GPU_BIMC    0x71010u
++#define GCC_GPLL0_VOTE  0x5200cu        /* bits 3/4: GPU GPLL0 votes */
++
++#define GPUCC_PA        0x05065000u
++#define GPUCC_CX_GDSC   0x1004u
++#define GPUCC_GFX3D_RCG 0x1070u
++#define GPUCC_GFX3D_CFG 0x1074u
++#define GPUCC_GX_BCR    0x1090u
++#define GPUCC_GX_GDSC   0x1094u
++#define GPUCC_GFX3D_CBC 0x1098u
++#define GPUCC_RBBMTIMER 0x10d0u
++#define GPUCC_GX_CLAMP  0x0130u
++
++#define GPU_PA          0x05000000u
++#define GPU_SIZE        0x00040000u
++#define SMMU_PA         0x05040000u
++#define SMMU_SIZE       0x00010000u
++
++/* PM8005 S1 = vdd_gfx, PPID 0x514; SPMI arbiter v3 (as sweet_keys.c). */
++#define SPMI_CORE_PA    0x0800f000u
++#define SPMI_CFG_PA     0x0800a000u
++#define SPMI_OBS_PA     0x09400000u
++#define SPMI_CHNLS_PA   0x08400000u
++#define SPMI_STRIDE     0x8000u
++#define S1_PPID         0x514u
++#define S1_MV           700u            /* inside the DT's 524-1100 mV */
++
++static vm_offset_t gcc, gpucc, gpu, smmu;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++wait_bits(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (int i = 0; i < 2000; i++) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++/* ---- SPMI v3, PM8005 S1 only ---- */
++
++static int
++s1_apid(uint32_t *owner)
++{
++	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
++	vm_offset_t cfg = ml_io_map(SPMI_CFG_PA, 0x1000);
++	if (!core || !cfg) {
++		return -1;
++	}
++	int found = -1;
++	for (unsigned i = 0; i < 512; i++) {
++		uint32_t map = rd(core, 0x800u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != S1_PPID) {
++			continue;
++		}
++		uint32_t own = rd(cfg, 0x700u + 4u * i) & 7u;
++		if (found < 0 || own == 0) {
++			found = (int)i;
++			*owner = own;
++		}
++	}
++	return found;
++}
++
++static int
++s1_read(int apid, uint8_t reg)
++{
++	vm_offset_t ch = ml_io_map(SPMI_OBS_PA + SPMI_STRIDE * (uint32_t)apid, 0x1000);
++	if (!ch) {
++		return -1;
++	}
++	wr(ch, 0, (1u << 27) | ((uint32_t)reg << 4));  /* EXT_READL, 1 byte */
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = rd(ch, 0x08);
++		if (s & 1u) {
++			return (s & 0x0eu) ? -1 : (int)(rd(ch, 0x18) & 0xffu);
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* Only S1's voltage (0x40/0x41) and enable (0x46) registers, EE 0 channel. */
++static int
++s1_write(int apid, uint8_t reg, uint32_t value, unsigned bytes)
++{
++	if ((reg != 0x40 || bytes != 2) && (reg != 0x46 || bytes != 1)) {
++		return -1;
++	}
++	vm_offset_t ch = ml_io_map(SPMI_CHNLS_PA + SPMI_STRIDE * (uint32_t)apid, 0x1000);
++	if (!ch) {
++		return -1;
++	}
++	wr(ch, 0x10, value);                            /* WDATA0 */
++	wr(ch, 0, ((uint32_t)reg << 4) | (bytes - 1));  /* EXT_WRITEL */
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = rd(ch, 0x08);
++		if (s & 1u) {
++			return (s & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++static bool
++vdd_gfx(bool power)
++{
++	uint32_t owner = 7;
++	int apid = s1_apid(&owner);
++	if (apid < 0) {
++		printf("SWEET GPU: PM8005 S1 not mapped\n");
++		return false;
++	}
++	int en = s1_read(apid, 0x46), lo = s1_read(apid, 0x40), hi = s1_read(apid, 0x41);
++	printf("SWEET GPU: PM8005 S1 apid %d owner %u en 0x%x set %d mV\n", apid, owner, en,
++	    (lo >= 0 && hi >= 0) ? (lo | hi << 8) : -1);
++	if (en >= 0 && (en & 0x80)) {
++		return true;
++	}
++	if (!power || owner != 0) {
++		return false;
++	}
++	int r1 = s1_write(apid, 0x40, S1_MV, 2);
++	int r2 = s1_write(apid, 0x46, 0x80, 1);
++	delay(2000);
++	en = s1_read(apid, 0x46);
++	lo = s1_read(apid, 0x40);
++	hi = s1_read(apid, 0x41);
++	printf("SWEET GPU: PM8005 S1 enabled (wr %d/%d): en 0x%x set %d mV\n", r1, r2, en,
++	    (lo >= 0 && hi >= 0) ? (lo | hi << 8) : -1);
++	return en >= 0 && (en & 0x80);
++}
++
++/* ---- power ---- */
++
++static bool
++gpu_power_on(void)
++{
++	wr(gcc, GCC_GPU_CFG_AHB, rd(gcc, GCC_GPU_CFG_AHB) | 1u);
++	wr(gcc, GCC_BIMC_GFX, rd(gcc, GCC_BIMC_GFX) | 1u);
++	wr(gcc, GCC_GPU_BIMC, rd(gcc, GCC_GPU_BIMC) | 1u);
++	wr(gcc, GCC_GPLL0_VOTE, rd(gcc, GCC_GPLL0_VOTE) | (3u << 3));
++	delay(100);
++	if (rd(gcc, GCC_GPU_CFG_AHB) >> 31) {
++		printf("SWEET GPU: gpu_cfg_ahb clock still off, GPUCC unreachable\n");
++		return false;
++	}
++	bool gfx = vdd_gfx(true);
++	wr(gpucc, GPUCC_CX_GDSC, rd(gpucc, GPUCC_CX_GDSC) & ~1u);
++	bool cx = wait_bits(gpucc, GPUCC_CX_GDSC, 1u << 31, 1u << 31);
++	/* gfx3d root on XO, forced on (downstream qcom,force-enable-root-clk) */
++	wr(gpucc, GPUCC_GFX3D_CFG, 0);
++	wr(gpucc, GPUCC_GFX3D_RCG, rd(gpucc, GPUCC_GFX3D_RCG) | 1u);
++	(void)wait_bits(gpucc, GPUCC_GFX3D_RCG, 1u, 0);
++	wr(gpucc, GPUCC_GFX3D_RCG, rd(gpucc, GPUCC_GFX3D_RCG) | 2u);
++	bool gx = false;
++	if (cx && gfx) {
++		wr(gpucc, GPUCC_GX_BCR, 1);
++		delay(10);
++		wr(gpucc, GPUCC_GX_BCR, 0);
++		wr(gpucc, GPUCC_GX_CLAMP, rd(gpucc, GPUCC_GX_CLAMP) | (1u << 4));
++		delay(10);
++		wr(gpucc, GPUCC_GX_CLAMP, rd(gpucc, GPUCC_GX_CLAMP) & ~(1u << 4));
++		wr(gpucc, GPUCC_GX_CLAMP, rd(gpucc, GPUCC_GX_CLAMP) & ~1u);
++		wr(gpucc, GPUCC_GX_GDSC, rd(gpucc, GPUCC_GX_GDSC) & ~1u);
++		gx = wait_bits(gpucc, GPUCC_GX_GDSC, 1u << 31, 1u << 31);
++		wr(gpucc, GPUCC_GFX3D_CBC, rd(gpucc, GPUCC_GFX3D_CBC) | (1u << 14));
++	}
++	printf("SWEET GPU: GDSC cx %s gx %s (vdd_gfx %s)\n", cx ? "on" : "OFF", gx ? "on" : "OFF",
++	    gfx ? "on" : "OFF");
++	if (!gx) {
++		return false;
++	}
++	wr(gpucc, GPUCC_GFX3D_CBC, rd(gpucc, GPUCC_GFX3D_CBC) | 1u);
++	wr(gpucc, GPUCC_RBBMTIMER, rd(gpucc, GPUCC_RBBMTIMER) | 1u);
++	bool ck = wait_bits(gpucc, GPUCC_GFX3D_CBC, 1u << 31, 0) &&
++	    wait_bits(gpucc, GPUCC_RBBMTIMER, 1u << 31, 0);
++	printf("SWEET GPU: clocks gfx3d 0x%08x rbbmtimer 0x%08x (%s)\n",
++	    rd(gpucc, GPUCC_GFX3D_CBC), rd(gpucc, GPUCC_RBBMTIMER), ck ? "running" : "NOT running");
++	return ck;
++}
++
++/* ---- read-back ---- */
++
++static void
++gpu_report(void)
++{
++	/* A5XX register dword offsets (Linux a5xx.xml.h) */
++	printf("SWEET GPU: RBBM_STATUS 0x%08x STATUS3 0x%08x INT_0_STATUS 0x%08x\n",
++	    rd(gpu, 0x4f5 * 4), rd(gpu, 0x530 * 4), rd(gpu, 0x4e1 * 4));
++	/* No SECVID reads here: secure-only registers may abort from this EE. */
++	printf("SWEET GPU: CP_RB_BASE 0x%08x%08x\n", rd(gpu, 0x801 * 4), rd(gpu, 0x800 * 4));
++	uint32_t c0 = rd(gpu, 0x3a0 * 4);
++	delay(1000);
++	printf("SWEET GPU: PERFCTR_CP_0 %u -> %u after 1 ms\n", c0, rd(gpu, 0x3a0 * 4));
++
++	uint32_t cr0 = rd(smmu, 0x0), idr0 = rd(smmu, 0x20), idr1 = rd(smmu, 0x24);
++	printf("SWEET GPU: SMMU sCR0 0x%08x (%s) sIDR0 0x%08x sIDR1 0x%08x sGFSR 0x%08x\n",
++	    cr0, (cr0 & 1u) ? "client bypass" : "translating", idr0, idr1, rd(smmu, 0x48));
++	unsigned pagesize = (idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	unsigned numpage = 1u << (((idr1 >> 28) & 7u) + 1u);
++	unsigned ncb = idr1 & 0xffu, nsmr = idr0 & 0xffu;
++	printf("SWEET GPU: SMMU %u SMRs, %u context banks, page %#x, CB base +%#x\n",
++	    nsmr, ncb, pagesize, numpage * pagesize);
++	for (unsigned i = 0; i < nsmr && i < 4; i++) {
++		printf("SWEET GPU: SMMU SMR%u 0x%08x S2CR%u 0x%08x\n", i, rd(smmu, 0x800 + 4 * i),
++		    i, rd(smmu, 0xc00 + 4 * i));
++	}
++	vm_offset_t cbs = numpage * pagesize;
++	for (unsigned i = 0; i < ncb && i < 4 && cbs + (i + 1) * pagesize <= SMMU_SIZE; i++) {
++		vm_offset_t cb = cbs + i * pagesize;
++		printf("SWEET GPU: SMMU CB%u SCTLR 0x%08x TTBR0 0x%08x%08x FSR 0x%08x CBAR 0x%08x\n",
++		    i, rd(smmu, cb), rd(smmu, cb + 0x24), rd(smmu, cb + 0x20), rd(smmu, cb + 0x58),
++		    rd(smmu, 0x1000 + 4 * i));
++	}
++}
++
++void
++sweet_a540_init(void)
++{
++	int mode = 0;
++	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
++	if (mode <= 0) {
++		return;
++	}
++	gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	gpucc = ml_io_map(GPUCC_PA, 0x2000);
++	gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!gcc || !gpucc || !gpu || !smmu) {
++		printf("SWEET GPU: mapping failed\n");
++		return;
++	}
++	printf("SWEET GPU: Adreno 540 stage A, sweetgpu=%d\n", mode);
++	printf("SWEET GPU: GCC cfg_ahb 0x%08x bimc_gfx 0x%08x gpu_bimc 0x%08x\n",
++	    rd(gcc, GCC_GPU_CFG_AHB), rd(gcc, GCC_BIMC_GFX), rd(gcc, GCC_GPU_BIMC));
++	if (mode == 1) {
++		bool ahb = !(rd(gcc, GCC_GPU_CFG_AHB) >> 31);
++		(void)vdd_gfx(false);
++		if (!ahb) {
++			printf("SWEET GPU: cfg_ahb off: GPUCC not read\n");
++			return;
++		}
++		uint32_t gxs = rd(gpucc, GPUCC_GX_GDSC);
++		printf("SWEET GPU: GPUCC cx 0x%08x gx 0x%08x gfx3d 0x%08x\n",
++		    rd(gpucc, GPUCC_CX_GDSC), gxs, rd(gpucc, GPUCC_GFX3D_CBC));
++		if ((gxs >> 31) && !(rd(gpucc, GPUCC_GFX3D_CBC) >> 31)) {
++			gpu_report();
++		}
++		return;
++	}
++	if (gpu_power_on()) {
++		gpu_report();
++		printf("SWEET GPU: Adreno 540 powered; stage A done\n");
++	} else {
++		printf("SWEET GPU: power-up stopped (see above)\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
