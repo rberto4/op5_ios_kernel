@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -20,8 +20,9 @@
+  * pull bits [1:0] of GPIO_CFG, as Android's bias-disable pinctrl does;
+  * function, drive and OE are kept. Otherwise the pins are only read
+  * (GPIO_IN_OUT bit 0). A position counts after 5 identical
+- * polls (100 ms; the contacts bounce). iPhone ringer switch: top and
+- * middle = silent, bottom = ring; sweetslider=0 disables it.
++ * polls (100 ms; the contacts bounce). iPhone ringer switch: top =
++ * silent, middle and bottom = ring (sweetslidermid=1: middle = silent);
++ * sweetslider=0 disables it.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -125,6 +126,7 @@
+ static const unsigned slider_pin[3] = { 40, 42, 26 };
+ static vm_offset_t slider_io[3];
+ static bool slider_on;
++static bool slider_mid_silent;  /* sweetslidermid=1: middle position = silent */
+ 
+ static void
+ slider_init(void)
+@@ -155,6 +157,9 @@
+ 		}
+ 	}
+ 	delay(1000);  /* let the external pull-ups charge the lines */
++	int mid = 0;
++	(void)PE_parse_boot_argn("sweetslidermid", &mid, sizeof(mid));
++	slider_mid_silent = (mid != 0);
+ 	slider_on = true;
+ 	printf("SWEET SLIDER: after  gpio40 cfg=%#x io=%#x gpio42 cfg=%#x io=%#x gpio26 cfg=%#x io=%#x\n",
+ 	    keys_rd(slider_io[0], 0), keys_rd(slider_io[0], 4),
+@@ -210,12 +215,13 @@
+ 		return;
+ 	}
+ 	/* Until backboardd has opened the buttons service, retry every 100 ms. */
+-	if (sweet_hid_ringer(pos != 2) <= 0) {
++	bool silent = (pos == 0) || (pos == 1 && slider_mid_silent);
++	if (sweet_hid_ringer(silent) <= 0) {
+ 		*count = 0;
+ 		return;
+ 	}
+ 	*reported = pos;
+-	printf("SWEET SLIDER: %s -> ringer %s\n", names[pos], pos == 2 ? "on" : "silent");
++	printf("SWEET SLIDER: %s -> ringer %s\n", names[pos], silent ? "silent" : "on");
+ }
+ 
+ static void
