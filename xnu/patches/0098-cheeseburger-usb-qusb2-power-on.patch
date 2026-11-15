@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -818,7 +818,46 @@
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
+ 		}
++	}
++}
++
++/*
++ * cheeseburger: ABL powers the QUSB2 PHY down when it leaves fastboot
++ * (0097 log: PORT_POWERDOWN 0x23 = CLAMP_N_EN | FREEZIO_N | POWER_DOWN,
++ * PLL_STATUS bit 0 CORE_READY clear), so the controller has no UTMI clock
++ * and endpoint commands never complete. Linux qusb2_phy_power_on ends by
++ * clearing POWER_DOWN, waiting 150 us and checking CORE_READY_STATUS
++ * (msm8998 cfg); ABL's tuning stays in the other registers. The PHY
++ * registers are 8 bits wide. sweetusbphy=0 skips this.
++ */
++#define QUSB2_PLL_STATUS        0x1a0
++#define   QUSB2_CORE_READY      (1u << 0)
++#define QUSB2_PORT_POWERDOWN    0x210
++#define   QUSB2_POWER_DOWN      (1u << 0)
++
++static void
++ud_qusb2_power_on(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetusbphy", &on, sizeof(on));
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (!on || phy == 0) {
++		printf("SWEET USB: QUSB2 power-on skipped (%s)\n", on ? "map failed" : "sweetusbphy=0");
++		return;
+ 	}
++	uint32_t pd = usb_rd(phy, QUSB2_PORT_POWERDOWN) & 0xff;
++	uint32_t st = usb_rd(phy, QUSB2_PLL_STATUS) & 0xff;
++	if (pd & QUSB2_POWER_DOWN) {
++		*(volatile uint32_t *)(phy + QUSB2_PORT_POWERDOWN) = pd & ~QUSB2_POWER_DOWN;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	int i;
++	for (i = 0; i < 20 && !(usb_rd(phy, QUSB2_PLL_STATUS) & QUSB2_CORE_READY); i++) {
++		delay(150);
++	}
++	printf("SWEET USB: QUSB2 POWERDOWN 0x%02x -> 0x%02x, PLL_STATUS 0x%02x -> 0x%02x (core %s after %d x 150 us)\n",
++	    pd, usb_rd(phy, QUSB2_PORT_POWERDOWN) & 0xff, st, usb_rd(phy, QUSB2_PLL_STATUS) & 0xff,
++	    (usb_rd(phy, QUSB2_PLL_STATUS) & QUSB2_CORE_READY) ? "ready" : "NOT ready", i);
+ }
+ 
+ static void
+@@ -871,6 +910,7 @@
+ 		printf("SWEET USB: no soft reset (sweetusbrst=0); controller %s after %d ms\n",
+ 		    (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ? "halted" : "NOT halted", i);
+ 	}
++	ud_qusb2_power_on();
+ 	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~(U2_SUSPHY | U2_ENBLSLPM));
+ 	dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) | U3_SUSPHY);
+ 	printf("SWEET USB: after:  GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
