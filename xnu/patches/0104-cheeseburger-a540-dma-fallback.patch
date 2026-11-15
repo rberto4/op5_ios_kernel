@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -489,9 +489,18 @@ stage_b(int mode)
+ 		return -1;
+ 	}
+ 	if (!dma) {
+-		if (kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK,
++		/* below 4 GiB if possible (test 0103: none free there), else anywhere (CB0 is VA64) */
++		kern_return_t kr = kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK,
+ 		    (ppnum_t)(((1ull << 32) >> PAGE_SHIFT) - 1), 0,
+-		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		if (kr != KERN_SUCCESS) {
++			printf("SWEET GPU B: no contiguous memory below 4 GiB (%d), trying anywhere\n", kr);
++			kr = kmem_alloc_contig(kernel_map, &dma, DMA_SIZE, PAGE_MASK, 0, 0,
++			    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		}
++		if (kr != KERN_SUCCESS) {
++			printf("SWEET GPU B: no contiguous DMA memory (%d)\n", kr);
++			dma = 0;
+ 			return -2;
+ 		}
+ 		dma_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)dma)) | (dma & PAGE_MASK);
