@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -3,7 +3,8 @@
+  *
+  * Runs only on request, from a process (the GPU must already be powered by
+  * stage A, boot-arg sweetgpu=2):
+- *   sysctl kern.sweetgpu_stage=1   SMMU stream 0 untranslated (=2: SMMU untouched), CP microcode, ME_INIT,
++ *   sysctl kern.sweetgpu_stage=1   SMMU stream 0 untranslated (=2: SMMU untouched,
++ *                                  =3: no zap, SECVID_TRUST_CNTL = 0 directly), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -86,6 +87,7 @@ bool sweet_a540_powered(void);
+ #define R_CP_PROTECT_CNTL       0x08a0
+ #define R_CP_PROTECT_0          0x0880   /* CP_PROTECT(i) = 0x880 + i */
+ #define R_SECVID_TSB_CNTL       0xf803
++#define R_SECVID_TRUST_CNTL     0xf400
+ #define R_SECVID_TSB_BASE_LO    0xf800
+ #define R_SECVID_TSB_BASE_HI    0xf801
+ #define R_SECVID_TSB_SIZE       0xf802
+@@ -340,15 +342,26 @@ rb_pkt7(uint32_t opcode, uint32_t cnt)
+ }
+ 
+ /* Make the ring visible to the GPU, kick it and wait until it is drained and idle. */
++/*
++ * RBBM_STATUS bits that mean "still working". Test 0104: after ME_INIT the
++ * ring was drained (RPTR = WPTR) with CP_BUSY clear, yet 0xc0000101 stayed
++ * set (GPU_BUSY_IGN_AHB, _CP, _HYST, HI_BUSY: no GPMU, no clock gating), so
++ * those four are ignored. Tunable: sysctl kern.sweetgpu_busymask.
++ */
++static int busy_mask = (int)0x3ffffefeu;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_busymask, CTLFLAG_RW | CTLFLAG_LOCKED, &busy_mask, 0,
++    "SWEET GPU stage B: RBBM_STATUS bits treated as busy");
++
+ static bool
+ rb_flush_wait(const char *what)
+ {
+ 	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+ 	for (int i = 0; i < 20000; i++) {
+-		if (grd(R_CP_RB_RPTR) == rb_wptr && !(grd(R_RBBM_STATUS) & ~1u) &&
++		if (grd(R_CP_RB_RPTR) == rb_wptr && !(grd(R_RBBM_STATUS) & (uint32_t)busy_mask) &&
+ 		    !(grd(R_RBBM_INT_0_STATUS) & 0x00800000u)) {
+-			printf("SWEET GPU B: %s: done after %d x 50 us (RPTR %u)\n", what, i, rb_wptr);
++			printf("SWEET GPU B: %s: done after %d x 50 us (RPTR %u, RBBM_STATUS 0x%08x)\n", what, i,
++			    rb_wptr, grd(R_RBBM_STATUS));
+ 			return true;
+ 		}
+ 		delay(50);
+@@ -566,15 +579,20 @@ stage_b(int mode)
+ 		return -5;
+ 	}
+ 
+-	/* 5. zap shader, then leave secure mode */
+-	if (zap_load() != 0) {
+-		gpu_dump("zap");
+-		return -6;
+-	}
+-	rb_pkt7(CP_SET_SECURE_MODE, 1);
+-	rb_out(0);
+-	if (!rb_flush_wait("SET_SECURE_MODE 0")) {
+-		return -7;
++	/* 5. zap shader, then leave secure mode (mode 3: no zap, direct write as Linux without one) */
++	if (mode == 3) {
++		gwr(R_SECVID_TRUST_CNTL, 0);
++		printf("SWEET GPU B: no zap: SECVID_TRUST_CNTL written 0\n");
++	} else {
++		if (zap_load() != 0) {
++			gpu_dump("zap");
++			return -6;
++		}
++		rb_pkt7(CP_SET_SECURE_MODE, 1);
++		rb_out(0);
++		if (!rb_flush_wait("SET_SECURE_MODE 0")) {
++			return -7;
++		}
+ 	}
+ 
+ 	/* 6. the GPU writes a value into our memory */
+@@ -604,7 +622,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value == 1 || value == 2) {
++	if (value >= 1 && value <= 3) {
+ 		printf("SWEET GPU B: stage B (mode %d) requested by pid %d\n", value, proc_selfpid());
+ 		stage_result = stage_b(value);
+ 		printf("SWEET GPU B: stage B result %d\n", stage_result);
