@@ -1,0 +1,185 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -61,6 +61,23 @@ bool sweet_a540_powered(void);
+ #define GPUCC_RBCPR_CBCR 0x1054u        /* rbcpr_clk, in the Linux msm8998 GPU node */
+ #define GPUCC_GFX3D_CBCR 0x1098u
+ #define CBCR_FORCE_MEM_PERIPH_ON (1u << 13)
++#define GPUCC_GFX3D_CMD         0x1070u
++#define GPUCC_GFX3D_CFG         0x1074u
++/* GPUPLL0, Fabia alpha PLL at GPUCC + 0 (Linux gpucc-msm8998 / clk-alpha-pll) */
++#define FABIA_MODE              0x00u
++#define FABIA_L_VAL             0x04u
++#define FABIA_CAL_L_VAL         0x08u
++#define FABIA_USER_CTL          0x0cu
++#define FABIA_OPMODE            0x2cu
++#define FABIA_FRAC              0x38u
++#define PLL_OUTCTRL             (1u << 0)
++#define PLL_RESET_N             (1u << 2)
++#define PLL_VOTE_FSM_ENA        (1u << 20)
++#define PLL_LOCK_DET            (1u << 31)
++#define PLL_OUT_MASK            0x7u
++#define PLL_POSTDIV_EVEN_MASK   (0xfu << 8)
++#define FABIA_CAL_L             63u     /* (249.6 + 2000) MHz * 0.54 / 19.2 MHz */
++#define GPU_L_MAX               43u     /* 412.8 MHz (SVS) until the GX rail is scaled */
+ #define ZAP_PA          0x95600000u     /* gpu_mem / pil_ipa_gpu carve-out */
+ #define ZAP_SIZE        0x00100000u
+ #define ZAP_MDATA_OFF   0x00080000u     /* metadata copy, outside the zap span */
+@@ -79,6 +96,8 @@ bool sweet_a540_powered(void);
+ #define R_RBBM_STATUS           0x04f5
+ #define R_RBBM_SW_RESET_CMD     0x0043
+ #define R_RBBM_PERFCTR_CNTL     0x0464
++#define R_RBBM_PERFCTR_CP_0_LO  0x03a0
++#define R_RBBM_ALWAYSON_LO      0x04d2
+ #define R_RBBM_PERFCTR_RBBM_SEL_0 0x046b
+ #define R_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
+ #define R_RBBM_INTERFACE_HANG_INT_CNTL 0x002f
+@@ -1128,6 +1147,123 @@ gpmu_domain_on(uint32_t cntl, uint32_t status, const char *name)
+ 	return (st & (1u << 20)) != 0;
+ }
+ 
++/*
++ * Phase C step 3: GPU clock. gfx3d = GPUPLL0 even output / 2 (Linux
++ * gpucc-msm8998 ftbl_gfx3d_clk_src); stage A leaves gfx3d on XO (19.2 MHz).
++ * sysctl kern.sweetgpu_pll_l = L (GPU clock = 19.2 MHz * L / 2; 0 = stay on
++ * XO), capped at GPU_L_MAX while the GX rail stays at stage A's 700 mV.
++ */
++static int pll_l;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_pll_l, CTLFLAG_RW | CTLFLAG_LOCKED, &pll_l, 0,
++    "SWEET GPU stage B: GPUPLL0 L value (GPU MHz = 9.6 * L, 0 = XO)");
++
++static bool
++fabia_wait_lock(volatile uint32_t *mode)
++{
++	for (int i = 0; i < 200; i++) {
++		if (*mode & PLL_LOCK_DET) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++/* alpha_pll_fabia_enable */
++static bool
++fabia_enable(vm_offset_t pll)
++{
++	volatile uint32_t *mode = (volatile uint32_t *)(pll + FABIA_MODE);
++	*mode &= ~PLL_OUTCTRL;
++	*(volatile uint32_t *)(pll + FABIA_OPMODE) = 0;         /* standby */
++	*mode |= PLL_RESET_N;
++	*(volatile uint32_t *)(pll + FABIA_OPMODE) = 1;         /* run */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!fabia_wait_lock(mode)) {
++		return false;
++	}
++	*(volatile uint32_t *)(pll + FABIA_USER_CTL) |= PLL_OUT_MASK;
++	*mode |= PLL_OUTCTRL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++/* alpha_pll_fabia_disable */
++static void
++fabia_disable(vm_offset_t pll)
++{
++	*(volatile uint32_t *)(pll + FABIA_MODE) &= ~PLL_OUTCTRL;
++	*(volatile uint32_t *)(pll + FABIA_USER_CTL) &= ~PLL_OUT_MASK;
++	*(volatile uint32_t *)(pll + FABIA_OPMODE) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static int
++gpu_clock_set(uint32_t l)
++{
++	vm_offset_t cc = ml_io_map(GPUCC_PA, 0x2000);
++	if (!cc) {
++		return -1;
++	}
++	volatile uint32_t *mode = (volatile uint32_t *)(cc + FABIA_MODE);
++	printf("SWEET GPU B: GPUPLL0 before: MODE 0x%08x L %u CAL_L %u USER_CTL 0x%08x OPMODE %u; gfx3d CFG 0x%08x\n",
++	    *mode, *(volatile uint32_t *)(cc + FABIA_L_VAL), *(volatile uint32_t *)(cc + FABIA_CAL_L_VAL),
++	    *(volatile uint32_t *)(cc + FABIA_USER_CTL), *(volatile uint32_t *)(cc + FABIA_OPMODE),
++	    *(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG));
++	if (*mode & PLL_VOTE_FSM_ENA) {
++		printf("SWEET GPU B: GPUPLL0 in FSM vote mode; not touching it\n");
++		return -1;
++	}
++	if (!(*mode & PLL_RESET_N)) {
++		/* alpha_pll_fabia_prepare: one calibration run */
++		*(volatile uint32_t *)(cc + FABIA_CAL_L_VAL) = FABIA_CAL_L;
++		*(volatile uint32_t *)(cc + FABIA_L_VAL) = FABIA_CAL_L;
++		bool cal = fabia_enable(cc);
++		printf("SWEET GPU B: GPUPLL0 calibration at L %u: %s (MODE 0x%08x)\n", FABIA_CAL_L,
++		    cal ? "locked" : "NO LOCK", *mode);
++		fabia_disable(cc);
++		if (!cal) {
++			return -1;
++		}
++	}
++	/* gfx3d back on XO while the PLL changes */
++	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG) = 0;
++	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD) |= 1u;
++	fabia_disable(cc);
++	*(volatile uint32_t *)(cc + FABIA_L_VAL) = l;
++	*(volatile uint32_t *)(cc + FABIA_FRAC) = 0;
++	*(volatile uint32_t *)(cc + FABIA_USER_CTL) &= ~PLL_POSTDIV_EVEN_MASK;       /* even out = VCO */
++	if (!fabia_enable(cc)) {
++		printf("SWEET GPU B: GPUPLL0 L %u: NO LOCK (MODE 0x%08x), gfx3d stays on XO\n", l, *mode);
++		fabia_disable(cc);
++		return -1;
++	}
++	/* gfx3d_clk_src: source 1 (GPUPLL0 even), divider 2 (field 2*2-1) */
++	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG) = (1u << 8) | 3u;
++	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD) |= 1u;
++	int i;
++	for (i = 0; i < 100 && (*(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD) & 1u); i++) {
++		delay(1);
++	}
++	printf("SWEET GPU B: GPUPLL0 L %u locked (MODE 0x%08x), gfx3d CMD 0x%08x CFG 0x%08x: %u.%u MHz requested\n",
++	    l, *mode, *(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD), *(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG),
++	    (192u * l / 2u) / 10u, (192u * l / 2u) % 10u);
++	return 0;
++}
++
++/* GPU clock from CP perf counter 0 (PERF_CP_ALWAYS_COUNT) against the 19.2 MHz always-on counter. */
++static void
++gpu_clock_measure(const char *when)
++{
++	uint32_t c0 = grd(R_RBBM_PERFCTR_CP_0_LO), a0 = grd(R_RBBM_ALWAYSON_LO);
++	delay(2000);
++	uint32_t c1 = grd(R_RBBM_PERFCTR_CP_0_LO), a1 = grd(R_RBBM_ALWAYSON_LO);
++	uint32_t dc = c1 - c0, da = a1 - a0;
++	uint64_t khz = da ? (uint64_t)dc * 19200ull / da : 0;
++	printf("SWEET GPU B: GPU clock %s: %u cycles / %u always-on ticks = %llu.%03llu MHz\n", when, dc, da,
++	    khz / 1000, khz % 1000);
++}
++
+ static int
+ stage_b(int mode)
+ {
+@@ -1189,8 +1325,15 @@ stage_b(int mode)
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+ 	use_iova = (mode == 5 || mode == 6 || mode == 7);
+ 
+-	/* 3. missing GPU clocks, soft reset, hardware init, ring, micro engine */
++	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
+ 	gpucc_extra_clocks();
++	if (pll_l != 0) {
++		if (pll_l < 13 || (uint32_t)pll_l > GPU_L_MAX) {
++			printf("SWEET GPU B: kern.sweetgpu_pll_l %d outside 13..%u; staying on XO\n", pll_l, GPU_L_MAX);
++		} else if (gpu_clock_set((uint32_t)pll_l) != 0) {
++			return -15;
++		}
++	}
+ 	gwr(R_RBBM_SW_RESET_CMD, 1);
+ 	(void)grd(R_RBBM_SW_RESET_CMD);
+ 	delay(10);
+@@ -1238,6 +1381,7 @@ stage_b(int mode)
+ 	if (!rb_flush_wait("ME_INIT")) {
+ 		return -5;
+ 	}
++	gpu_clock_measure("after ME_INIT");
+ 	if (gpmu_enable && power_init() != 0) {
+ 		return -10;
+ 	}
