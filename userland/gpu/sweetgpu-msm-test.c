@@ -116,11 +116,14 @@ now_ns(void)
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);       /* every step reaches ssh even if the kernel dies next */
+	printf("step: matching SweetGPU\n");
 	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
 	if (svc == 0) {
 		fprintf(stderr, "no SweetGPU service (boot with sweetgpu=2)\n");
 		return 1;
 	}
+	printf("step: IOServiceOpen\n");
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);
 	if (kr != KERN_SUCCESS) {
@@ -144,6 +147,7 @@ main(void)
 	printf("submitqueue: %d id %u\n", r, q.id);
 
 	/* 2. buffers */
+	printf("step: GEM_NEW + GEM_INFO + map\n");
 	uint32_t hc, hd;
 	uint64_t ic, id;
 	volatile uint32_t *cc, *cd;
@@ -168,6 +172,7 @@ main(void)
 	__sync_synchronize();
 
 	/* 4. submit, wait, check */
+	printf("step: SUBMIT\n");
 	struct drm_msm_gem_submit_bo bos[2] = {
 		{ .flags = MSM_SUBMIT_BO_READ, .handle = hc, .presumed = ic },
 		{ .flags = MSM_SUBMIT_BO_WRITE, .handle = hd, .presumed = id },

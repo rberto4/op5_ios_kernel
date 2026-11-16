@@ -1,0 +1,91 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -121,6 +121,7 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOReturn cpuPrep(struct drm_msm_gem_cpu_prep *req);
+ 	IOReturn submit(struct drm_msm_gem_submit *req);
+ 	IOReturn readUser(uint64_t address, void *out, size_t size);
++	IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -169,6 +170,7 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 	if (fBo == NULL || fSegPA == NULL || fSegLen == NULL || fLock == NULL) {
+ 		return false;
+ 	}
++	IOLog("SWEET GPU UC: open by task %p\n", owningTask);
+ 	/* bring the GPU up if the present path has not (first open waits for it) */
+ 	sweet_gpu_start();
+ 	for (int i = 0; i < 2000 && !sweet_gpu_ready(); i++) {
+@@ -211,13 +213,23 @@ SweetGPUUserClient::gemNew(struct drm_msm_gem_new *req)
+ 	if (h == SWEET_GPU_MAX_BOS) {
+ 		return kIOReturnNoResources;
+ 	}
+-	/* write-combined, as Linux gives freedreno its buffers */
++	/*
++	 * Plain cacheable kernel memory (tests 0128/0129: asking IOKit for a
++	 * write-combined buffer panicked the kernel, phystokv on a page below
++	 * XNU's RAM). Zero it through the cached kernel view, push that to
++	 * memory for the GPU; user space maps it write-combined
++	 * (clientMemoryForType), as Linux gives freedreno its buffers.
++	 */
++	IOLog("SWEET GPU UC: gem_new %llu bytes: allocating\n", size);
+ 	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, size, 0x4000);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 0x4000);
+ 	if (mem == NULL) {
+ 		return kIOReturnNoMemory;
+ 	}
+ 	bzero(mem->getBytesNoCopy(), (size_t)size);
++	mem->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	IOLog("SWEET GPU UC: gem_new: allocated, first segment 0x%llx\n",
++	    (unsigned long long)mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone));
+ 	uint32_t n = 0;
+ 	IOByteCount off = 0;
+ 	while (off < size && n < SWEET_GPU_MAX_SEGS) {
+@@ -239,6 +251,7 @@ SweetGPUUserClient::gemNew(struct drm_msm_gem_new *req)
+ 		off += len;
+ 	}
+ 	uint64_t va = off == size ? sweet_gpu_map(fSegPA, fSegLen, n, size) : 0;
++	IOLog("SWEET GPU UC: gem_new: %u segments, GPU address 0x%llx\n", n, va);
+ 	if (va == 0) {
+ 		mem->release();
+ 		return kIOReturnNoResources;
+@@ -382,7 +395,7 @@ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMe
+ 	}
+ 	fBo[type].mem->retain();
+ 	*memory = fBo[type].mem;
+-	*options = 0;
++	*options = kIOMapWriteCombineCache;     /* no CPU cache between user space and the GPU */
+ 	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
+@@ -396,9 +409,28 @@ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMe
+ 	memcpy(req, args->structureInput, sizeof(type)); \
+ 	args->structureOutputSize = sizeof(type)
+ 
++static uint32_t sweet_gpu_calls_logged;
++
+ IOReturn
+ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	/* bring-up trace (tests 0128/0129 died with nothing logged): the first calls */
++	bool log = sweet_gpu_calls_logged < 64;
++	if (log) {
++		sweet_gpu_calls_logged++;
++		IOLog("SWEET GPU UC: call 0x%x in %u out %u\n", selector, args->structureInputSize,
++		    args->structureOutputSize);
++	}
++	IOReturn ret = dispatchMethod(selector, args);
++	if (log) {
++		IOLog("SWEET GPU UC: call 0x%x -> 0x%x\n", selector, ret);
++	}
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments *args)
+ {
+ 	IOReturn ret;
+ 
