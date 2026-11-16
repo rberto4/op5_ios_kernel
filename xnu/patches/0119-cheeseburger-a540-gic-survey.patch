@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -616,9 +616,19 @@ gicd_spi_enable(uint32_t intid, bool on)
+ 		printf("SWEET GPU B: GIC: CTLR 0x%08x TYPER 0x%08x IGROUPR 0x%08x IGRPMODR 0x%08x (INTID %u bit %u)\n",
+ 		    *(volatile uint32_t *)(gicd + GICD_CTLR_OFF), *(volatile uint32_t *)(gicd + GICD_TYPER_OFF), grp0,
+ 		    *(volatile uint32_t *)(gicd + GICD_IGRPMODR(intid)), intid, intid % 32u);
++		/* test 0118: IGROUPR for INTID 332 reads 0 and ignores the write; is that true of every SPI? */
++		uint32_t lines = ((*(volatile uint32_t *)(gicd + GICD_TYPER_OFF) & 0x1fu) + 1u) * 32u;
++		for (uint32_t n = 32; n < lines; n += 256) {
++			printf("SWEET GPU B: GIC IGROUPR/ISENABLER INTID %u..%u:", n, n + 255);
++			for (uint32_t k = n; k < n + 256 && k < lines; k += 32) {
++				printf(" %08x/%08x", *(volatile uint32_t *)(gicd + GICD_IGROUPR(k)),
++				    *(volatile uint32_t *)(gicd + GICD_ISENABLER(k)));
++			}
++			printf("\n");
++		}
+ 		*(volatile uint32_t *)(gicd + GICD_IGROUPR(intid)) = grp0 | bit;      /* group 1 non-secure */
+ 		*(volatile uint8_t *)(gicd + GICD_IPRIORITYR(intid)) = 0xa0;
+-		*(volatile uint64_t *)(gicd + GICD_IROUTER(intid)) = 0;         /* CPU 0 (affinity 0.0.0.0) */
++		*(volatile uint64_t *)(gicd + GICD_IROUTER(intid)) = 1ull << 31; /* IRM: any participating CPU (0118: CPU 0 saw nothing) */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		*(volatile uint32_t *)(gicd + GICD_ISENABLER(intid)) = bit;
+ 	} else {
