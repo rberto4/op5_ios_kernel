@@ -423,7 +423,7 @@ diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,513 @@
 +/*
 + * SweetGPU: the Adreno 540 for user space (phase E).
 + *
@@ -445,7 +445,6 @@ new file mode 100644
 + * notice).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+#include <device/device_types.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
