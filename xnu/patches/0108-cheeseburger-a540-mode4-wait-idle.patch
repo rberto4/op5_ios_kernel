@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -4,7 +4,9 @@
+  * Runs only on request, from a process (the GPU must already be powered by
+  * stage A, boot-arg sweetgpu=2):
+  *   sysctl kern.sweetgpu_stage=1   SMMU stream 0 untranslated (=2: SMMU untouched,
+- *                                  =3: no zap, SECVID_TRUST_CNTL = 0 directly), CP microcode, ME_INIT,
++ *                                  =3: no zap, SECVID_TRUST_CNTL = 0 directly,
++ *                                  =4: no secure exit, MEM_WRITE, then
++ *                                  WAIT_FOR_IDLE + MEM_WRITE (-11 = that hung)), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -64,6 +66,9 @@ bool sweet_a540_powered(void);
+ #define R_RBBM_STATUS           0x04f5
+ #define R_RBBM_SW_RESET_CMD     0x0043
+ #define R_RBBM_PERFCTR_CNTL     0x0464
++#define R_RBBM_PERFCTR_RBBM_SEL_0 0x046b
++#define R_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
++#define R_RBBM_INTERFACE_HANG_INT_CNTL 0x002f
+ #define R_CP_PERFCTR_CP_SEL_0   0x0bb0
+ #define R_UCHE_CACHE_WAYS       0x0e96
+ #define R_UCHE_WRITE_THRU_LO    0x0e87
+@@ -128,6 +133,7 @@ static const uint16_t addr_mode_regs[] = {
+ #define CP_MEM_WRITE            61
+ #define CP_SET_SECURE_MODE      102
+ #define CP_SET_PROTECTED_MODE   95
++#define CP_WAIT_FOR_IDLE        38
+ #define CP_INDIRECT_BUFFER_PFE  63
+ #define CP_TYPE4_PKT            0x40000000u
+ #define TYPE4_MAX_PAYLOAD       127u
+@@ -462,9 +468,12 @@ hw_init(void)
+ {
+ 	gwr(R_VBIF_RR_QOS_ARB, 0x3);
+ 	gwr(R_VBIF_GATE_OFF_WRREQ, 0x9);
++	gwr(R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+ 	gwr(R_RBBM_AHB_CNTL0, 0x1);
++	gwr(R_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xffff);
+ 	gwr(R_RBBM_PERFCTR_CNTL, 0x1);
+ 	gwr(R_CP_PERFCTR_CP_SEL_0, 0);  /* PERF_CP_ALWAYS_COUNT */
++	gwr(R_RBBM_PERFCTR_RBBM_SEL_0, 6);
+ 	gwr(R_UCHE_CACHE_WAYS, 0x02);
+ 	gwr(R_UCHE_TRAP_LO, 0xffff0000);
+ 	gwr(R_UCHE_TRAP_HI, 0x0001ffff);
+@@ -628,6 +637,28 @@ power_init(void)
+ 	return 0;
+ }
+ 
++/* CP_MEM_WRITE of val into the scratch word; true when the GPU wrote it. */
++static bool
++mem_write_test(uint32_t val, bool wait_idle_first, const char *what)
++{
++	uint64_t target = dma_pa + DMA_SCRATCH;
++	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
++	flush_dcache64(target, 64, TRUE);
++	if (wait_idle_first) {
++		rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++	}
++	rb_pkt7(CP_MEM_WRITE, 3);
++	rb_out((uint32_t)target);
++	rb_out((uint32_t)(target >> 32));
++	rb_out(val);
++	bool drained = rb_flush_wait(what);
++	flush_dcache64(target, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
++	printf("SWEET GPU B: %s: scratch at 0x%llx = 0x%08x (%s)\n", what, target, got,
++	    got == val ? "GPU WROTE IT" : "unchanged");
++	return drained && got == val;
++}
++
+ static int
+ stage_b(int mode)
+ {
+@@ -722,6 +753,23 @@ stage_b(int mode)
+ 	}
+ 
+ 	/* 5. zap shader, then leave secure mode (mode 3: no zap, direct write as Linux without one) */
++	if (mode == 4) {
++		/*
++		 * Test 0107: SET_SECURE_MODE 0 hangs with RBBM_STATUS GPU_BUSY bits
++		 * never clear. Stay in secure mode: plain MEM_WRITE, then the same
++		 * after CP_WAIT_FOR_IDLE (hangs if "GPU busy" is the blocker).
++		 */
++		if (!mem_write_test(0xc0ffee01, false, "MEM_WRITE (no secure exit)")) {
++			gpu_dump("mode 4 first write");
++			return -8;
++		}
++		if (!mem_write_test(0xc0ffee02, true, "WAIT_FOR_IDLE + MEM_WRITE")) {
++			gpu_dump("mode 4 wait for idle");
++			return -11;
++		}
++		gpu_dump("end");
++		return 6;
++	}
+ 	if (mode == 3) {
+ 		gwr(R_SECVID_TRUST_CNTL, 0);
+ 		printf("SWEET GPU B: no zap: SECVID_TRUST_CNTL written 0\n");
+@@ -764,7 +812,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 3) {
++	if (value >= 1 && value <= 4) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
