@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -49,6 +49,12 @@ bool sweet_a540_powered(void);
+ 
+ #define GPU_PA          0x05000000u
+ #define SMMU_PA         0x05040000u
++#define GPUCC_PA        0x05065000u
++#define GPUCC_CXO_CBCR  0x1020u         /* gpucc_cxo_clk, critical in Linux */
++#define GPUCC_RBCPR_RCG 0x1030u
++#define GPUCC_RBCPR_CBCR 0x1054u        /* rbcpr_clk, in the Linux msm8998 GPU node */
++#define GPUCC_GFX3D_CBCR 0x1098u
++#define CBCR_FORCE_MEM_PERIPH_ON (1u << 13)
+ #define ZAP_PA          0x95600000u     /* gpu_mem / pil_ipa_gpu carve-out */
+ #define ZAP_SIZE        0x00100000u
+ #define ZAP_MDATA_OFF   0x00080000u     /* metadata copy, outside the zap span */
+@@ -659,6 +665,36 @@ mem_write_test(uint32_t val, bool wait_idle_first, const char *what)
+ 	return drained && got == val;
+ }
+ 
++/*
++ * Test 0108: CP_WAIT_FOR_IDLE hangs because RBBM_STATUS never goes idle
++ * (HI_BUSY set from power on). Stage A leaves two clocks of the Linux
++ * msm8998 GPU set off: gpucc_cxo_clk and rbcpr_clk (RCG left at its XO
++ * default). Linux gpucc probe also sets gfx3d FORCE_MEM_PERIPH_ON.
++ */
++static void
++gpucc_extra_clocks(void)
++{
++	vm_offset_t cc = ml_io_map(GPUCC_PA, 0x2000);
++	if (!cc) {
++		return;
++	}
++	volatile uint32_t *cxo = (volatile uint32_t *)(cc + GPUCC_CXO_CBCR);
++	volatile uint32_t *rbcpr = (volatile uint32_t *)(cc + GPUCC_RBCPR_CBCR);
++	volatile uint32_t *gfx3d = (volatile uint32_t *)(cc + GPUCC_GFX3D_CBCR);
++	printf("SWEET GPU B: GPUCC before: cxo 0x%08x rbcpr rcg 0x%08x cbcr 0x%08x gfx3d 0x%08x "
++	    "RBBM_STATUS 0x%08x\n", *cxo, *(volatile uint32_t *)(cc + GPUCC_RBCPR_RCG), *rbcpr, *gfx3d,
++	    grd(R_RBBM_STATUS));
++	*cxo |= 1u;
++	*rbcpr |= 1u;
++	*gfx3d |= CBCR_FORCE_MEM_PERIPH_ON;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (int i = 0; i < 200 && ((*cxo | *rbcpr) >> 31); i++) {
++		delay(10);
++	}
++	printf("SWEET GPU B: GPUCC after:  cxo 0x%08x rbcpr 0x%08x gfx3d 0x%08x RBBM_STATUS 0x%08x\n",
++	    *cxo, *rbcpr, *gfx3d, grd(R_RBBM_STATUS));
++}
++
+ static int
+ stage_b(int mode)
+ {
+@@ -715,7 +751,8 @@ stage_b(int mode)
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+ 
+-	/* 3. soft reset (clears what an earlier attempt left), hardware init, ring, micro engine */
++	/* 3. missing GPU clocks, soft reset, hardware init, ring, micro engine */
++	gpucc_extra_clocks();
+ 	gwr(R_RBBM_SW_RESET_CMD, 1);
+ 	(void)grd(R_RBBM_SW_RESET_CMD);
+ 	delay(10);
