@@ -1,0 +1,143 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -493,6 +493,129 @@ hwr(uint32_t reg, uint32_t v)
+ 	trace_status("write", reg);
+ }
+ 
++/*
++ * Hardware clock gating, as Linux a5xx_set_hwcg(gpu, true) for A540 (table
++ * a5xx_hwcg, register offsets from a5xx.xml.h). Test 0110: RBBM_STATUS
++ * GPU_BUSY bits flap with every register write and never settle idle, even
++ * with the CP halted. sysctl kern.sweetgpu_hwcg=0 skips it.
++ */
++static int hwcg_enable = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_hwcg, CTLFLAG_RW | CTLFLAG_LOCKED, &hwcg_enable, 0,
++    "SWEET GPU stage B: hardware clock gating");
++
++static const uint32_t a5xx_hwcg[][2] = {
++	{ 0x0068, 0x02222222 },  /* RBBM_CLOCK_CNTL_SP0 */
++	{ 0x0069, 0x02222222 },  /* RBBM_CLOCK_CNTL_SP1 */
++	{ 0x006a, 0x02222222 },  /* RBBM_CLOCK_CNTL_SP2 */
++	{ 0x006b, 0x02222222 },  /* RBBM_CLOCK_CNTL_SP3 */
++	{ 0x006c, 0x02222220 },  /* RBBM_CLOCK_CNTL2_SP0 */
++	{ 0x006d, 0x02222220 },  /* RBBM_CLOCK_CNTL2_SP1 */
++	{ 0x006e, 0x02222220 },  /* RBBM_CLOCK_CNTL2_SP2 */
++	{ 0x006f, 0x02222220 },  /* RBBM_CLOCK_CNTL2_SP3 */
++	{ 0x0070, 0x0000f3cf },  /* RBBM_CLOCK_HYST_SP0 */
++	{ 0x0071, 0x0000f3cf },  /* RBBM_CLOCK_HYST_SP1 */
++	{ 0x0072, 0x0000f3cf },  /* RBBM_CLOCK_HYST_SP2 */
++	{ 0x0073, 0x0000f3cf },  /* RBBM_CLOCK_HYST_SP3 */
++	{ 0x0074, 0x00000080 },  /* RBBM_CLOCK_DELAY_SP0 */
++	{ 0x0075, 0x00000080 },  /* RBBM_CLOCK_DELAY_SP1 */
++	{ 0x0076, 0x00000080 },  /* RBBM_CLOCK_DELAY_SP2 */
++	{ 0x0077, 0x00000080 },  /* RBBM_CLOCK_DELAY_SP3 */
++	{ 0x004a, 0x22222222 },  /* RBBM_CLOCK_CNTL_TP0 */
++	{ 0x004b, 0x22222222 },  /* RBBM_CLOCK_CNTL_TP1 */
++	{ 0x004c, 0x22222222 },  /* RBBM_CLOCK_CNTL_TP2 */
++	{ 0x004d, 0x22222222 },  /* RBBM_CLOCK_CNTL_TP3 */
++	{ 0x004e, 0x22222222 },  /* RBBM_CLOCK_CNTL2_TP0 */
++	{ 0x004f, 0x22222222 },  /* RBBM_CLOCK_CNTL2_TP1 */
++	{ 0x0050, 0x22222222 },  /* RBBM_CLOCK_CNTL2_TP2 */
++	{ 0x0051, 0x22222222 },  /* RBBM_CLOCK_CNTL2_TP3 */
++	{ 0x0052, 0x00002222 },  /* RBBM_CLOCK_CNTL3_TP0 */
++	{ 0x0053, 0x00002222 },  /* RBBM_CLOCK_CNTL3_TP1 */
++	{ 0x0054, 0x00002222 },  /* RBBM_CLOCK_CNTL3_TP2 */
++	{ 0x0055, 0x00002222 },  /* RBBM_CLOCK_CNTL3_TP3 */
++	{ 0x00b0, 0x77777777 },  /* RBBM_CLOCK_HYST_TP0 */
++	{ 0x00b1, 0x77777777 },  /* RBBM_CLOCK_HYST_TP1 */
++	{ 0x00b2, 0x77777777 },  /* RBBM_CLOCK_HYST_TP2 */
++	{ 0x00b3, 0x77777777 },  /* RBBM_CLOCK_HYST_TP3 */
++	{ 0x00b4, 0x77777777 },  /* RBBM_CLOCK_HYST2_TP0 */
++	{ 0x00b5, 0x77777777 },  /* RBBM_CLOCK_HYST2_TP1 */
++	{ 0x00b6, 0x77777777 },  /* RBBM_CLOCK_HYST2_TP2 */
++	{ 0x00b7, 0x77777777 },  /* RBBM_CLOCK_HYST2_TP3 */
++	{ 0x00b8, 0x00007777 },  /* RBBM_CLOCK_HYST3_TP0 */
++	{ 0x00b9, 0x00007777 },  /* RBBM_CLOCK_HYST3_TP1 */
++	{ 0x00ba, 0x00007777 },  /* RBBM_CLOCK_HYST3_TP2 */
++	{ 0x00bb, 0x00007777 },  /* RBBM_CLOCK_HYST3_TP3 */
++	{ 0x00a4, 0x11111111 },  /* RBBM_CLOCK_DELAY_TP0 */
++	{ 0x00a5, 0x11111111 },  /* RBBM_CLOCK_DELAY_TP1 */
++	{ 0x00a6, 0x11111111 },  /* RBBM_CLOCK_DELAY_TP2 */
++	{ 0x00a7, 0x11111111 },  /* RBBM_CLOCK_DELAY_TP3 */
++	{ 0x00a8, 0x11111111 },  /* RBBM_CLOCK_DELAY2_TP0 */
++	{ 0x00a9, 0x11111111 },  /* RBBM_CLOCK_DELAY2_TP1 */
++	{ 0x00aa, 0x11111111 },  /* RBBM_CLOCK_DELAY2_TP2 */
++	{ 0x00ab, 0x11111111 },  /* RBBM_CLOCK_DELAY2_TP3 */
++	{ 0x00ac, 0x00001111 },  /* RBBM_CLOCK_DELAY3_TP0 */
++	{ 0x00ad, 0x00001111 },  /* RBBM_CLOCK_DELAY3_TP1 */
++	{ 0x00ae, 0x00001111 },  /* RBBM_CLOCK_DELAY3_TP2 */
++	{ 0x00af, 0x00001111 },  /* RBBM_CLOCK_DELAY3_TP3 */
++	{ 0x005a, 0x22222222 },  /* RBBM_CLOCK_CNTL_UCHE */
++	{ 0x005b, 0x22222222 },  /* RBBM_CLOCK_CNTL2_UCHE */
++	{ 0x005c, 0x22222222 },  /* RBBM_CLOCK_CNTL3_UCHE */
++	{ 0x005d, 0x00222222 },  /* RBBM_CLOCK_CNTL4_UCHE */
++	{ 0x005e, 0x00444444 },  /* RBBM_CLOCK_HYST_UCHE */
++	{ 0x005f, 0x00000002 },  /* RBBM_CLOCK_DELAY_UCHE */
++	{ 0x0078, 0x22222222 },  /* RBBM_CLOCK_CNTL_RB0 */
++	{ 0x0079, 0x22222222 },  /* RBBM_CLOCK_CNTL_RB1 */
++	{ 0x007a, 0x22222222 },  /* RBBM_CLOCK_CNTL_RB2 */
++	{ 0x007b, 0x22222222 },  /* RBBM_CLOCK_CNTL_RB3 */
++	{ 0x007c, 0x00222222 },  /* RBBM_CLOCK_CNTL2_RB0 */
++	{ 0x007d, 0x00222222 },  /* RBBM_CLOCK_CNTL2_RB1 */
++	{ 0x007e, 0x00222222 },  /* RBBM_CLOCK_CNTL2_RB2 */
++	{ 0x007f, 0x00222222 },  /* RBBM_CLOCK_CNTL2_RB3 */
++	{ 0x0082, 0x00022220 },  /* RBBM_CLOCK_CNTL_CCU0 */
++	{ 0x0083, 0x00022220 },  /* RBBM_CLOCK_CNTL_CCU1 */
++	{ 0x0084, 0x00022220 },  /* RBBM_CLOCK_CNTL_CCU2 */
++	{ 0x0085, 0x00022220 },  /* RBBM_CLOCK_CNTL_CCU3 */
++	{ 0x008a, 0x05522222 },  /* RBBM_CLOCK_CNTL_RAC */
++	{ 0x008b, 0x00505555 },  /* RBBM_CLOCK_CNTL2_RAC */
++	{ 0x0086, 0x04040404 },  /* RBBM_CLOCK_HYST_RB_CCU0 */
++	{ 0x0087, 0x04040404 },  /* RBBM_CLOCK_HYST_RB_CCU1 */
++	{ 0x0088, 0x04040404 },  /* RBBM_CLOCK_HYST_RB_CCU2 */
++	{ 0x0089, 0x04040404 },  /* RBBM_CLOCK_HYST_RB_CCU3 */
++	{ 0x0080, 0x07444044 },  /* RBBM_CLOCK_HYST_RAC */
++	{ 0x008c, 0x00000002 },  /* RBBM_CLOCK_DELAY_RB_CCU_L1_0 */
++	{ 0x008d, 0x00000002 },  /* RBBM_CLOCK_DELAY_RB_CCU_L1_1 */
++	{ 0x008e, 0x00000002 },  /* RBBM_CLOCK_DELAY_RB_CCU_L1_2 */
++	{ 0x008f, 0x00000002 },  /* RBBM_CLOCK_DELAY_RB_CCU_L1_3 */
++	{ 0x0081, 0x00010011 },  /* RBBM_CLOCK_DELAY_RAC */
++	{ 0x0063, 0x04222222 },  /* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{ 0x0060, 0x02222222 },  /* RBBM_CLOCK_MODE_GPC */
++	{ 0x0091, 0x00002222 },  /* RBBM_CLOCK_MODE_VFD */
++	{ 0x0064, 0x00000000 },  /* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{ 0x0062, 0x04104004 },  /* RBBM_CLOCK_HYST_GPC */
++	{ 0x0090, 0x00000000 },  /* RBBM_CLOCK_HYST_VFD */
++	{ 0x0066, 0x00000000 },  /* RBBM_CLOCK_DELAY_HLSQ */
++	{ 0x0065, 0x00004000 },  /* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{ 0x0061, 0x00000200 },  /* RBBM_CLOCK_DELAY_GPC */
++	{ 0x0092, 0x00002222 },  /* RBBM_CLOCK_DELAY_VFD */
++};
++
++#define R_RBBM_CLOCK_CNTL       0x0067
++#define R_RBBM_CLOCK_DELAY_GPMU 0x00c9
++#define R_RBBM_CLOCK_HYST_GPMU  0x00ca
++#define R_RBBM_ISDB_CNT         0x0533
++
++static void
++set_hwcg(void)
++{
++	for (unsigned i = 0; i < sizeof(a5xx_hwcg) / sizeof(a5xx_hwcg[0]); i++) {
++		gwr(a5xx_hwcg[i][0], a5xx_hwcg[i][1]);
++	}
++	gwr(R_RBBM_CLOCK_DELAY_GPMU, 0x00000770);
++	gwr(R_RBBM_CLOCK_HYST_GPMU, 0x00000004);
++	gwr(R_RBBM_CLOCK_CNTL, 0xaaa8aa00);
++	gwr(R_RBBM_ISDB_CNT, 0x182);
++	trace_status("hwcg", R_RBBM_CLOCK_CNTL);
++}
++
+ static void
+ hw_init(void)
+ {
+@@ -521,6 +644,9 @@ hw_init(void)
+ 	hwr(R_UCHE_MODE_CNTL, 1u << 29);
+ 	hwr(R_CP_CHICKEN_DBG, 0x02000000);
+ 	hwr(R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	if (hwcg_enable) {
++		set_hwcg();
++	}
+ 	hwr(R_RBBM_AHB_CNTL2, 0x0000003f);
+ 	hwr(R_TPL1_MODE_CNTL, 2u << 7);
+ 	hwr(R_RB_MODE_CNTL, 2u << 1);
