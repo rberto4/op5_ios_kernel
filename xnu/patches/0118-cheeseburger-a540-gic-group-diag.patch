@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -586,6 +586,9 @@ smmu_translate_setup(void)
+ #define GICD_ICENABLER(n)       (0x0180u + 4u * ((n) / 32u))
+ #define GICD_ISPENDR(n)         (0x0200u + 4u * ((n) / 32u))
+ #define GICD_ICFGR(n)           (0x0c00u + 4u * ((n) / 16u))
++#define GICD_IGRPMODR(n)        (0x0d00u + 4u * ((n) / 32u))
++#define GICD_CTLR_OFF           0x0000u
++#define GICD_TYPER_OFF          0x0004u
+ #define GICD_IPRIORITYR(n)      (0x0400u + (n))
+ #define GICD_IROUTER(n)         (0x6000u + 8u * (n))
+ #define GPU_INTID               (32u + 300u)
+@@ -594,6 +597,7 @@ smmu_translate_setup(void)
+ #define INT_CP_CACHE_FLUSH_TS   0x00100000u
+ 
+ extern int sweet_irq_register(uint32_t intid, void (*fn)(uint32_t intid));
++extern uint32_t sweet_irq_count(uint32_t intid);
+ 
+ static vm_offset_t gicd;
+ static volatile uint32_t irq_count, irq_last_status;
+@@ -603,7 +607,16 @@ gicd_spi_enable(uint32_t intid, bool on)
+ {
+ 	uint32_t bit = 1u << (intid % 32u);
+ 	if (on) {
+-		*(volatile uint32_t *)(gicd + GICD_IGROUPR(intid)) |= bit;      /* group 1 non-secure */
++		/*
++		 * Test 0116: RBBM raised CACHE_FLUSH_TS and the GIC showed INTID 332
++		 * pending, but no IRQ reached sleh_irq and IGROUPR read 0 after
++		 * this write. Log the group state: a Group 0 SPI goes to EL3.
++		 */
++		uint32_t grp0 = *(volatile uint32_t *)(gicd + GICD_IGROUPR(intid));
++		printf("SWEET GPU B: GIC: CTLR 0x%08x TYPER 0x%08x IGROUPR 0x%08x IGRPMODR 0x%08x (INTID %u bit %u)\n",
++		    *(volatile uint32_t *)(gicd + GICD_CTLR_OFF), *(volatile uint32_t *)(gicd + GICD_TYPER_OFF), grp0,
++		    *(volatile uint32_t *)(gicd + GICD_IGRPMODR(intid)), intid, intid % 32u);
++		*(volatile uint32_t *)(gicd + GICD_IGROUPR(intid)) = grp0 | bit;      /* group 1 non-secure */
+ 		*(volatile uint8_t *)(gicd + GICD_IPRIORITYR(intid)) = 0xa0;
+ 		*(volatile uint64_t *)(gicd + GICD_IROUTER(intid)) = 0;         /* CPU 0 (affinity 0.0.0.0) */
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+@@ -687,6 +700,7 @@ irq_test(void)
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
+ 	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
++	printf("SWEET GPU B: IRQ: sleh_irq saw INTID %u %u time(s)\n", GPU_INTID, sweet_irq_count(GPU_INTID));
+ 	printf("SWEET GPU B: IRQ: %u interrupt(s), INT_0_STATUS 0x%08x, wait %d x 50 us (%llu us), fence 0x%08x (%s), "
+ 	    "RPTR %u WPTR %u\n", irq_count, irq_last_status, i, ns / 1000, got,
+ 	    got == 0x5eed0001 ? "written" : "NOT written", grd(R_CP_RB_RPTR), rb_wptr);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1934,6 +1934,14 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ typedef void (*sweet_irq_fn_t)(uint32_t intid);
+ #define SWEET_IRQ_MAX 1020
+ static sweet_irq_fn_t sweet_irq_fns[SWEET_IRQ_MAX];
++static uint32_t sweet_irq_counts[SWEET_IRQ_MAX];   /* IRQs taken per INTID, for bring-up */
++
++uint32_t sweet_irq_count(uint32_t intid);
++uint32_t
++sweet_irq_count(uint32_t intid)
++{
++	return intid < SWEET_IRQ_MAX ? __atomic_load_n(&sweet_irq_counts[intid], __ATOMIC_RELAXED) : 0;
++}
+ 
+ int sweet_irq_register(uint32_t intid, sweet_irq_fn_t fn);
+ int
+@@ -1982,8 +1990,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		sweet_irq_fn_t fn = intid < SWEET_IRQ_MAX ?
+-		    __atomic_load_n(&sweet_irq_fns[intid], __ATOMIC_ACQUIRE) : NULL;
++		sweet_irq_fn_t fn = NULL;
++		if (intid < SWEET_IRQ_MAX) {
++			__atomic_fetch_add(&sweet_irq_counts[intid], 1, __ATOMIC_RELAXED);
++			fn = __atomic_load_n(&sweet_irq_fns[intid], __ATOMIC_ACQUIRE);
++		}
+ 		if (fn) {
+ 			fn(intid);
+ 		} else if (cdp->interrupt_handler) {
