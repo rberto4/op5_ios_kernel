@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -36,6 +36,8 @@ void sweet_gpu_unmap(uint64_t iova, uint64_t size);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, uint32_t n);
+ int sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
+ void sweet_gpu_flush_va(uintptr_t va, size_t len);
++int copyin(const unsigned long long uaddr, void *kaddr, size_t len);      /* user_addr_t */
++task_t current_task(void);
+ }
+ 
+ /* ---- msm_drm.h (MIT, see above) ---- */
+@@ -186,18 +188,17 @@ SweetGPUUserClient::readUser(uint64_t address, void *out, size_t size)
+ 	if (size == 0) {
+ 		return kIOReturnSuccess;
+ 	}
+-	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)address, size,
+-	    kIODirectionOut, fTask);
+-	if (md == NULL) {
++	/*
++	 * copyin, by the caller's virtual addresses (externalMethod runs in the
++	 * calling task). Tests 0128/0131/0132: IOMemoryDescriptor::readBytes
++	 * copies by physical address (bcopy_phys -> phystokv) and panicked
++	 * whenever the user's page sat in the low RAM bank, outside XNU's
++	 * physical aperture.
++	 */
++	if (current_task() != fTask) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	IOReturn ret = md->prepare();
+-	if (ret == kIOReturnSuccess) {
+-		ret = md->readBytes(0, out, size) == size ? kIOReturnSuccess : kIOReturnBadArgument;
+-		md->complete();
+-	}
+-	md->release();
+-	return ret;
++	return copyin((unsigned long long)address, out, size) == 0 ? kIOReturnSuccess : kIOReturnBadArgument;
+ }
+ 
+ IOReturn
