@@ -54,7 +54,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
  static bool
  smmu_translate_setup(void)
  {
-@@ -821,6 +849,190 @@ rb_surface(uint32_t info_reg, uint32_t gras_reg, uint64_t addr)
+@@ -821,6 +849,191 @@ rb_surface(uint32_t info_reg, uint32_t gras_reg, uint64_t addr)
  
  static bool irq_test(void);
  
@@ -69,6 +69,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
 +    "SWEET GPU: mode 9 GPU copy time (us)");
 +SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_cpu_us, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_cpu_us, 0,
 +    "SWEET GPU: mode 9 CPU copy time (us)");
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);  /* PEXPERT/MACH private in machine_routines.h */
 +static uint64_t fb_pa;
 +static uint32_t fb_w, fb_h, fb_pitch;
 +static vm_offset_t fb_cpu;
@@ -245,7 +246,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
  static bool
  blit_test(void)
  {
-@@ -1497,7 +1709,7 @@ stage_b(int mode)
+@@ -1497,7 +1710,7 @@ stage_b(int mode)
  		return -3;
  	}
  	use_iova = false;
@@ -254,7 +255,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
  		return -13;
  	}
  
-@@ -1517,7 +1729,7 @@ stage_b(int mode)
+@@ -1517,7 +1730,7 @@ stage_b(int mode)
  	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
  	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
  	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
@@ -263,7 +264,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
  
  	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
  	gpucc_extra_clocks();
-@@ -1626,6 +1838,13 @@ stage_b(int mode)
+@@ -1626,6 +1839,13 @@ stage_b(int mode)
  
  	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
  	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
@@ -277,7 +278,7 @@ diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
  	if (ok && mode == 8) {
  		ok = blit_test();
  		if (!ok) {
-@@ -1686,7 +1905,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+@@ -1686,7 +1906,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
  	if (err || !req->newptr) {
  		return err;
  	}
