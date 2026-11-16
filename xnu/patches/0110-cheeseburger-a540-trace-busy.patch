@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -469,39 +469,63 @@ smmu_setup(void)
+ 
+ /* ---- stage B ---- */
+ 
++/*
++ * Test 0109: RBBM_STATUS is 0x1 after the soft reset and 0xc0000101 (GPU_BUSY
++ * summary bits, never clearing) once the CP runs. Log the write that sets them.
++ */
++static uint32_t trace_last;
++
++static void
++trace_status(const char *what, uint32_t reg)
++{
++	uint32_t st = grd(R_RBBM_STATUS);
++	if (st != trace_last) {
++		printf("SWEET GPU B: RBBM_STATUS 0x%08x -> 0x%08x after %s 0x%04x\n", trace_last, st, what,
++		    reg);
++		trace_last = st;
++	}
++}
++
++static void
++hwr(uint32_t reg, uint32_t v)
++{
++	gwr(reg, v);
++	trace_status("write", reg);
++}
++
+ static void
+ hw_init(void)
+ {
+-	gwr(R_VBIF_RR_QOS_ARB, 0x3);
+-	gwr(R_VBIF_GATE_OFF_WRREQ, 0x9);
+-	gwr(R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+-	gwr(R_RBBM_AHB_CNTL0, 0x1);
+-	gwr(R_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xffff);
+-	gwr(R_RBBM_PERFCTR_CNTL, 0x1);
+-	gwr(R_CP_PERFCTR_CP_SEL_0, 0);  /* PERF_CP_ALWAYS_COUNT */
+-	gwr(R_RBBM_PERFCTR_RBBM_SEL_0, 6);
+-	gwr(R_UCHE_CACHE_WAYS, 0x02);
+-	gwr(R_UCHE_TRAP_LO, 0xffff0000);
+-	gwr(R_UCHE_TRAP_HI, 0x0001ffff);
+-	gwr(R_UCHE_WRITE_THRU_LO, 0xffff0000);
+-	gwr(R_UCHE_WRITE_THRU_HI, 0x0001ffff);
+-	gwr(R_UCHE_GMEM_MIN_LO, 0x00100000);
+-	gwr(R_UCHE_GMEM_MIN_HI, 0);
+-	gwr(R_UCHE_GMEM_MAX_LO, 0x00100000 + 0x100000 - 1);    /* A540: 1 MiB GMEM */
+-	gwr(R_UCHE_GMEM_MAX_HI, 0);
+-	gwr(R_CP_MEQ_THRESHOLDS, 0x40);
+-	gwr(R_CP_MERCIU_SIZE, 0x400);
+-	gwr(R_CP_ROQ_THRESHOLDS_2, 0x80000060);
+-	gwr(R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
+-	gwr(R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
+-	gwr(R_UCHE_MODE_CNTL, 1u << 29);
+-	gwr(R_CP_CHICKEN_DBG, 0x02000000);
+-	gwr(R_RBBM_AHB_CNTL1, 0xa6ffffff);
+-	gwr(R_RBBM_AHB_CNTL2, 0x0000003f);
+-	gwr(R_TPL1_MODE_CNTL, 2u << 7);
+-	gwr(R_RB_MODE_CNTL, 2u << 1);
+-	gwr(R_UCHE_DBG_ECO_CNTL_2, 2);
+-	gwr(R_VPC_DBG_ECO_CNTL, grd(R_VPC_DBG_ECO_CNTL) | (1u << 10));
++	hwr(R_VBIF_RR_QOS_ARB, 0x3);
++	hwr(R_VBIF_GATE_OFF_WRREQ, 0x9);
++	hwr(R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	hwr(R_RBBM_AHB_CNTL0, 0x1);
++	hwr(R_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xffff);
++	hwr(R_RBBM_PERFCTR_CNTL, 0x1);
++	hwr(R_CP_PERFCTR_CP_SEL_0, 0);  /* PERF_CP_ALWAYS_COUNT */
++	hwr(R_RBBM_PERFCTR_RBBM_SEL_0, 6);
++	hwr(R_UCHE_CACHE_WAYS, 0x02);
++	hwr(R_UCHE_TRAP_LO, 0xffff0000);
++	hwr(R_UCHE_TRAP_HI, 0x0001ffff);
++	hwr(R_UCHE_WRITE_THRU_LO, 0xffff0000);
++	hwr(R_UCHE_WRITE_THRU_HI, 0x0001ffff);
++	hwr(R_UCHE_GMEM_MIN_LO, 0x00100000);
++	hwr(R_UCHE_GMEM_MIN_HI, 0);
++	hwr(R_UCHE_GMEM_MAX_LO, 0x00100000 + 0x100000 - 1);    /* A540: 1 MiB GMEM */
++	hwr(R_UCHE_GMEM_MAX_HI, 0);
++	hwr(R_CP_MEQ_THRESHOLDS, 0x40);
++	hwr(R_CP_MERCIU_SIZE, 0x400);
++	hwr(R_CP_ROQ_THRESHOLDS_2, 0x80000060);
++	hwr(R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	hwr(R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++	hwr(R_UCHE_MODE_CNTL, 1u << 29);
++	hwr(R_CP_CHICKEN_DBG, 0x02000000);
++	hwr(R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	hwr(R_RBBM_AHB_CNTL2, 0x0000003f);
++	hwr(R_TPL1_MODE_CNTL, 2u << 7);
++	hwr(R_RB_MODE_CNTL, 2u << 1);
++	hwr(R_UCHE_DBG_ECO_CNTL_2, 2);
++	hwr(R_VPC_DBG_ECO_CNTL, grd(R_VPC_DBG_ECO_CNTL) | (1u << 10));
+ 	/* CP register protection, as Linux (ADRENO_PROTECT_RW(reg, cnt)) */
+ 	static const uint32_t prot[][2] = {
+ 		{ 0x04, 4 }, { 0x08, 8 }, { 0x10, 16 }, { 0x20, 32 }, { 0x40, 64 }, { 0x80, 64 },
+@@ -509,22 +533,23 @@ hw_init(void)
+ 		{ 0x880, 32 }, { 0xaa0, 1 }, { 0xcc0, 1 }, { 0xcf0, 2 }, { 0xe68, 8 }, { 0xe70, 16 },
+ 		{ 0xe80, 16 }, { 0x10000, 0x8000 },
+ 	};
+-	gwr(R_CP_PROTECT_CNTL, 0x7);
++	hwr(R_CP_PROTECT_CNTL, 0x7);
+ 	for (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); i++) {
+ 		uint32_t cnt = prot[i][1], log2 = 0;
+ 		while ((2u << log2) <= cnt) {   /* ilog2 */
+ 			log2++;
+ 		}
+-		gwr(R_CP_PROTECT_0 + i, (1u << 30) | (1u << 29) | ((log2 & 0x1f) << 24) |
++		hwr(R_CP_PROTECT_0 + i, (1u << 30) | (1u << 29) | ((log2 & 0x1f) << 24) |
+ 		    ((prot[i][0] << 2) & 0xfffff));
+ 	}
+-	gwr(R_SECVID_TSB_CNTL, 0);
+-	gwr64(R_SECVID_TSB_BASE_LO, 0);
+-	gwr(R_SECVID_TSB_SIZE, 0);
++	hwr(R_SECVID_TSB_CNTL, 0);
++	hwr(R_SECVID_TSB_BASE_LO, 0);
++	hwr(R_SECVID_TSB_BASE_LO + 1, 0);
++	hwr(R_SECVID_TSB_SIZE, 0);
+ 	for (unsigned i = 0; i < sizeof(addr_mode_regs) / sizeof(addr_mode_regs[0]); i++) {
+-		gwr(addr_mode_regs[i], 1);
++		hwr(addr_mode_regs[i], 1);
+ 	}
+-	gwr(R_SECVID_TSB_ADDR_MODE, 1);
++	hwr(R_SECVID_TSB_ADDR_MODE, 1);
+ }
+ 
+ /*
+@@ -759,15 +784,26 @@ stage_b(int mode)
+ 	gwr(R_RBBM_SW_RESET_CMD, 0);
+ 	delay(10);
+ 	printf("SWEET GPU B: after soft reset RBBM_STATUS 0x%08x\n", grd(R_RBBM_STATUS));
++	trace_last = grd(R_RBBM_STATUS);
+ 	hw_init();
+ 	gwr64(R_CP_ME_INSTR_BASE_LO, dma_pa + DMA_PM4);
++	trace_status("ME base", R_CP_ME_INSTR_BASE_LO);
+ 	gwr64(R_CP_PFP_INSTR_BASE_LO, dma_pa + DMA_PFP);
++	trace_status("PFP base", R_CP_PFP_INSTR_BASE_LO);
+ 	gwr64(R_CP_RB_BASE, dma_pa + DMA_RB);
+ 	gwr(R_CP_RB_CNTL, 12u | (2u << 8) | RB_CNTL_NO_UPDATE);  /* 32 KiB, 32-byte blocks */
+ 	gwr(R_RBBM_INT_0_MASK, 0);
+ 	rb_wptr = 0;
+ 	gwr(R_CP_RB_WPTR, 0);
++	trace_status("ring setup", R_CP_RB_CNTL);
++	delay(100);
++	trace_status("100 us before CP start", 0);
+ 	gwr(R_CP_PFP_ME_CNTL, 0);
++	trace_status("CP start", R_CP_PFP_ME_CNTL);
++	for (int i = 0; i < 10; i++) {
++		delay(10);
++		trace_status("CP start + 10 us", i);
++	}
+ 	delay(100);
+ 	printf("SWEET GPU B: CP started: RBBM_STATUS 0x%08x RPTR %u\n", grd(R_RBBM_STATUS),
+ 	    grd(R_CP_RB_RPTR));
