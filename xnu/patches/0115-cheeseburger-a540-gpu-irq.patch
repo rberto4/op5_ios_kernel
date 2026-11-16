@@ -1,0 +1,229 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -10,7 +10,9 @@
+  *                                  =5: as 1 with CB0 translating through page
+  *                                  tables, -13 = page table setup refused,
+  *                                  =6: as 5, then a write to an unmapped
+- *                                  GPU address and one more valid write), CP microcode, ME_INIT,
++ *                                  GPU address and one more valid write,
++ *                                  =7: as 5, then CP_EVENT_WRITE with IRQ on
++ *                                  GIC SPI 300, -14 = no interrupt/fence), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -72,6 +74,7 @@ bool sweet_a540_powered(void);
+ #define R_RBBM_AHB_CNTL1        0x0094
+ #define R_RBBM_AHB_CNTL2        0x0095
+ #define R_RBBM_INT_0_MASK       0x0038
++#define R_RBBM_INT_CLEAR_CMD    0x0037
+ #define R_RBBM_INT_0_STATUS     0x04e1
+ #define R_RBBM_STATUS           0x04f5
+ #define R_RBBM_SW_RESET_CMD     0x0043
+@@ -148,6 +151,9 @@ static const uint16_t addr_mode_regs[] = {
+ #define CP_SET_SECURE_MODE      102
+ #define CP_SET_PROTECTED_MODE   95
+ #define CP_WAIT_FOR_IDLE        38
++#define CP_EVENT_WRITE          70
++#define EV_CACHE_FLUSH_TS       4u
++#define EV_IRQ                  (1u << 31)
+ #define CP_INDIRECT_BUFFER_PFE  63
+ #define CP_TYPE4_PKT            0x40000000u
+ #define TYPE4_MAX_PAYLOAD       127u
+@@ -568,6 +574,110 @@ smmu_translate_setup(void)
+ 	       srd(cb + CB_TTBR0) == (uint32_t)(dma_pa + DMA_PT_L1);
+ }
+ 
++/*
++ * Phase C step 2: GPU interrupt. The Adreno node's interrupt is GIC SPI 300
++ * (INTID 332), level high. The GIC distributor is left as pe_init_fiq set it
++ * (ARE_NS, group 1 enabled); this routes the SPI to CPU 0 and enables it,
++ * and osfmk/arm64/sleh.c (patch 0115) calls gpu_irq() before EOI.
++ */
++#define GICD_PA                 0x17a00000u
++#define GICD_IGROUPR(n)         (0x0080u + 4u * ((n) / 32u))
++#define GICD_ISENABLER(n)       (0x0100u + 4u * ((n) / 32u))
++#define GICD_ICENABLER(n)       (0x0180u + 4u * ((n) / 32u))
++#define GICD_IPRIORITYR(n)      (0x0400u + (n))
++#define GICD_IROUTER(n)         (0x6000u + 8u * (n))
++#define GPU_INTID               (32u + 300u)
++#define GPU_IRQ_STORM           1000u
++#define INT_CP_SW               0x00000100u
++#define INT_CP_CACHE_FLUSH_TS   0x00100000u
++
++extern int sweet_irq_register(uint32_t intid, void (*fn)(uint32_t intid));
++
++static vm_offset_t gicd;
++static volatile uint32_t irq_count, irq_last_status;
++
++static void
++gicd_spi_enable(uint32_t intid, bool on)
++{
++	uint32_t bit = 1u << (intid % 32u);
++	if (on) {
++		*(volatile uint32_t *)(gicd + GICD_IGROUPR(intid)) |= bit;      /* group 1 non-secure */
++		*(volatile uint8_t *)(gicd + GICD_IPRIORITYR(intid)) = 0xa0;
++		*(volatile uint64_t *)(gicd + GICD_IROUTER(intid)) = 0;         /* CPU 0 (affinity 0.0.0.0) */
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(gicd + GICD_ISENABLER(intid)) = bit;
++	} else {
++		*(volatile uint32_t *)(gicd + GICD_ICENABLER(intid)) = bit;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gpu_irq(uint32_t intid)
++{
++	uint32_t st = grd(R_RBBM_INT_0_STATUS);
++	gwr(R_RBBM_INT_CLEAR_CMD, st);
++	irq_last_status = st;
++	if (++irq_count >= GPU_IRQ_STORM) {
++		gwr(R_RBBM_INT_0_MASK, 0);
++		gicd_spi_enable(intid, false);
++	}
++}
++
++/* CP_EVENT_WRITE CACHE_FLUSH_TS with IRQ: the CP writes a fence value, then interrupts. */
++static bool
++irq_test(void)
++{
++	if (!gicd) {
++		gicd = ml_io_map(GICD_PA, 0x10000);
++	}
++	if (!gicd) {
++		return false;
++	}
++	gwr(R_RBBM_INT_CLEAR_CMD, 0xffffffffu);
++	irq_count = 0;
++	irq_last_status = 0;
++	if (sweet_irq_register(GPU_INTID, gpu_irq) != 0) {
++		printf("SWEET GPU B: IRQ: sweet_irq_register(%u) refused\n", GPU_INTID);
++		return false;
++	}
++	gicd_spi_enable(GPU_INTID, true);
++	gwr(R_RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS | INT_CP_SW);
++	printf("SWEET GPU B: IRQ: INTID %u enabled: IGROUPR 0x%08x ISENABLER 0x%08x IROUTER 0x%llx\n", GPU_INTID,
++	    *(volatile uint32_t *)(gicd + GICD_IGROUPR(GPU_INTID)),
++	    *(volatile uint32_t *)(gicd + GICD_ISENABLER(GPU_INTID)),
++	    *(volatile uint64_t *)(gicd + GICD_IROUTER(GPU_INTID)));
++
++	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
++	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++	uint64_t fence = gaddr(DMA_SCRATCH);
++	rb_pkt7(CP_EVENT_WRITE, 4);
++	rb_out(EV_CACHE_FLUSH_TS | EV_IRQ);
++	rb_out((uint32_t)fence);
++	rb_out((uint32_t)(fence >> 32));
++	rb_out(0x5eed0001);
++	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
++	uint64_t t0 = mach_absolute_time();
++	gwr(R_CP_RB_WPTR, rb_wptr);
++	int i;
++	for (i = 0; i < 2000 && irq_count == 0; i++) {
++		delay(50);
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
++	printf("SWEET GPU B: IRQ: %u interrupt(s), INT_0_STATUS 0x%08x, wait %d x 50 us (%llu us), fence 0x%08x (%s), "
++	    "RPTR %u WPTR %u\n", irq_count, irq_last_status, i, ns / 1000, got,
++	    got == 0x5eed0001 ? "written" : "NOT written", grd(R_CP_RB_RPTR), rb_wptr);
++
++	gwr(R_RBBM_INT_0_MASK, 0);
++	gicd_spi_enable(GPU_INTID, false);
++	(void)sweet_irq_register(GPU_INTID, NULL);
++	return irq_count > 0 && irq_count < GPU_IRQ_STORM && (irq_last_status & INT_CP_CACHE_FLUSH_TS) &&
++	       got == 0x5eed0001;
++}
++
+ /* ---- stage B ---- */
+ 
+ /*
+@@ -1013,7 +1123,7 @@ stage_b(int mode)
+ 		return -3;
+ 	}
+ 	use_iova = false;
+-	if ((mode == 5 || mode == 6) && !smmu_translate_setup()) {
++	if ((mode == 5 || mode == 6 || mode == 7) && !smmu_translate_setup()) {
+ 		return -13;
+ 	}
+ 
+@@ -1033,7 +1143,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+-	use_iova = (mode == 5 || mode == 6);
++	use_iova = (mode == 5 || mode == 6 || mode == 7);
+ 
+ 	/* 3. missing GPU clocks, soft reset, hardware init, ring, micro engine */
+ 	gpucc_extra_clocks();
+@@ -1123,6 +1233,13 @@ stage_b(int mode)
+ 
+ 	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
+ 	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
++	if (ok && mode == 7) {
++		ok = irq_test();
++		if (!ok) {
++			gpu_dump("IRQ test");
++			return -14;
++		}
++	}
+ 	if (ok && (mode == 5 || mode == 6)) {
+ 		ok = mem_write_at(DMA_TEST, IOVA_TEST, 0xc0ffee05, true, "MEM_WRITE test page");
+ 	}
+@@ -1156,7 +1273,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 6) {
++	if (value >= 1 && value <= 7) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1925,6 +1925,28 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++/*
++ * sweet: no IOKit interrupt controller drives the GIC, so drivers that want
++ * a device SPI register a handler here (called in interrupt context, before
++ * EOI; it must clear the device's interrupt source).
++ */
++typedef void (*sweet_irq_fn_t)(uint32_t intid);
++#define SWEET_IRQ_MAX 1020
++static sweet_irq_fn_t sweet_irq_fns[SWEET_IRQ_MAX];
++
++int sweet_irq_register(uint32_t intid, sweet_irq_fn_t fn);
++int
++sweet_irq_register(uint32_t intid, sweet_irq_fn_t fn)
++{
++	if (intid < 32 || intid >= SWEET_IRQ_MAX) {
++		return -1;
++	}
++	__atomic_store_n(&sweet_irq_fns[intid], fn, __ATOMIC_RELEASE);
++	return 0;
++}
++#endif /* SWEET */
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1960,7 +1982,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		sweet_irq_fn_t fn = intid < SWEET_IRQ_MAX ?
++		    __atomic_load_n(&sweet_irq_fns[intid], __ATOMIC_ACQUIRE) : NULL;
++		if (fn) {
++			fn(intid);
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
