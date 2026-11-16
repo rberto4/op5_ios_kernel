@@ -157,7 +157,14 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
 	 * made that way, and this mapping is as the memory is.
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+	/*
+	 * (op5) The cache mode a client asks for here replaces the kernel's
+	 * (IOUserClient::mapClientMemory64), so ask for write-combine
+	 * explicitly: with a cached mapping the commands stayed in this CPU's
+	 * cache and the GPU read zeros (test 0131).
+	 */
+	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+	    kIOMapAnywhere | kIOMapWriteCombineCache) != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
 	return (void *)(uintptr_t)address;

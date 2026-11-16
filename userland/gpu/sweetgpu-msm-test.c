@@ -96,7 +96,9 @@ bo_new(uint64_t size, uint32_t *handle, uint64_t *iova, volatile uint32_t **cpu)
 	}
 	mach_vm_address_t addr = 0;
 	mach_vm_size_t mapped = 0;
-	if (IOConnectMapMemory64(conn, n.handle, mach_task_self(), &addr, &mapped, kIOMapAnywhere) != KERN_SUCCESS) {
+	/* the caller's cache mode wins over the kernel's (IOUserClient::mapClientMemory64): ask for WC */
+	if (IOConnectMapMemory64(conn, n.handle, mach_task_self(), &addr, &mapped,
+	    kIOMapAnywhere | kIOMapWriteCombineCache) != KERN_SUCCESS) {
 		return -1;
 	}
 	*handle = n.handle;

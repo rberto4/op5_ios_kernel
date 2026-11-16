@@ -64,6 +64,12 @@ main(int argc, char **argv)
 			return 1;
 		}
 	}
+	int64_t wide = 0;
+	size_t wlen = sizeof(wide);
+	if (sysctlbyname(name, &wide, &wlen, NULL, 0) == 0 && wlen == sizeof(wide)) {
+		printf("%s: %lld (0x%016llx)\n", name, (long long)wide, (unsigned long long)wide);
+		return 0;
+	}
 	int now = 0;
 	if (read_int(name, &now) != 0) {
 		return 1;

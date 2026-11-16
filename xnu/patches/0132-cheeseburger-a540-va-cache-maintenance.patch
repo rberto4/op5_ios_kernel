@@ -1,0 +1,284 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -473,7 +473,7 @@ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_busymask, CTLFLAG_RW | CTLFLAG_LOCKED, &bus
+ static bool
+ rb_flush_wait(const char *what)
+ {
+-	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_RB), RB_SIZE, FALSE);
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+ 	for (int i = 0; i < 20000; i++) {
+ 		if (grd(R_CP_RB_RPTR) == rb_wptr && !(grd(R_RBBM_STATUS) & (uint32_t)busy_mask) &&
+@@ -605,8 +605,8 @@ pt_map_blocks(uint64_t pa, uint64_t len)
+ 	for (uint64_t off = 0; off < len; off += 0x200000ull) {
+ 		l2[((IOVA_FB + off) >> 21) & 0x1ff] = (pa + off) | (PTE_PAGE & ~0x2ull);    /* block: bits[1:0] = 01 */
+ 	}
+-	flush_dcache64(dma_pa + DMA_PT_L1, 0x1000, TRUE);
+-	flush_dcache64(dma_pa + DMA_PT_L2B, 0x1000, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L1), 0x1000, FALSE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L2B), 0x1000, FALSE);
+ 	swr(SMMU_CB(0) + CB_TLBIALL, 0);
+ 	swr(SMMU_CB(0) + CB_TLBSYNC, 0);
+ 	for (int i = 0; i < 1000 && (srd(SMMU_CB(0) + CB_TLBSTATUS) & 1u); i++) {
+@@ -621,7 +621,7 @@ smmu_translate_setup(void)
+ 	memset((void *)(dma + DMA_PT_L1), 0, 4 * 0x1000);
+ 	pt_map(IOVA_DMA, 0, DMA_SIZE);
+ 	pt_map(IOVA_TEST, DMA_TEST, 0x1000);
+-	flush_dcache64(dma_pa + DMA_PT_L1, 4 * 0x1000, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L1), 4 * 0x1000, FALSE);
+ 
+ 	uint32_t cb = SMMU_CB(0);
+ 	swr(cb + CB_SCTLR, 0);
+@@ -754,14 +754,14 @@ irq_test(void)
+ 	    *(volatile uint64_t *)(gicd + GICD_IROUTER(GPU_INTID)));
+ 
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+-	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_SCRATCH), 64, FALSE);
+ 	uint64_t fence = gaddr(DMA_SCRATCH);
+ 	rb_pkt7(CP_EVENT_WRITE, 4);
+ 	rb_out(EV_CACHE_FLUSH_TS | EV_IRQ);
+ 	rb_out((uint32_t)fence);
+ 	rb_out((uint32_t)(fence >> 32));
+ 	rb_out(0x5eed0001);
+-	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_RB), RB_SIZE, FALSE);
+ 	uint64_t t0 = mach_absolute_time();
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+ 	int i, st_at = -1, pend_at = -1;
+@@ -782,7 +782,7 @@ irq_test(void)
+ 	    "(-1 = never)\n", st_seen, st_at, pend_at);
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_SCRATCH), 64, FALSE);
+ 	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
+ 	printf("SWEET GPU B: IRQ: sleh_irq saw INTID %u %u time(s)\n", GPU_INTID, sweet_irq_count(GPU_INTID));
+ 	printf("SWEET GPU B: IRQ: %u interrupt(s), INT_0_STATUS 0x%08x, wait %d x 50 us (%llu us), fence 0x%08x (%s), "
+@@ -1003,7 +1003,7 @@ screen_test(void)
+ 			src[y * IMG_W + x] = img_pattern(x, y);
+ 		}
+ 	}
+-	flush_dcache64(dma_pa + DMA_IMG_SRC, IMG_PITCH * IMG_H, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_IMG_SRC), IMG_PITCH * IMG_H, FALSE);
+ 	uint32_t ox = (fb_w - TILE_N * IMG_W) / 2u, oy = ((fb_h - TILE_N * IMG_H) / 2u) & ~1u;
+ 	/* step 3: a single tile, top-left of the box */
+ 	rb_blit_setup();
+@@ -1111,7 +1111,7 @@ blit_test(void)
+ 			dst[y * IMG_W + x] = 0;
+ 		}
+ 	}
+-	flush_dcache64(dma_pa + DMA_IMG_SRC, 2 * IMG_PITCH * IMG_H, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_IMG_SRC), 2 * IMG_PITCH * IMG_H, FALSE);
+ 
+ 	/* fd5_blitter emit_setup */
+ 	rb_reg(R_RB_RENDER_CNTL, 0x00000008);
+@@ -1141,7 +1141,7 @@ blit_test(void)
+ 
+ 	/* CACHE_FLUSH_TS with IRQ: flushes the render caches, writes the fence, interrupts */
+ 	bool fenced = irq_test();
+-	flush_dcache64(dma_pa + DMA_IMG_DST, IMG_PITCH * IMG_H, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_IMG_DST), IMG_PITCH * IMG_H, FALSE);
+ 	uint32_t bad = 0, first_x = 0, first_y = 0, first_got = 0, first_want = 0, inside = 0;
+ 	for (uint32_t y = 0; y < IMG_H; y++) {
+ 		for (uint32_t x = 0; x < IMG_W; x++) {
+@@ -1185,7 +1185,7 @@ scale_variant(uint32_t which, uint32_t mode)
+ 	for (uint32_t i = 0; i < SC_PX * SC_PX; i++) {
+ 		dst[i] = 0x12345678u;
+ 	}
+-	flush_dcache64(dma_pa + off, SC_PITCH * SC_PX, TRUE);
++	flush_dcache64((addr64_t)(dma + off), SC_PITCH * SC_PX, FALSE);
+ 	rb_blit_setup();
+ 	rb_pkt7(CP_SET_RENDER_MODE, 1);
+ 	rb_out(mode);
+@@ -1209,7 +1209,7 @@ scale_variant(uint32_t which, uint32_t mode)
+ 	rb_out(RENDER_MODE_END2D);
+ 	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
+ 	bool fenced = irq_test();
+-	flush_dcache64(dma_pa + off, SC_PITCH * SC_PX, TRUE);
++	flush_dcache64((addr64_t)(dma + off), SC_PITCH * SC_PX, FALSE);
+ 	uint32_t written = 0, outside = 0, nearest = 0, maxerr = 0;
+ 	for (uint32_t y = 0; y < SC_PX; y++) {
+ 		for (uint32_t x = 0; x < SC_PX; x++) {
+@@ -1254,7 +1254,7 @@ scale_test(void)
+ 			src[y * IMG_W + x] = img_pattern(x, y);
+ 		}
+ 	}
+-	flush_dcache64(dma_pa + DMA_IMG_SRC, IMG_PITCH * IMG_H, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_IMG_SRC), IMG_PITCH * IMG_H, FALSE);
+ 	scale_res_a = (int)scale_variant(0, RENDER_MODE_BLIT2D);
+ 	if (scale_res_a == -1) {
+ 		return -1;
+@@ -1548,7 +1548,7 @@ gpmu_build_ib(void)
+ 		offset += n;
+ 		left -= n;
+ 	}
+-	flush_dcache64(dma_pa + DMA_GPMU, dwords * 4, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_GPMU), dwords * 4, FALSE);
+ out:
+ 	kfree_data(fw, FW_MAX);
+ 	return dwords;
+@@ -1596,7 +1596,7 @@ mem_write_at(uint32_t off, uint64_t gpu_addr, uint32_t val, bool wait_idle_first
+ {
+ 	uint64_t pa = dma_pa + off;
+ 	*(volatile uint32_t *)(dma + off) = 0xdeadbeef;
+-	flush_dcache64(pa, 64, TRUE);
++	flush_dcache64((addr64_t)(dma + off), 64, FALSE);
+ 	if (wait_idle_first) {
+ 		rb_pkt7(CP_WAIT_FOR_IDLE, 0);
+ 	}
+@@ -1605,7 +1605,7 @@ mem_write_at(uint32_t off, uint64_t gpu_addr, uint32_t val, bool wait_idle_first
+ 	rb_out((uint32_t)(gpu_addr >> 32));
+ 	rb_out(val);
+ 	bool drained = rb_flush_wait(what);
+-	flush_dcache64(pa, 64, TRUE);
++	flush_dcache64((addr64_t)(dma + off), 64, FALSE);
+ 	uint32_t got = *(volatile uint32_t *)(dma + off);
+ 	printf("SWEET GPU B: %s: GPU address 0x%llx (PA 0x%llx) = 0x%08x (%s)\n", what, gpu_addr, pa, got,
+ 	    got == val ? "GPU WROTE IT" : "unchanged");
+@@ -1891,7 +1891,7 @@ stage_b(int mode)
+ 	kfree_data(pfp, FW_MAX);
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+-	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
++	flush_dcache64((addr64_t)dma, DMA_SIZE, FALSE);
+ 	use_iova = (mode >= 5 && mode <= 10);
+ 
+ 	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
+@@ -2146,12 +2146,12 @@ gpu_core_init(void)
+ 		return false;
+ 	}
+ 	memset((void *)(dma + DMA_PT_L2D), 0, 0x1000);
+-	flush_dcache64(dma_pa + DMA_PT_L2D, 0x1000, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L2D), 0x1000, FALSE);
+ 	volatile uint64_t *l1 = (volatile uint64_t *)(dma + DMA_PT_L1);
+ 	l1[(IOVA_BO >> 30) & 3] = (dma_pa + DMA_PT_L2D) | PTE_TABLE;
+-	flush_dcache64(dma_pa + DMA_PT_L1, 0x1000, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L1), 0x1000, FALSE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0;
+-	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_SCRATCH), 64, FALSE);
+ 	gpu_seq = 0;
+ 	return true;
+ }
+@@ -2193,11 +2193,27 @@ rb_fence_kick(void)
+ 	rb_out((uint32_t)(fence >> 32));
+ 	rb_out(seq);
+ 	gpu_seq = seq;
+-	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_RB), RB_SIZE, FALSE);
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+ 	return seq;
+ }
+ 
++/*
++ * Tests 0128 and 0131: XNU here also hands out pages below 4 GiB (the
++ * low RAM bank), which are not in its physical aperture, so any cache
++ * maintenance by physical address (flush_dcache64(..., TRUE),
++ * IOMemoryDescriptor kIOMemoryIncoherentIOFlush) panics in phystokv on
++ * them. All cache maintenance goes through kernel virtual addresses.
++ */
++void sweet_gpu_flush_va(uintptr_t va, size_t len);
++void
++sweet_gpu_flush_va(uintptr_t va, size_t len)
++{
++	if (va != 0 && len != 0) {
++		flush_dcache64((addr64_t)va, (unsigned)len, FALSE);
++	}
++}
++
+ int sweet_gpu_ready(void);
+ int
+ sweet_gpu_ready(void)
+@@ -2215,7 +2231,7 @@ sweet_gpu_wait(uint32_t seq, uint32_t timeout_us)
+ 	nanoseconds_to_absolutetime((uint64_t)timeout_us * 1000ull, &deadline);
+ 	deadline += mach_absolute_time();
+ 	for (;;) {
+-		flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
++		flush_dcache64((addr64_t)(dma + DMA_SCRATCH), 64, FALSE);
+ 		if ((int32_t)(*fv - seq) >= 0) {
+ 			return 0;
+ 		}
+@@ -2274,7 +2290,7 @@ bo_l3_table(uint32_t t)
+ 	flush_dcache64((addr64_t)va, 0x1000, FALSE);
+ 	volatile uint64_t *l2 = (volatile uint64_t *)(dma + DMA_PT_L2D);
+ 	l2[t] = pa | PTE_TABLE;
+-	flush_dcache64(dma_pa + DMA_PT_L2D + 8u * t, 8, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L2D + 8u * t), 8, FALSE);
+ 	return true;
+ }
+ 
+@@ -2518,11 +2534,11 @@ pt_map_surface(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t nseg)
+ 		for (uint32_t t = 0; t < 4; t++) {
+ 			l2[((IOVA_SURF >> 21) & 0x1ff) + t] = (dma_pa + DMA_PT_L3S + 0x1000u * t) | PTE_TABLE;
+ 		}
+-		flush_dcache64(dma_pa + DMA_PT_L2C, 0x1000, TRUE);
++		flush_dcache64((addr64_t)(dma + DMA_PT_L2C), 0x1000, FALSE);
+ 		l1[(IOVA_SURF >> 30) & 3] = (dma_pa + DMA_PT_L2C) | PTE_TABLE;
+-		flush_dcache64(dma_pa + DMA_PT_L1, 0x1000, TRUE);
++		flush_dcache64((addr64_t)(dma + DMA_PT_L1), 0x1000, FALSE);
+ 	}
+-	flush_dcache64(dma_pa + DMA_PT_L3S, 4 * 0x1000, TRUE);
++	flush_dcache64((addr64_t)(dma + DMA_PT_L3S), 4 * 0x1000, FALSE);
+ 	swr(SMMU_CB(0) + CB_TLBIALL, 0);
+ 	swr(SMMU_CB(0) + CB_TLBSYNC, 0);
+ 	for (int i = 0; i < 1000 && (srd(SMMU_CB(0) + CB_TLBSTATUS) & 1u); i++) {
+@@ -2548,11 +2564,7 @@ sweet_gpu_present_copy(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t
+ 		return -1;
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+-	for (uint32_t i = 0; i < nseg; i++) {
+-		if (seg_pa[i] >= 0x100000000ull) {     /* only XNU's RAM has a kernel view to flush */
+-			flush_dcache64(seg_pa[i], (unsigned)seg_len[i], TRUE);     /* backboardd drew with the CPU */
+-		}
+-	}
++	/* the caller cleaned the surface rows from the CPU caches by virtual address (sweet_gpu_flush_va) */
+ 	lck_mtx_lock(gpu_mtx);
+ 	if (!pt_map_surface(seg_pa, seg_len, nseg) || !rb_space(96)) {
+ 		lck_mtx_unlock(gpu_mtx);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -161,6 +161,7 @@ extern "C" {
+ vm_offset_t sweet_fb_kva;
+ /* bsd/dev/sweet_a540_b.c: GPU copies for the present path (sweetfb_gpu=1) */
+ int sweet_gpu_present_start(void);
++void sweet_gpu_flush_va(uintptr_t va, size_t len);
+ int sweet_gpu_present_copy(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t nseg, uint32_t src_off,
+     uint32_t bpr, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
+ }
+@@ -608,6 +609,12 @@ AppleCLCD::gpuCopy(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t
+ 	if (off < total) {
+ 		return false;
+ 	}
++	/* clean the rows backboardd drew from the CPU caches, by virtual address (pages may sit below 4 GiB) */
++	uintptr_t kva = s->kernelAddress();
++	if (kva == 0) {
++		return false;
++	}
++	sweet_gpu_flush_va(kva + s->offset + (uintptr_t)sy * s->bytesPerRow, (size_t)h * s->bytesPerRow);
+ 	return sweet_gpu_present_copy(fSegPA, fSegLen, n, s->offset, s->bytesPerRow, (uint32_t)sx, (uint32_t)sy,
+ 	           (uint32_t)dx, (uint32_t)dy, (uint32_t)w, (uint32_t)h) == 0;
+ }
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -35,6 +35,7 @@ uint64_t sweet_gpu_map(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t
+ void sweet_gpu_unmap(uint64_t iova, uint64_t size);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, uint32_t n);
+ int sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
++void sweet_gpu_flush_va(uintptr_t va, size_t len);
+ }
+ 
+ /* ---- msm_drm.h (MIT, see above) ---- */
+@@ -227,7 +228,8 @@ SweetGPUUserClient::gemNew(struct drm_msm_gem_new *req)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	bzero(mem->getBytesNoCopy(), (size_t)size);
+-	mem->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	/* by virtual address: a physical flush panics on pages below 4 GiB (test 0131) */
++	sweet_gpu_flush_va((uintptr_t)mem->getBytesNoCopy(), (size_t)size);
+ 	IOLog("SWEET GPU UC: gem_new: allocated, first segment 0x%llx\n",
+ 	    (unsigned long long)mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone));
+ 	uint32_t n = 0;
