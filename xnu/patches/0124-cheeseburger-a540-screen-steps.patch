@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -856,11 +856,23 @@ static bool irq_test(void);
+  * 2k is the left half of virtual row k, row 2k+1 the right half.
+  */
+ static int screen_gpu_us, screen_cpu_us;
++/*
++ * Test 0123: the phone hung in mode 9 with nothing logged after the zap
++ * (UDP log lost the tail). kern.sweetgpu_screen_steps = how far to go:
++ * 1 CPU maps and reads the panel only, 2 + GPU mapping (no access),
++ * 3 + one 64x64 GPU tile, 4 + all tiles, 5 + the 1080x768 copy.
++ * kern.sweetgpu_screen_reached = last step completed (set before the next one).
++ */
++static int screen_steps = 1, screen_reached;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_steps, CTLFLAG_RW | CTLFLAG_LOCKED, &screen_steps, 0,
++    "SWEET GPU: mode 9 steps to run (1-5)");
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_reached, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_reached, 0,
++    "SWEET GPU: mode 9 last step completed");
+ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_gpu_us, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_gpu_us, 0,
+     "SWEET GPU: mode 9 GPU copy time (us)");
+ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_cpu_us, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_cpu_us, 0,
+     "SWEET GPU: mode 9 CPU copy time (us)");
+-extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);  /* PEXPERT/MACH private in machine_routines.h */
++extern vm_offset_t sweet_fb_kva;      /* AppleCLCD's panel mapping (SweetFramebuffer.cpp) */
+ static uint64_t fb_pa;
+ static uint32_t fb_w, fb_h, fb_pitch;
+ static vm_offset_t fb_cpu;
+@@ -938,18 +950,36 @@ screen_test(void)
+ 	fb_h = (uint32_t)video.v_height;
+ 	fb_pitch = (uint32_t)video.v_rowBytes;
+ 	uint64_t len = ((uint64_t)fb_pitch * fb_h + 0x1fffffull) & ~0x1fffffull;
+-	printf("SWEET GPU B: SCREEN: panel %ux%u pitch %u at 0x%llx, GPU 0x%llx (%llu MiB mapped)\n", fb_w, fb_h,
+-	    fb_pitch, fb_pa, IOVA_FB, len >> 20);
+-	if ((2u * fb_pitch) % 64u || fb_h % 2u || !pt_map_blocks(fb_pa, len)) {
++	screen_reached = 0;
++	printf("SWEET GPU B: SCREEN: panel %ux%u pitch %u at 0x%llx, GPU 0x%llx (%llu MiB), steps %d\n", fb_w, fb_h,
++	    fb_pitch, fb_pa, IOVA_FB, len >> 20, screen_steps);
++	if ((2u * fb_pitch) % 64u || fb_h % 2u) {
+ 		printf("SWEET GPU B: SCREEN: layout not usable\n");
+ 		return -1;
+ 	}
++	/*
++	 * step 1: CPU access through AppleCLCD's own panel mapping (test 0123:
++	 * mapping the 8 MiB panel again panicked, kmem_alloc KERN_NO_SPACE)
++	 */
++	fb_cpu = sweet_fb_kva;
+ 	if (!fb_cpu) {
+-		fb_cpu = ml_io_map_wcomb(fb_pa, (vm_size_t)fb_pitch * fb_h);     /* as the present path */
++		printf("SWEET GPU B: SCREEN: AppleCLCD has no panel mapping\n");
++		return -1;
+ 	}
+-	if (!fb_cpu) {
++	uint32_t centre = *(volatile uint32_t *)(fb_cpu + (uint64_t)(fb_h / 2u) * fb_pitch + (fb_w / 2u) * 4u);
++	screen_reached = 1;
++	printf("SWEET GPU B: SCREEN step 1: CPU reads centre pixel 0x%08x\n", centre);
++	if (screen_steps < 2) {
++		return 0;
++	}
++	/* step 2: GPU page table entries (no GPU access yet) */
++	if (!pt_map_blocks(fb_pa, len)) {
+ 		return -1;
+ 	}
++	screen_reached = 2;
++	if (screen_steps < 3) {
++		return 0;
++	}
+ 	uint32_t vpitch = 2u * fb_pitch;
+ 
+ 	/* A. 8 x 8 tiles of the source image, centred; source seen the same way (two rows per virtual row) */
+@@ -961,6 +991,23 @@ screen_test(void)
+ 	}
+ 	flush_dcache64(dma_pa + DMA_IMG_SRC, IMG_PITCH * IMG_H, TRUE);
+ 	uint32_t ox = (fb_w - TILE_N * IMG_W) / 2u, oy = ((fb_h - TILE_N * IMG_H) / 2u) & ~1u;
++	/* step 3: a single tile, top-left of the box */
++	rb_blit_setup();
++	rb_blit_copy(gaddr(DMA_IMG_SRC), 2u * IMG_PITCH, IOVA_FB, vpitch, 0, 0, ox, oy / 2u, IMG_W, IMG_H / 2u);
++	rb_blit_copy(gaddr(DMA_IMG_SRC), 2u * IMG_PITCH, IOVA_FB, vpitch, IMG_W, 0, fb_w + ox, oy / 2u, IMG_W,
++	    IMG_H / 2u);
++	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++	bool one = irq_test();
++	uint32_t got0 = *(volatile uint32_t *)(fb_cpu + (uint64_t)oy * fb_pitch + ox * 4u);
++	printf("SWEET GPU B: SCREEN step 3: one tile, fence %s, pixel (%u,%u) = 0x%08x (want 0x%08x), CB0 FSR 0x%08x\n",
++	    one ? "ok" : "MISSING", ox, oy, got0, img_pattern(0, 0), srd(SMMU_CB(0) + CB_FSR));
++	if (!one) {
++		return -2;
++	}
++	screen_reached = 3;
++	if (screen_steps < 4) {
++		return 0;
++	}
+ 	rb_blit_setup();
+ 	for (uint32_t ty = 0; ty < TILE_N; ty++) {
+ 		for (uint32_t tx = 0; tx < TILE_N; tx++) {
+@@ -994,6 +1041,10 @@ screen_test(void)
+ 		printf("SWEET GPU B: SCREEN A first wrong pixel (%u,%u) = 0x%08x, want 0x%08x\n", fx, fy, fgot, fwant);
+ 		return -2;
+ 	}
++	screen_reached = 4;
++	if (screen_steps < 5) {
++		return 0;
++	}
+ 
+ 	/* B. GPU copy of the top BENCH_ROWS panel rows to the bottom: one blit on the virtual surface */
+ 	uint32_t vrows = BENCH_ROWS / 2u, vdst = (fb_h - BENCH_ROWS) / 2u;
+@@ -1029,6 +1080,7 @@ screen_test(void)
+ 	    "CPU memcpy %llu us (%llu MB/s)\n", fb_w, BENCH_ROWS, bytes >> 10, gpu_ns / 1000,
+ 	    gpu_ns ? bytes * 1000ull / gpu_ns : 0, fenced ? "ok" : "MISSING", mism, cpu_ns / 1000,
+ 	    cpu_ns ? bytes * 1000ull / cpu_ns : 0);
++	screen_reached = 5;
+ 	screen_gpu_us = (int)(gpu_ns / 1000);
+ 	screen_cpu_us = (int)(cpu_ns / 1000);
+ 	return (fenced && mism == 0) ? 0 : -3;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -149,6 +149,14 @@ class IOAcceleratorES : public IOService {
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * The panel's kernel mapping, for the A540 driver's screen blits (test
++ * 0123: a second 8 MiB mapping of the panel ran out of I/O space).
++ */
++extern "C" {
++vm_offset_t sweet_fb_kva;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -222,6 +230,7 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	sweet_fb_kva = fPixels;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
