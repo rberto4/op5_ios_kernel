@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -2121,8 +2121,16 @@ static volatile uint32_t gpu_seq;
+ static uint64_t bo_bitmap[BO_PAGES / 64];
+ static vm_offset_t bo_l3_va[BO_L3_TABLES];
+ static uint64_t bo_l3_pa[BO_L3_TABLES];
+-static vm_offset_t bo_l3_chunk;         /* current 16K page being split into 4K tables */
+-static uint32_t bo_l3_chunk_used = 4;
++static vm_offset_t bo_l3_chunk;         /* current 64K contiguous chunk, split into 4K tables */
++static uint64_t bo_l3_chunk_pa;
++#define BO_L3_PER_CHUNK 16u
++static uint32_t bo_l3_chunk_used = BO_L3_PER_CHUNK;
++extern vm_offset_t ml_vtophys(vm_offset_t vaddr);
++static int64_t bo_dbg_l3_pa, bo_dbg_l3_vtophys;
++SYSCTL_QUAD(_kern, OID_AUTO, sweetgpu_l3_pa, CTLFLAG_RD | CTLFLAG_LOCKED, &bo_dbg_l3_pa,
++    "SWEET GPU: first BO level-3 table, physical address used");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetgpu_l3_vtophys, CTLFLAG_RD | CTLFLAG_LOCKED, &bo_dbg_l3_vtophys,
++    "SWEET GPU: first BO level-3 table, ml_vtophys");
+ static int bo_pages_used, gpu_submits;
+ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_bo_pages, CTLFLAG_RD | CTLFLAG_LOCKED, &bo_pages_used, 0,
+     "SWEET GPU: 4K pages mapped for buffer objects");
+@@ -2224,16 +2232,29 @@ bo_l3_table(uint32_t t)
+ 	if (bo_l3_va[t]) {
+ 		return true;
+ 	}
+-	if (bo_l3_chunk_used == 4) {
++	if (bo_l3_chunk_used == BO_L3_PER_CHUNK) {
++		/*
++		 * Test 0130: the CP took the IB packet and then sat inside the IB
++		 * with no SMMU fault, i.e. it read some other memory: the tables
++		 * from kmem_alloc did not sit where pmap_find_phys said (0128 even
++		 * gave 0x2e708000). Allocate them as the DMA area is, which works.
++		 */
+ 		vm_offset_t va = 0;
+-		if (kmem_alloc(kernel_map, &va, 0x4000, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		if (kmem_alloc_contig(kernel_map, &va, BO_L3_PER_CHUNK * 0x1000u, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			return false;
+ 		}
+ 		bo_l3_chunk = va;
++		bo_l3_chunk_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) | (va & PAGE_MASK);
+ 		bo_l3_chunk_used = 0;
+ 	}
+-	vm_offset_t va = bo_l3_chunk + 0x1000u * bo_l3_chunk_used++;
+-	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) | (va & PAGE_MASK);
++	vm_offset_t va = bo_l3_chunk + 0x1000u * bo_l3_chunk_used;
++	uint64_t pa = bo_l3_chunk_pa + 0x1000u * bo_l3_chunk_used;
++	bo_l3_chunk_used++;
++	if (bo_dbg_l3_pa == 0) {
++		bo_dbg_l3_pa = (int64_t)pa;
++		bo_dbg_l3_vtophys = (int64_t)ml_vtophys(va);
++	}
+ 	/*
+ 	 * Test 0128 panicked in phystokv (0x2e708000, below XNU's RAM at
+ 	 * 0x1_00000000) from a physical-address cache flush: flush the
