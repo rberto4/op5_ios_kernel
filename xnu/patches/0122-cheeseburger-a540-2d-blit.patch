@@ -1,0 +1,219 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -12,7 +12,9 @@
+  *                                  =6: as 5, then a write to an unmapped
+  *                                  GPU address and one more valid write,
+  *                                  =7: as 5, then CP_EVENT_WRITE with IRQ on
+- *                                  GIC SPI 300, -14 = no interrupt/fence), CP microcode, ME_INIT,
++ *                                  GIC SPI 300, -14 = no interrupt/fence,
++ *                                  =8: as 5, then a 2D blit (CP_BLIT) checked
++ *                                  pixel by pixel, -17 = wrong pixels), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -175,6 +177,11 @@ static const uint16_t addr_mode_regs[] = {
+ #define CP_SET_PROTECTED_MODE   95
+ #define CP_WAIT_FOR_IDLE        38
+ #define CP_EVENT_WRITE          70
++#define CP_SET_RENDER_MODE      0x6c
++#define CP_BLIT                 0x2c
++#define RENDER_MODE_BLIT2D      5
++#define RENDER_MODE_END2D       8
++#define BLIT_OP_COPY            1
+ #define EV_CACHE_FLUSH_TS       4u
+ #define EV_IRQ                  (1u << 31)
+ #define CP_INDIRECT_BUFFER_PFE  63
+@@ -194,7 +201,9 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_PT_L2       0x22000
+ #define DMA_PT_L3A      0x23000
+ #define DMA_PT_L3B      0x24000
+-#define DMA_SIZE        0x25000
++#define DMA_IMG_SRC     0x25000     /* mode 8: 64x64 RGBA8 source image */
++#define DMA_IMG_DST     0x29000     /* mode 8: 64x64 RGBA8 destination image */
++#define DMA_SIZE        0x2d000
+ #define IOVA_DMA        0x10000000ull   /* mode 5: GPU address of the DMA area */
+ #define IOVA_TEST       0x20000000ull   /* mode 5: GPU address of DMA_TEST */
+ #define IOVA_UNMAPPED   0x30000000ull   /* mode 6: no page table entry */
+@@ -745,6 +754,140 @@ irq_test(void)
+ 	       got == 0x5eed0001;
+ }
+ 
++/*
++ * Phase C step 4: first GPU rendering, a 2D blit (A5xx 2D engine, CP_BLIT),
++ * register sequence from Mesa freedreno fd5_blitter.c (MIT): emit_setup,
++ * then emit_blit for linear RGBA8 surfaces. Offsets and fields from Mesa
++ * a5xx.xml / adreno_pm4.xml. The CPU checks every destination pixel.
++ */
++#define R_RB_RENDER_CNTL        0xe141
++#define R_RB_2D_BLIT_CNTL       0x2100
++#define R_GRAS_2D_BLIT_CNTL     0x2180
++#define R_UNKNOWN_2184          0x2184
++#define R_RB_CNTL               0xe140
++#define R_RB_MODE_CNTL_2D       0x0cc6
++#define R_SP_MODE_CNTL          0x0ec2
++#define R_TPL1_MODE_CNTL_2D     0x0f02
++#define R_HLSQ_MODE_CNTL        0x0e06
++#define R_GRAS_CL_CNTL          0xe000
++#define R_RB_2D_SRC_INFO        0x2107
++#define R_GRAS_2D_SRC_INFO      0x2181
++#define R_RB_2D_DST_INFO        0x2110
++#define R_GRAS_2D_DST_INFO      0x2182
++#define RB_CNTL_BYPASS          (1u << 17)
++#define FMT_R8G8B8A8_UNORM      0x30u   /* RB5_R8G8B8A8_UNORM, TILE5_LINEAR, WZYX */
++#define IMG_W                   64u
++#define IMG_H                   64u
++#define IMG_PITCH               (IMG_W * 4u)
++#define BLIT_W                  48u
++#define BLIT_H                  48u
++#define BLIT_SX                 8u
++#define BLIT_SY                 8u
++#define BLIT_DX                 4u
++#define BLIT_DY                 12u
++
++static void
++rb_pkt4(uint32_t reg, uint32_t cnt)
++{
++	rb_out(CP_TYPE4_PKT | cnt | (pm4_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (pm4_parity(reg) << 27));
++}
++
++static void
++rb_reg(uint32_t reg, uint32_t val)
++{
++	rb_pkt4(reg, 1);
++	rb_out(val);
++}
++
++static uint32_t
++img_pattern(uint32_t x, uint32_t y)
++{
++	return 0xff000000u | ((x * 4u) & 0xffu) | (((y * 4u) & 0xffu) << 8) | ((((x ^ y) * 8u) & 0xffu) << 16);
++}
++
++static void
++rb_surface(uint32_t info_reg, uint32_t gras_reg, uint64_t addr)
++{
++	rb_pkt4(info_reg, 9);
++	rb_out(FMT_R8G8B8A8_UNORM);
++	rb_out((uint32_t)addr);
++	rb_out((uint32_t)(addr >> 32));
++	rb_out((IMG_PITCH >> 6) | (((IMG_PITCH * IMG_H) >> 6) << 16));     /* PITCH, ARRAY_PITCH (64-byte units) */
++	for (int i = 0; i < 5; i++) {
++		rb_out(0);
++	}
++	rb_reg(gras_reg, FMT_R8G8B8A8_UNORM);
++}
++
++static bool irq_test(void);
++
++static bool
++blit_test(void)
++{
++	volatile uint32_t *src = (volatile uint32_t *)(dma + DMA_IMG_SRC);
++	volatile uint32_t *dst = (volatile uint32_t *)(dma + DMA_IMG_DST);
++	for (uint32_t y = 0; y < IMG_H; y++) {
++		for (uint32_t x = 0; x < IMG_W; x++) {
++			src[y * IMG_W + x] = img_pattern(x, y);
++			dst[y * IMG_W + x] = 0;
++		}
++	}
++	flush_dcache64(dma_pa + DMA_IMG_SRC, 2 * IMG_PITCH * IMG_H, TRUE);
++
++	/* fd5_blitter emit_setup */
++	rb_reg(R_RB_RENDER_CNTL, 0x00000008);
++	rb_reg(R_RB_2D_BLIT_CNTL, 0x86000000);
++	rb_reg(R_GRAS_2D_BLIT_CNTL, 0x86000000);
++	rb_reg(R_UNKNOWN_2184, 0x00000009);
++	rb_reg(R_RB_CNTL, RB_CNTL_BYPASS);
++	rb_reg(R_RB_MODE_CNTL_2D, 0x00000004);
++	rb_reg(R_SP_MODE_CNTL, 0x0000000c);
++	rb_reg(R_TPL1_MODE_CNTL_2D, 0x00000344);
++	rb_reg(R_HLSQ_MODE_CNTL, 0x00000002);
++	rb_reg(R_GRAS_CL_CNTL, 0x00000181);
++	/* emit_blit */
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(RENDER_MODE_BLIT2D);
++	rb_surface(R_RB_2D_SRC_INFO, R_GRAS_2D_SRC_INFO, gaddr(DMA_IMG_SRC));
++	rb_surface(R_RB_2D_DST_INFO, R_GRAS_2D_DST_INFO, gaddr(DMA_IMG_DST));
++	rb_pkt7(CP_BLIT, 5);
++	rb_out(BLIT_OP_COPY);
++	rb_out(BLIT_SX | (BLIT_SY << 16));
++	rb_out((BLIT_SX + BLIT_W - 1) | ((BLIT_SY + BLIT_H - 1) << 16));
++	rb_out(BLIT_DX | (BLIT_DY << 16));
++	rb_out((BLIT_DX + BLIT_W - 1) | ((BLIT_DY + BLIT_H - 1) << 16));
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(RENDER_MODE_END2D);
++	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++
++	/* CACHE_FLUSH_TS with IRQ: flushes the render caches, writes the fence, interrupts */
++	bool fenced = irq_test();
++	flush_dcache64(dma_pa + DMA_IMG_DST, IMG_PITCH * IMG_H, TRUE);
++	uint32_t bad = 0, first_x = 0, first_y = 0, first_got = 0, first_want = 0, inside = 0;
++	for (uint32_t y = 0; y < IMG_H; y++) {
++		for (uint32_t x = 0; x < IMG_W; x++) {
++			bool in = x >= BLIT_DX && x < BLIT_DX + BLIT_W && y >= BLIT_DY && y < BLIT_DY + BLIT_H;
++			uint32_t want = in ? img_pattern(x - BLIT_DX + BLIT_SX, y - BLIT_DY + BLIT_SY) : 0;
++			uint32_t got = dst[y * IMG_W + x];
++			inside += in && got == want;
++			if (got != want && bad++ == 0) {
++				first_x = x;
++				first_y = y;
++				first_got = got;
++				first_want = want;
++			}
++		}
++	}
++	printf("SWEET GPU B: BLIT %ux%u (%u,%u)->(%u,%u): %u/%u pixels right inside, %u wrong of %u, fence %s\n",
++	    BLIT_W, BLIT_H, BLIT_SX, BLIT_SY, BLIT_DX, BLIT_DY, inside, BLIT_W * BLIT_H, bad, IMG_W * IMG_H,
++	    fenced ? "ok" : "MISSING");
++	if (bad) {
++		printf("SWEET GPU B: BLIT first wrong pixel (%u,%u) = 0x%08x, want 0x%08x\n", first_x, first_y,
++		    first_got, first_want);
++	}
++	return fenced && bad == 0;
++}
++
+ /* ---- stage B ---- */
+ 
+ /*
+@@ -1354,7 +1497,7 @@ stage_b(int mode)
+ 		return -3;
+ 	}
+ 	use_iova = false;
+-	if ((mode == 5 || mode == 6 || mode == 7) && !smmu_translate_setup()) {
++	if (mode >= 5 && mode <= 8 && !smmu_translate_setup()) {
+ 		return -13;
+ 	}
+ 
+@@ -1374,7 +1517,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+-	use_iova = (mode == 5 || mode == 6 || mode == 7);
++	use_iova = (mode >= 5 && mode <= 8);
+ 
+ 	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
+ 	gpucc_extra_clocks();
+@@ -1483,6 +1626,13 @@ stage_b(int mode)
+ 
+ 	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
+ 	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
++	if (ok && mode == 8) {
++		ok = blit_test();
++		if (!ok) {
++			gpu_dump("BLIT test");
++			return -17;
++		}
++	}
+ 	if (ok && mode == 7) {
+ 		ok = irq_test();
+ 		if (!ok) {
+@@ -1536,7 +1686,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 7) {
++	if (value >= 1 && value <= 8) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
