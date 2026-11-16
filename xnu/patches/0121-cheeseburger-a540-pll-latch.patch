@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -73,6 +73,9 @@ bool sweet_a540_powered(void);
+ #define PLL_OUTCTRL             (1u << 0)
+ #define PLL_RESET_N             (1u << 2)
+ #define PLL_VOTE_FSM_ENA        (1u << 20)
++#define PLL_UPDATE              (1u << 22)
++#define PLL_UPDATE_BYPASS       (1u << 23)
++#define PLL_ACK_LATCH           (1u << 29)
+ #define PLL_LOCK_DET            (1u << 31)
+ #define PLL_OUT_MASK            0x7u
+ #define PLL_POSTDIV_EVEN_MASK   (0xfu << 8)
+@@ -98,6 +101,7 @@ bool sweet_a540_powered(void);
+ #define R_RBBM_PERFCTR_CNTL     0x0464
+ #define R_RBBM_PERFCTR_CP_0_LO  0x03a0
+ #define R_RBBM_ALWAYSON_LO      0x04d2
++#define R_RBBM_CLOCK_CNTL_REG   0x0067
+ #define R_RBBM_PERFCTR_RBBM_SEL_0 0x046b
+ #define R_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
+ #define R_RBBM_INTERFACE_HANG_INT_CNTL 0x002f
+@@ -1198,6 +1202,40 @@ fabia_disable(vm_offset_t pll)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * __clk_alpha_pll_update_latch. Test 0120: without it the PLL kept its
++ * calibration L (63): the GPU ran at ~605 MHz (measured 612) instead of
++ * the 249.6 MHz asked for.
++ */
++static bool
++fabia_update_latch(volatile uint32_t *mode)
++{
++	uint32_t m = *mode;
++	*mode = m | PLL_UPDATE;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(1);
++	int i;
++	if (m & PLL_UPDATE_BYPASS) {
++		for (i = 0; i < 200 && !(*mode & PLL_ACK_LATCH); i++) {
++			delay(1);
++		}
++		*mode &= ~PLL_UPDATE;
++	} else {
++		for (i = 0; i < 200 && (*mode & PLL_UPDATE); i++) {
++			delay(1);
++		}
++	}
++	for (i = 0; i < 200 && (*mode & PLL_ACK_LATCH); i++) {
++		delay(1);
++	}
++	delay(10);
++	return !(*mode & PLL_UPDATE) && !(*mode & PLL_ACK_LATCH);
++}
++
++static int last_khz;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_khz, CTLFLAG_RD | CTLFLAG_LOCKED, &last_khz, 0,
++    "SWEET GPU stage B: last measured GPU clock (kHz)");
++
+ static int
+ gpu_clock_set(uint32_t l)
+ {
+@@ -1230,11 +1268,19 @@ gpu_clock_set(uint32_t l)
+ 	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG) = 0;
+ 	*(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD) |= 1u;
+ 	fabia_disable(cc);
+-	*(volatile uint32_t *)(cc + FABIA_L_VAL) = l;
+-	*(volatile uint32_t *)(cc + FABIA_FRAC) = 0;
+ 	*(volatile uint32_t *)(cc + FABIA_USER_CTL) &= ~PLL_POSTDIV_EVEN_MASK;       /* even out = VCO */
+ 	if (!fabia_enable(cc)) {
+-		printf("SWEET GPU B: GPUPLL0 L %u: NO LOCK (MODE 0x%08x), gfx3d stays on XO\n", l, *mode);
++		printf("SWEET GPU B: GPUPLL0: NO LOCK (MODE 0x%08x), gfx3d stays on XO\n", *mode);
++		fabia_disable(cc);
++		return -1;
++	}
++	/* alpha_pll_fabia_set_rate: L, alpha, latch */
++	*(volatile uint32_t *)(cc + FABIA_L_VAL) = l;
++	*(volatile uint32_t *)(cc + FABIA_FRAC) = 0;
++	bool latched = fabia_update_latch(mode);
++	if (!latched || !fabia_wait_lock(mode)) {
++		printf("SWEET GPU B: GPUPLL0 L %u: latch %s, MODE 0x%08x; gfx3d stays on XO\n", l,
++		    latched ? "ok" : "TIMEOUT", *mode);
+ 		fabia_disable(cc);
+ 		return -1;
+ 	}
+@@ -1255,11 +1301,16 @@ gpu_clock_set(uint32_t l)
+ static void
+ gpu_clock_measure(const char *when)
+ {
++	/* test 0120: with clock gating on the CP clock stops when idle; count with it off */
++	uint32_t cg = grd(R_RBBM_CLOCK_CNTL_REG);
++	gwr(R_RBBM_CLOCK_CNTL_REG, 0);
+ 	uint32_t c0 = grd(R_RBBM_PERFCTR_CP_0_LO), a0 = grd(R_RBBM_ALWAYSON_LO);
+ 	delay(2000);
+ 	uint32_t c1 = grd(R_RBBM_PERFCTR_CP_0_LO), a1 = grd(R_RBBM_ALWAYSON_LO);
++	gwr(R_RBBM_CLOCK_CNTL_REG, cg);
+ 	uint32_t dc = c1 - c0, da = a1 - a0;
+ 	uint64_t khz = da ? (uint64_t)dc * 19200ull / da : 0;
++	last_khz = (int)khz;
+ 	printf("SWEET GPU B: GPU clock %s: %u cycles / %u always-on ticks = %llu.%03llu MHz\n", when, dc, da,
+ 	    khz / 1000, khz % 1000);
+ }
+@@ -1382,6 +1433,17 @@ stage_b(int mode)
+ 		return -5;
+ 	}
+ 	gpu_clock_measure("after ME_INIT");
++	if (pll_l != 0 && (uint32_t)last_khz > 9600u * (uint32_t)pll_l * 11u / 10u) {
++		/* faster than asked (> +10%): back to XO before anything else runs */
++		vm_offset_t cc = ml_io_map(GPUCC_PA, 0x2000);
++		if (cc) {
++			*(volatile uint32_t *)(cc + GPUCC_GFX3D_CFG) = 0;
++			*(volatile uint32_t *)(cc + GPUCC_GFX3D_CMD) |= 1u;
++		}
++		printf("SWEET GPU B: GPU clock %d kHz above %u kHz asked: gfx3d back on XO\n", last_khz,
++		    9600u * (uint32_t)pll_l);
++		return -16;
++	}
+ 	if (gpmu_enable && power_init() != 0) {
+ 		return -10;
+ 	}
