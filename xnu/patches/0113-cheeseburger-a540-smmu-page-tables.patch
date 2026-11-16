@@ -1,0 +1,254 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -6,7 +6,9 @@
+  *   sysctl kern.sweetgpu_stage=1   SMMU stream 0 untranslated (=2: SMMU untouched,
+  *                                  =3: no zap, SECVID_TRUST_CNTL = 0 directly,
+  *                                  =4: no secure exit, MEM_WRITE, then
+- *                                  WAIT_FOR_IDLE + MEM_WRITE (-11 = that hung)), CP microcode, ME_INIT,
++ *                                  WAIT_FOR_IDLE + MEM_WRITE (-11 = that hung),
++ *                                  =5: as 1 with CB0 translating through page
++ *                                  tables, -13 = page table setup refused), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -156,10 +158,25 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_PFP         0x10000
+ #define DMA_SCRATCH     0x18000
+ #define DMA_GPMU        0x19000     /* GPMU microcode IB, up to 28 KiB */
+-#define DMA_SIZE        0x20000
++#define DMA_TEST        0x20000     /* mode 5: second test page, own GPU address */
++#define DMA_PT_L1       0x21000     /* mode 5: SMMU page tables, 4K granule */
++#define DMA_PT_L2       0x22000
++#define DMA_PT_L3A      0x23000
++#define DMA_PT_L3B      0x24000
++#define DMA_SIZE        0x25000
++#define IOVA_DMA        0x10000000ull   /* mode 5: GPU address of the DMA area */
++#define IOVA_TEST       0x20000000ull   /* mode 5: GPU address of DMA_TEST */
+ 
+ static vm_offset_t gpu, smmu, dma;
+ static uint64_t dma_pa;
++static bool use_iova;   /* mode 5: CB0 translates through our page tables */
++
++/* GPU address of an offset in the DMA area */
++static uint64_t
++gaddr(uint32_t off)
++{
++	return (use_iova ? IOVA_DMA : dma_pa) + off;
++}
+ static int stage_result;
+ 
+ static inline uint32_t
+@@ -194,6 +211,9 @@ gpu_dump(const char *why)
+ 	    grd(R_CP_INTERRUPT_STATUS), grd(R_CP_PROTECT_STATUS), grd(R_CP_RB_RPTR), grd(R_CP_RB_WPTR),
+ 	    grd(R_RBBM_STATUS3),
+ 	    *(volatile uint32_t *)(smmu + 0x48), *(volatile uint32_t *)(smmu + 0x8000 + 0x58));
++	printf("SWEET GPU B: %s: CB0 FAR 0x%08x%08x FSYNR0 0x%08x\n", why,
++	    *(volatile uint32_t *)(smmu + 0x8000 + 0x64), *(volatile uint32_t *)(smmu + 0x8000 + 0x60),
++	    *(volatile uint32_t *)(smmu + 0x8000 + 0x68));
+ }
+ 
+ /* ---- firmware files ---- */
+@@ -471,6 +491,80 @@ smmu_setup(void)
+ 	    (srd(SMMU_CBA2R(0)) & CBA2R_VA64);
+ }
+ 
++/*
++ * Phase C step 1: CB0 translates. AArch64 stage-1 tables, 4K granule, 32-bit
++ * GPU address space (T0SZ 32: walk starts at level 1), the register values
++ * Linux arm-smmu / io-pgtable-arm use for a non-coherent master: MAIR attr0
++ * normal non-cacheable, walks non-cacheable outer-shareable, terminate (not
++ * stall) on fault. The DMA area appears at IOVA_DMA, DMA_TEST also at
++ * IOVA_TEST.
++ */
++#define CB_TCR2         0x10u
++#define CB_TTBR0        0x20u
++#define CB_TCR          0x30u
++#define CB_CONTEXTIDR   0x34u
++#define CB_MAIR0        0x38u
++#define CB_FAR          0x60u
++#define CB_FSYNR0       0x68u
++#define CB_TLBIALL      0x618u
++#define CB_TLBSYNC      0x7f0u
++#define CB_TLBSTATUS    0x7f4u
++#define PTE_TABLE       0x3ull
++#define PTE_PAGE        (0x3ull | (1ull << 10) /* AF */ | (2ull << 8) /* outer shareable */ | \
++	                 (1ull << 6) /* AP: read/write, unprivileged too */ | (0ull << 2) /* MAIR attr0 */)
++#define TCR_VALUE       (32u /* T0SZ */ | (2u << 12) /* SH0 outer */ | (1u << 23) /* EPD1 */)
++#define TCR2_VALUE      (2u /* PASize 40 bits */ | (7u << 15) /* SEP upstream */)
++#define MAIR0_VALUE     0x0004ff44u     /* attr0 NC, attr1 WB RWA, attr2 device */
++#define SCTLR_XLATE     (1u /* M */ | (1u << 1) /* TRE */ | (1u << 2) /* AFE */ | (1u << 5) /* CFRE */ | \
++	                 (1u << 6) /* CFIE */ | (1u << 12) /* ASIDPNE */)
++
++static void
++pt_map(uint64_t iova, uint32_t off, uint32_t len)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(dma + DMA_PT_L1);
++	volatile uint64_t *l2 = (volatile uint64_t *)(dma + DMA_PT_L2);
++	uint32_t l3off = (iova >= IOVA_TEST) ? DMA_PT_L3B : DMA_PT_L3A;
++	volatile uint64_t *l3 = (volatile uint64_t *)(dma + l3off);
++	l1[(iova >> 30) & 3] = (dma_pa + DMA_PT_L2) | PTE_TABLE;
++	l2[(iova >> 21) & 0x1ff] = (dma_pa + l3off) | PTE_TABLE;
++	for (uint32_t done = 0; done < len; done += 0x1000) {
++		l3[((iova + done) >> 12) & 0x1ff] = (dma_pa + off + done) | PTE_PAGE;
++	}
++}
++
++static bool
++smmu_translate_setup(void)
++{
++	memset((void *)(dma + DMA_PT_L1), 0, 4 * 0x1000);
++	pt_map(IOVA_DMA, 0, DMA_SIZE);
++	pt_map(IOVA_TEST, DMA_TEST, 0x1000);
++	flush_dcache64(dma_pa + DMA_PT_L1, 4 * 0x1000, TRUE);
++
++	uint32_t cb = SMMU_CB(0);
++	swr(cb + CB_SCTLR, 0);
++	swr(cb + CB_TCR2, TCR2_VALUE);
++	swr(cb + CB_TTBR0, (uint32_t)(dma_pa + DMA_PT_L1));
++	swr(cb + CB_TTBR0 + 4, (uint32_t)((dma_pa + DMA_PT_L1) >> 32));
++	swr(cb + CB_MAIR0, MAIR0_VALUE);
++	swr(cb + CB_CONTEXTIDR, 0);
++	swr(cb + CB_TCR, TCR_VALUE);
++	swr(cb + CB_TLBIALL, 0);
++	swr(cb + CB_TLBSYNC, 0);
++	int i;
++	for (i = 0; i < 1000 && (srd(cb + CB_TLBSTATUS) & 1u); i++) {
++		delay(1);
++	}
++	swr(cb + CB_FSR, srd(cb + CB_FSR));
++	swr(cb + CB_SCTLR, SCTLR_XLATE);
++	printf("SWEET GPU B: CB0 translate: TTBR0 0x%08x%08x (want 0x%llx) TCR 0x%08x TCR2 0x%08x MAIR0 0x%08x "
++	    "SCTLR 0x%08x TLB sync %d us\n", srd(cb + CB_TTBR0 + 4), srd(cb + CB_TTBR0), dma_pa + DMA_PT_L1,
++	    srd(cb + CB_TCR), srd(cb + CB_TCR2), srd(cb + CB_MAIR0), srd(cb + CB_SCTLR), i);
++	printf("SWEET GPU B: page tables: DMA area at GPU 0x%llx, test page at GPU 0x%llx\n", IOVA_DMA,
++	    IOVA_TEST);
++	return srd(cb + CB_SCTLR) == SCTLR_XLATE && srd(cb + CB_TCR) == TCR_VALUE &&
++	       srd(cb + CB_TTBR0) == (uint32_t)(dma_pa + DMA_PT_L1);
++}
++
+ /* ---- stage B ---- */
+ 
+ /*
+@@ -776,7 +870,7 @@ power_init(void)
+ 	if (dwords == 0) {
+ 		return -1;
+ 	}
+-	uint64_t iova = dma_pa + DMA_GPMU;
++	uint64_t iova = gaddr(DMA_GPMU);
+ 	rb_pkt7(CP_SET_PROTECTED_MODE, 1);
+ 	rb_out(0);
+ 	rb_pkt7(CP_INDIRECT_BUFFER_PFE, 3);
+@@ -800,26 +894,32 @@ power_init(void)
+ 
+ /* CP_MEM_WRITE of val into the scratch word; true when the GPU wrote it. */
+ static bool
+-mem_write_test(uint32_t val, bool wait_idle_first, const char *what)
++mem_write_at(uint32_t off, uint64_t gpu_addr, uint32_t val, bool wait_idle_first, const char *what)
+ {
+-	uint64_t target = dma_pa + DMA_SCRATCH;
+-	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+-	flush_dcache64(target, 64, TRUE);
++	uint64_t pa = dma_pa + off;
++	*(volatile uint32_t *)(dma + off) = 0xdeadbeef;
++	flush_dcache64(pa, 64, TRUE);
+ 	if (wait_idle_first) {
+ 		rb_pkt7(CP_WAIT_FOR_IDLE, 0);
+ 	}
+ 	rb_pkt7(CP_MEM_WRITE, 3);
+-	rb_out((uint32_t)target);
+-	rb_out((uint32_t)(target >> 32));
++	rb_out((uint32_t)gpu_addr);
++	rb_out((uint32_t)(gpu_addr >> 32));
+ 	rb_out(val);
+ 	bool drained = rb_flush_wait(what);
+-	flush_dcache64(target, 64, TRUE);
+-	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
+-	printf("SWEET GPU B: %s: scratch at 0x%llx = 0x%08x (%s)\n", what, target, got,
++	flush_dcache64(pa, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)(dma + off);
++	printf("SWEET GPU B: %s: GPU address 0x%llx (PA 0x%llx) = 0x%08x (%s)\n", what, gpu_addr, pa, got,
+ 	    got == val ? "GPU WROTE IT" : "unchanged");
+ 	return drained && got == val;
+ }
+ 
++static bool
++mem_write_test(uint32_t val, bool wait_idle_first, const char *what)
++{
++	return mem_write_at(DMA_SCRATCH, gaddr(DMA_SCRATCH), val, wait_idle_first, what);
++}
++
+ /*
+  * Test 0108: CP_WAIT_FOR_IDLE hangs because RBBM_STATUS never goes idle
+  * (HI_BUSY set from power on). Stage A leaves two clocks of the Linux
+@@ -909,6 +1009,10 @@ stage_b(int mode)
+ 	} else if (!smmu_setup()) {
+ 		return -3;
+ 	}
++	use_iova = false;
++	if (mode == 5 && !smmu_translate_setup()) {
++		return -13;
++	}
+ 
+ 	/* 2. microcode (first dword of each file is the version, skipped) */
+ 	size_t pm4_len = 0, pfp_len = 0;
+@@ -926,6 +1030,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
++	use_iova = (mode == 5);
+ 
+ 	/* 3. missing GPU clocks, soft reset, hardware init, ring, micro engine */
+ 	gpucc_extra_clocks();
+@@ -941,11 +1046,11 @@ stage_b(int mode)
+ 	(void)gpmu_domain_on(R_GPMU_SP_POWER_CNTL, R_GPMU_SP_PWR_CLK_STATUS, "SP/TP");
+ 	trace_last = grd(R_RBBM_STATUS);
+ 	hw_init();
+-	gwr64(R_CP_ME_INSTR_BASE_LO, dma_pa + DMA_PM4);
++	gwr64(R_CP_ME_INSTR_BASE_LO, gaddr(DMA_PM4));
+ 	trace_status("ME base", R_CP_ME_INSTR_BASE_LO);
+-	gwr64(R_CP_PFP_INSTR_BASE_LO, dma_pa + DMA_PFP);
++	gwr64(R_CP_PFP_INSTR_BASE_LO, gaddr(DMA_PFP));
+ 	trace_status("PFP base", R_CP_PFP_INSTR_BASE_LO);
+-	gwr64(R_CP_RB_BASE, dma_pa + DMA_RB);
++	gwr64(R_CP_RB_BASE, gaddr(DMA_RB));
+ 	gwr(R_CP_RB_CNTL, 12u | (2u << 8) | RB_CNTL_NO_UPDATE);  /* 32 KiB, 32-byte blocks */
+ 	gwr(R_RBBM_INT_0_MASK, 0);
+ 	rb_wptr = 0;
+@@ -1013,22 +1118,14 @@ stage_b(int mode)
+ 		}
+ 	}
+ 
+-	/* 6. the GPU writes a value into our memory */
+-	uint64_t target = dma_pa + DMA_SCRATCH;
+-	rb_pkt7(CP_MEM_WRITE, 3);
+-	rb_out((uint32_t)target);
+-	rb_out((uint32_t)(target >> 32));
+-	rb_out(0xc0ffee01);
+-	if (!rb_flush_wait("MEM_WRITE")) {
+-		return -8;
++	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
++	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
++	if (ok && mode == 5) {
++		ok = mem_write_at(DMA_TEST, IOVA_TEST, 0xc0ffee05, true, "MEM_WRITE test page");
+ 	}
+-	flush_dcache64(target, 64, TRUE);
+-	uint32_t got = *(volatile uint32_t *)(dma + DMA_SCRATCH);
+-	printf("SWEET GPU B: scratch at 0x%llx = 0x%08x (%s)\n", target, got,
+-	    got == 0xc0ffee01 ? "GPU WROTE IT" : "unchanged");
+ 	gpu_dump("end");
+ 	printf("SWEET GPU B: SMMU sGFSR 0x%08x CB0 FSR 0x%08x\n", srd(0x48), srd(SMMU_CB(0) + CB_FSR));
+-	return got == 0xc0ffee01 ? 6 : -9;
++	return ok ? 6 : -9;
+ }
+ 
+ static int
+@@ -1040,7 +1137,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 4) {
++	if (value >= 1 && value <= 5) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
