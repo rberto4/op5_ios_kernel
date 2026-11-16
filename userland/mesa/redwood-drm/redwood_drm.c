@@ -16,7 +16,7 @@
 
 #include "xf86drm.h"
 
-#define REDWOOD_GPU_SERVICE     "RedwoodGPU"
+#define REDWOOD_GPU_SERVICE     "SweetGPU"      /* iokit/Kernel/arm/SweetGPU.cpp (op5) */
 #define REDWOOD_GPU_SURFACE     0x7e            /* the request that is not Linux's */
 #define REDWOOD_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 
