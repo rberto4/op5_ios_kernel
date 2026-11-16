@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -280,8 +280,12 @@ zap_load(void)
+ 	struct scm_res r = scm_call(SCM_SVC_PIL, PAS_IS_SUPPORTED, SCM_ARGS(1, SCM_VAL, 0, 0),
+ 	    ZAP_PAS_ID, 0, 0);
+ 	printf("SWEET GPU B: SCM PAS is_supported(13): a0 %lld a1 %lld\n", (long long)r.a0, (long long)r.a1);
++	/*
++	 * Test 0105: TZ answered a0 0 a1 0 (not supported). Linux qcom_mdt_load
++	 * does not ask; go on and let init_image give the real answer.
++	 */
+ 	if (r.a0 != 0 || r.a1 != 1) {
+-		goto out;
++		printf("SWEET GPU B: is_supported says no; trying init_image anyway\n");
+ 	}
+ 	vm_offset_t zap = ml_io_map(ZAP_PA, ZAP_SIZE);
+ 	if (!zap) {
+@@ -623,6 +627,17 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 		return err;
+ 	}
+ 	if (value >= 1 && value <= 3) {
++		/*
++		 * Test 0105: a second run on a live CP hung the phone. One run per
++		 * boot until the CP is stopped cleanly before the reset.
++		 */
++		static bool ran;
++		if (ran) {
++			printf("SWEET GPU B: stage B already ran this boot (result %d); reboot first\n",
++			    stage_result);
++			return EBUSY;
++		}
++		ran = true;
+ 		printf("SWEET GPU B: stage B (mode %d) requested by pid %d\n", value, proc_selfpid());
+ 		stage_result = stage_b(value);
+ 		printf("SWEET GPU B: stage B result %d\n", stage_result);
