@@ -1,0 +1,288 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -14,7 +14,9 @@
+  *                                  =7: as 5, then CP_EVENT_WRITE with IRQ on
+  *                                  GIC SPI 300, -14 = no interrupt/fence,
+  *                                  =8: as 5, then a 2D blit (CP_BLIT) checked
+- *                                  pixel by pixel, -17 = wrong pixels), CP microcode, ME_INIT,
++ *                                  pixel by pixel, -17 = wrong pixels,
++ *                                  =9: as 5, then GPU blits into the panel
++ *                                  (pattern + 1080x768 copy, timed vs CPU)), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -203,7 +205,9 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_PT_L3B      0x24000
+ #define DMA_IMG_SRC     0x25000     /* mode 8: 64x64 RGBA8 source image */
+ #define DMA_IMG_DST     0x29000     /* mode 8: 64x64 RGBA8 destination image */
+-#define DMA_SIZE        0x2d000
++#define DMA_PT_L2B      0x2d000     /* mode 9: level-2 table for GPU addresses 1-2 GiB (panel) */
++#define DMA_SIZE        0x2e000
++#define IOVA_FB         0x40000000ull   /* mode 9: panel framebuffer, 2 MiB blocks */
+ #define IOVA_DMA        0x10000000ull   /* mode 5: GPU address of the DMA area */
+ #define IOVA_TEST       0x20000000ull   /* mode 5: GPU address of DMA_TEST */
+ #define IOVA_UNMAPPED   0x30000000ull   /* mode 6: no page table entry */
+@@ -573,6 +577,30 @@ pt_map(uint64_t iova, uint32_t off, uint32_t len)
+ 	}
+ }
+ 
++/* Map [pa, pa + len) with 2 MiB level-2 blocks at IOVA_FB (pa 2 MiB aligned); used by mode 9. */
++static bool
++pt_map_blocks(uint64_t pa, uint64_t len)
++{
++	if ((pa & 0x1fffffull) || len > 0x40000000ull) {
++		return false;
++	}
++	volatile uint64_t *l1 = (volatile uint64_t *)(dma + DMA_PT_L1);
++	volatile uint64_t *l2 = (volatile uint64_t *)(dma + DMA_PT_L2B);
++	memset((void *)(dma + DMA_PT_L2B), 0, 0x1000);
++	l1[(IOVA_FB >> 30) & 3] = (dma_pa + DMA_PT_L2B) | PTE_TABLE;
++	for (uint64_t off = 0; off < len; off += 0x200000ull) {
++		l2[((IOVA_FB + off) >> 21) & 0x1ff] = (pa + off) | (PTE_PAGE & ~0x2ull);    /* block: bits[1:0] = 01 */
++	}
++	flush_dcache64(dma_pa + DMA_PT_L1, 0x1000, TRUE);
++	flush_dcache64(dma_pa + DMA_PT_L2B, 0x1000, TRUE);
++	swr(SMMU_CB(0) + CB_TLBIALL, 0);
++	swr(SMMU_CB(0) + CB_TLBSYNC, 0);
++	for (int i = 0; i < 1000 && (srd(SMMU_CB(0) + CB_TLBSTATUS) & 1u); i++) {
++		delay(1);
++	}
++	return true;
++}
++
+ static bool
+ smmu_translate_setup(void)
+ {
+@@ -821,6 +849,190 @@ rb_surface(uint32_t info_reg, uint32_t gras_reg, uint64_t addr)
+ 
+ static bool irq_test(void);
+ 
++/*
++ * Phase D step 1: blits into the panel the display scans out. The panel
++ * pitch (4320 bytes) is not a multiple of 64, which the 2D engine needs, so
++ * the panel is seen as a 2160-pixel-wide surface with pitch 8640: panel row
++ * 2k is the left half of virtual row k, row 2k+1 the right half.
++ */
++static int screen_gpu_us, screen_cpu_us;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_gpu_us, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_gpu_us, 0,
++    "SWEET GPU: mode 9 GPU copy time (us)");
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_screen_cpu_us, CTLFLAG_RD | CTLFLAG_LOCKED, &screen_cpu_us, 0,
++    "SWEET GPU: mode 9 CPU copy time (us)");
++static uint64_t fb_pa;
++static uint32_t fb_w, fb_h, fb_pitch;
++static vm_offset_t fb_cpu;
++
++static void
++rb_blit_copy(uint64_t src, uint32_t spitch, uint64_t dst, uint32_t dpitch, uint32_t sx, uint32_t sy,
++    uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
++{
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(RENDER_MODE_BLIT2D);
++	rb_pkt4(R_RB_2D_SRC_INFO, 9);
++	rb_out(FMT_R8G8B8A8_UNORM);
++	rb_out((uint32_t)src);
++	rb_out((uint32_t)(src >> 32));
++	rb_out(spitch >> 6);
++	for (int i = 0; i < 5; i++) {
++		rb_out(0);
++	}
++	rb_reg(R_GRAS_2D_SRC_INFO, FMT_R8G8B8A8_UNORM);
++	rb_pkt4(R_RB_2D_DST_INFO, 9);
++	rb_out(FMT_R8G8B8A8_UNORM);
++	rb_out((uint32_t)dst);
++	rb_out((uint32_t)(dst >> 32));
++	rb_out(dpitch >> 6);
++	for (int i = 0; i < 5; i++) {
++		rb_out(0);
++	}
++	rb_reg(R_GRAS_2D_DST_INFO, FMT_R8G8B8A8_UNORM);
++	rb_pkt7(CP_BLIT, 5);
++	rb_out(BLIT_OP_COPY);
++	rb_out(sx | (sy << 16));
++	rb_out((sx + w - 1) | ((sy + h - 1) << 16));
++	rb_out(dx | (dy << 16));
++	rb_out((dx + w - 1) | ((dy + h - 1) << 16));
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(RENDER_MODE_END2D);
++}
++
++static void
++rb_blit_setup(void)
++{
++	rb_reg(R_RB_RENDER_CNTL, 0x00000008);
++	rb_reg(R_RB_2D_BLIT_CNTL, 0x86000000);
++	rb_reg(R_GRAS_2D_BLIT_CNTL, 0x86000000);
++	rb_reg(R_UNKNOWN_2184, 0x00000009);
++	rb_reg(R_RB_CNTL, RB_CNTL_BYPASS);
++	rb_reg(R_RB_MODE_CNTL_2D, 0x00000004);
++	rb_reg(R_SP_MODE_CNTL, 0x0000000c);
++	rb_reg(R_TPL1_MODE_CNTL_2D, 0x00000344);
++	rb_reg(R_HLSQ_MODE_CNTL, 0x00000002);
++	rb_reg(R_GRAS_CL_CNTL, 0x00000181);
++}
++
++static uint64_t
++ns_since(uint64_t t0)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns;
++}
++
++#define TILE_N          8u      /* 8 x 8 tiles of 64 x 64 */
++#define BENCH_ROWS      768u
++
++static int
++screen_test(void)
++{
++	PE_Video video;
++	if (PE_current_console(&video) != 0 || video.v_baseAddr == 0) {
++		printf("SWEET GPU B: SCREEN: no console framebuffer\n");
++		return -1;
++	}
++	fb_pa = video.v_baseAddr;
++	fb_w = (uint32_t)video.v_width;
++	fb_h = (uint32_t)video.v_height;
++	fb_pitch = (uint32_t)video.v_rowBytes;
++	uint64_t len = ((uint64_t)fb_pitch * fb_h + 0x1fffffull) & ~0x1fffffull;
++	printf("SWEET GPU B: SCREEN: panel %ux%u pitch %u at 0x%llx, GPU 0x%llx (%llu MiB mapped)\n", fb_w, fb_h,
++	    fb_pitch, fb_pa, IOVA_FB, len >> 20);
++	if ((2u * fb_pitch) % 64u || fb_h % 2u || !pt_map_blocks(fb_pa, len)) {
++		printf("SWEET GPU B: SCREEN: layout not usable\n");
++		return -1;
++	}
++	if (!fb_cpu) {
++		fb_cpu = ml_io_map_wcomb(fb_pa, (vm_size_t)fb_pitch * fb_h);     /* as the present path */
++	}
++	if (!fb_cpu) {
++		return -1;
++	}
++	uint32_t vpitch = 2u * fb_pitch;
++
++	/* A. 8 x 8 tiles of the source image, centred; source seen the same way (two rows per virtual row) */
++	volatile uint32_t *src = (volatile uint32_t *)(dma + DMA_IMG_SRC);
++	for (uint32_t y = 0; y < IMG_H; y++) {
++		for (uint32_t x = 0; x < IMG_W; x++) {
++			src[y * IMG_W + x] = img_pattern(x, y);
++		}
++	}
++	flush_dcache64(dma_pa + DMA_IMG_SRC, IMG_PITCH * IMG_H, TRUE);
++	uint32_t ox = (fb_w - TILE_N * IMG_W) / 2u, oy = ((fb_h - TILE_N * IMG_H) / 2u) & ~1u;
++	rb_blit_setup();
++	for (uint32_t ty = 0; ty < TILE_N; ty++) {
++		for (uint32_t tx = 0; tx < TILE_N; tx++) {
++			uint32_t dx = ox + tx * IMG_W, dy = (oy + ty * IMG_H) / 2u;
++			/* even source rows -> even panel rows, odd -> odd */
++			rb_blit_copy(gaddr(DMA_IMG_SRC), 2u * IMG_PITCH, IOVA_FB, vpitch, 0, 0, dx, dy, IMG_W, IMG_H / 2u);
++			rb_blit_copy(gaddr(DMA_IMG_SRC), 2u * IMG_PITCH, IOVA_FB, vpitch, IMG_W, 0, fb_w + dx, dy, IMG_W,
++			    IMG_H / 2u);
++		}
++	}
++	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++	uint64_t t0 = mach_absolute_time();
++	bool fenced = irq_test();
++	uint64_t tiles_ns = ns_since(t0);
++	uint32_t bad = 0, fx = 0, fy = 0, fgot = 0, fwant = 0;
++	for (uint32_t y = 0; y < TILE_N * IMG_H; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(fb_cpu + (uint64_t)(oy + y) * fb_pitch);
++		for (uint32_t x = 0; x < TILE_N * IMG_W; x++) {
++			uint32_t want = img_pattern(x % IMG_W, y % IMG_H), got = row[ox + x];
++			if (got != want && bad++ == 0) {
++				fx = ox + x;
++				fy = oy + y;
++				fgot = got;
++				fwant = want;
++			}
++		}
++	}
++	printf("SWEET GPU B: SCREEN A: %u tiles 64x64 at (%u,%u): %u wrong of %u, fence %s, %llu us\n",
++	    TILE_N * TILE_N, ox, oy, bad, TILE_N * TILE_N * IMG_W * IMG_H, fenced ? "ok" : "MISSING", tiles_ns / 1000);
++	if (bad) {
++		printf("SWEET GPU B: SCREEN A first wrong pixel (%u,%u) = 0x%08x, want 0x%08x\n", fx, fy, fgot, fwant);
++		return -2;
++	}
++
++	/* B. GPU copy of the top BENCH_ROWS panel rows to the bottom: one blit on the virtual surface */
++	uint32_t vrows = BENCH_ROWS / 2u, vdst = (fb_h - BENCH_ROWS) / 2u;
++	rb_blit_setup();
++	rb_blit_copy(IOVA_FB, vpitch, IOVA_FB, vpitch, 0, 0, 0, vdst, 2u * fb_w, vrows);
++	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++	t0 = mach_absolute_time();
++	fenced = irq_test();
++	uint64_t gpu_ns = ns_since(t0);
++	uint32_t mism = 0;
++	for (uint32_t y = 0; y < BENCH_ROWS; y += 37) {
++		volatile uint32_t *a = (volatile uint32_t *)(fb_cpu + (uint64_t)y * fb_pitch);
++		volatile uint32_t *b = (volatile uint32_t *)(fb_cpu + (uint64_t)(fb_h - BENCH_ROWS + y) * fb_pitch);
++		for (uint32_t x = 0; x < fb_w; x += 7) {
++			mism += a[x] != b[x];
++		}
++	}
++	/* the same copy by the CPU, as the present path does today (cached source -> panel) */
++	uint64_t bytes = (uint64_t)fb_w * 4u * BENCH_ROWS;
++	uint8_t *tmp = kalloc_data((vm_size_t)bytes, Z_WAITOK);
++	uint64_t cpu_ns = 0;
++	if (tmp) {
++		memcpy(tmp, (const void *)fb_cpu, (size_t)bytes);
++		t0 = mach_absolute_time();
++		for (uint32_t y = 0; y < BENCH_ROWS; y++) {
++			memcpy((void *)(fb_cpu + (uint64_t)(fb_h - BENCH_ROWS + y) * fb_pitch), tmp + (uint64_t)y * fb_w * 4u,
++			    (size_t)fb_w * 4u);
++		}
++		cpu_ns = ns_since(t0);
++		kfree_data(tmp, (vm_size_t)bytes);
++	}
++	printf("SWEET GPU B: SCREEN B: %ux%u (%llu KiB) GPU %llu us (%llu MB/s), fence %s, %u mismatches sampled; "
++	    "CPU memcpy %llu us (%llu MB/s)\n", fb_w, BENCH_ROWS, bytes >> 10, gpu_ns / 1000,
++	    gpu_ns ? bytes * 1000ull / gpu_ns : 0, fenced ? "ok" : "MISSING", mism, cpu_ns / 1000,
++	    cpu_ns ? bytes * 1000ull / cpu_ns : 0);
++	screen_gpu_us = (int)(gpu_ns / 1000);
++	screen_cpu_us = (int)(cpu_ns / 1000);
++	return (fenced && mism == 0) ? 0 : -3;
++}
++
+ static bool
+ blit_test(void)
+ {
+@@ -1497,7 +1709,7 @@ stage_b(int mode)
+ 		return -3;
+ 	}
+ 	use_iova = false;
+-	if (mode >= 5 && mode <= 8 && !smmu_translate_setup()) {
++	if (mode >= 5 && mode <= 9 && !smmu_translate_setup()) {
+ 		return -13;
+ 	}
+ 
+@@ -1517,7 +1729,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+-	use_iova = (mode >= 5 && mode <= 8);
++	use_iova = (mode >= 5 && mode <= 9);
+ 
+ 	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
+ 	gpucc_extra_clocks();
+@@ -1626,6 +1838,13 @@ stage_b(int mode)
+ 
+ 	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
+ 	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
++	if (ok && mode == 9) {
++		int r = screen_test();
++		if (r != 0) {
++			gpu_dump("SCREEN test");
++			return -18;
++		}
++	}
+ 	if (ok && mode == 8) {
+ 		ok = blit_test();
+ 		if (!ok) {
+@@ -1686,7 +1905,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 8) {
++	if (value >= 1 && value <= 9) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
