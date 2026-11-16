@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -16,7 +16,9 @@
+  *                                  =8: as 5, then a 2D blit (CP_BLIT) checked
+  *                                  pixel by pixel, -17 = wrong pixels,
+  *                                  =9: as 5, then GPU blits into the panel
+- *                                  (pattern + 1080x768 copy, timed vs CPU)), CP microcode, ME_INIT,
++ *                                  (pattern + 1080x768 copy, timed vs CPU),
++ *                                  =10: as 5, then BLIT_OP_SCALE 64x64 -> 92x92
++ *                                  (two render modes), -19 = no fence), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -184,6 +186,8 @@ static const uint16_t addr_mode_regs[] = {
+ #define RENDER_MODE_BLIT2D      5
+ #define RENDER_MODE_END2D       8
+ #define BLIT_OP_COPY            1
++#define BLIT_OP_SCALE           3
++#define RENDER_MODE_BLIT2DSCALE 7
+ #define EV_CACHE_FLUSH_TS       4u
+ #define EV_IRQ                  (1u << 31)
+ #define CP_INDIRECT_BUFFER_PFE  63
+@@ -206,7 +210,8 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_IMG_SRC     0x25000     /* mode 8: 64x64 RGBA8 source image */
+ #define DMA_IMG_DST     0x29000     /* mode 8: 64x64 RGBA8 destination image */
+ #define DMA_PT_L2B      0x2d000     /* mode 9: level-2 table for GPU addresses 1-2 GiB (panel) */
+-#define DMA_SIZE        0x2e000
++#define DMA_SCALE_DST   0x2e000     /* mode 10: two 128x128 RGBA8 targets (pitch 512) */
++#define DMA_SIZE        0x4e000
+ #define IOVA_FB         0x40000000ull   /* mode 9: panel framebuffer, 2 MiB blocks */
+ #define IOVA_DMA        0x10000000ull   /* mode 5: GPU address of the DMA area */
+ #define IOVA_TEST       0x20000000ull   /* mode 5: GPU address of DMA_TEST */
+@@ -1153,6 +1158,102 @@ blit_test(void)
+ 	return fenced && bad == 0;
+ }
+ 
++/*
++ * Phase D step 2 probe: can the 2D engine scale? iOS presents 750x1334 into
++ * the 1080x1920 panel (x1.44). CP_BLIT BLIT_OP_SCALE is documented only as
++ * "used for mipmap generation" and render mode 7 as a placeholder name, so
++ * try 64x64 -> 92x92 both ways and compare with nearest and bilinear.
++ */
++#define SC_W            92u
++#define SC_PITCH        512u
++#define SC_PX           (SC_PITCH / 4u)
++
++static uint32_t
++scale_variant(uint32_t which, uint32_t mode)
++{
++	uint32_t off = DMA_SCALE_DST + which * SC_PITCH * SC_PX;
++	volatile uint32_t *dst = (volatile uint32_t *)(dma + off);
++	for (uint32_t i = 0; i < SC_PX * SC_PX; i++) {
++		dst[i] = 0x12345678u;
++	}
++	flush_dcache64(dma_pa + off, SC_PITCH * SC_PX, TRUE);
++	rb_blit_setup();
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(mode);
++	rb_surface(R_RB_2D_SRC_INFO, R_GRAS_2D_SRC_INFO, gaddr(DMA_IMG_SRC));
++	rb_pkt4(R_RB_2D_DST_INFO, 9);
++	rb_out(FMT_R8G8B8A8_UNORM);
++	rb_out((uint32_t)gaddr(off));
++	rb_out((uint32_t)(gaddr(off) >> 32));
++	rb_out((SC_PITCH >> 6) | (((SC_PITCH * SC_PX) >> 6) << 16));
++	for (int i = 0; i < 5; i++) {
++		rb_out(0);
++	}
++	rb_reg(R_GRAS_2D_DST_INFO, FMT_R8G8B8A8_UNORM);
++	rb_pkt7(CP_BLIT, 5);
++	rb_out(BLIT_OP_SCALE);
++	rb_out(0);
++	rb_out((IMG_W - 1) | ((IMG_H - 1) << 16));
++	rb_out(0);
++	rb_out((SC_W - 1) | ((SC_W - 1) << 16));
++	rb_pkt7(CP_SET_RENDER_MODE, 1);
++	rb_out(RENDER_MODE_END2D);
++	rb_pkt7(CP_WAIT_FOR_IDLE, 0);
++	bool fenced = irq_test();
++	flush_dcache64(dma_pa + off, SC_PITCH * SC_PX, TRUE);
++	uint32_t written = 0, outside = 0, nearest = 0, maxerr = 0;
++	for (uint32_t y = 0; y < SC_PX; y++) {
++		for (uint32_t x = 0; x < SC_PX; x++) {
++			uint32_t got = dst[y * SC_PX + x];
++			bool in = x < SC_W && y < SC_W;
++			if (!in) {
++				outside += got != 0x12345678u;
++				continue;
++			}
++			written += got != 0x12345678u;
++			uint32_t nx = (2u * x + 1u) * IMG_W / (2u * SC_W), ny = (2u * y + 1u) * IMG_H / (2u * SC_W);
++			nearest += got == img_pattern(nx, ny);
++			/* bilinear expectation of R = 4 * x_src and G = 4 * y_src (src centres) */
++			int32_t er = (int32_t)(((2 * (int64_t)x + 1) * IMG_W * 4 / (2 * SC_W)) - 2);
++			int32_t eg = (int32_t)(((2 * (int64_t)y + 1) * IMG_H * 4 / (2 * SC_W)) - 2);
++			er = er < 0 ? 0 : (er > 252 ? 252 : er);
++			eg = eg < 0 ? 0 : (eg > 252 ? 252 : eg);
++			int32_t dr = (int32_t)(got & 0xffu) - er, dg = (int32_t)((got >> 8) & 0xffu) - eg;
++			uint32_t e = (uint32_t)((dr < 0 ? -dr : dr) > (dg < 0 ? -dg : dg) ? (dr < 0 ? -dr : dr) : (dg < 0 ? -dg : dg));
++			maxerr = e > maxerr ? e : maxerr;
++		}
++	}
++	printf("SWEET GPU B: SCALE %c (render mode %u): fence %s, written %u/%u, outside touched %u, nearest-exact %u, "
++	    "max R/G error vs bilinear %u; px (0,0) 0x%08x (45,45) 0x%08x (91,91) 0x%08x\n", 'a' + which, mode,
++	    fenced ? "ok" : "MISSING", written, SC_W * SC_W, outside, nearest, maxerr, dst[0], dst[45 * SC_PX + 45],
++	    dst[91 * SC_PX + 91]);
++	return fenced ? (written << 16) | (nearest > 0xffffu ? 0xffffu : nearest) : 0xffffffffu;
++}
++
++static int scale_res_a, scale_res_b;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_scale_a, CTLFLAG_RD | CTLFLAG_LOCKED, &scale_res_a, 0,
++    "SWEET GPU: mode 10 variant a (written << 16 | nearest-exact, -1 = no fence)");
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_scale_b, CTLFLAG_RD | CTLFLAG_LOCKED, &scale_res_b, 0,
++    "SWEET GPU: mode 10 variant b");
++
++static int
++scale_test(void)
++{
++	volatile uint32_t *src = (volatile uint32_t *)(dma + DMA_IMG_SRC);
++	for (uint32_t y = 0; y < IMG_H; y++) {
++		for (uint32_t x = 0; x < IMG_W; x++) {
++			src[y * IMG_W + x] = img_pattern(x, y);
++		}
++	}
++	flush_dcache64(dma_pa + DMA_IMG_SRC, IMG_PITCH * IMG_H, TRUE);
++	scale_res_a = (int)scale_variant(0, RENDER_MODE_BLIT2D);
++	if (scale_res_a == -1) {
++		return -1;
++	}
++	scale_res_b = (int)scale_variant(1, RENDER_MODE_BLIT2DSCALE);
++	return scale_res_b == -1 ? -1 : 0;
++}
++
+ /* ---- stage B ---- */
+ 
+ /*
+@@ -1762,7 +1863,7 @@ stage_b(int mode)
+ 		return -3;
+ 	}
+ 	use_iova = false;
+-	if (mode >= 5 && mode <= 9 && !smmu_translate_setup()) {
++	if (mode >= 5 && mode <= 10 && !smmu_translate_setup()) {
+ 		return -13;
+ 	}
+ 
+@@ -1782,7 +1883,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+-	use_iova = (mode >= 5 && mode <= 9);
++	use_iova = (mode >= 5 && mode <= 10);
+ 
+ 	/* 3. missing GPU clocks (and GPU clock, kern.sweetgpu_pll_l), soft reset, hw init, ring, ME */
+ 	gpucc_extra_clocks();
+@@ -1891,6 +1992,12 @@ stage_b(int mode)
+ 
+ 	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
+ 	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
++	if (ok && mode == 10) {
++		if (scale_test() != 0) {
++			gpu_dump("SCALE test");
++			return -19;
++		}
++	}
+ 	if (ok && mode == 9) {
+ 		int r = screen_test();
+ 		if (r != 0) {
+@@ -1958,7 +2065,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 9) {
++	if (value >= 1 && value <= 10) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
