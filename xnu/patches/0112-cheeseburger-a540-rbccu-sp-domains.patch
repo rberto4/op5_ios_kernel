@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -122,6 +122,10 @@ bool sweet_a540_powered(void);
+ #define R_GPMU_PWR_COL_IF_HYST  0xa893
+ #define R_GPMU_PWR_COL_BIN_CTRL 0xa894
+ #define R_GPMU_CM3_SYSRESET     0xa8d8
++#define R_GPMU_SP_POWER_CNTL    0xa881
++#define R_GPMU_RBCCU_POWER_CNTL 0xa887
++#define R_GPMU_SP_PWR_CLK_STATUS 0xa88b
++#define R_GPMU_RBCCU_PWR_CLK_STATUS 0xa88d
+ #define R_GPMU_GENERAL_0        0xa8e0
+ #define R_GPMU_GENERAL_1        0xa8e1
+ #define R_GPMU_VOLTAGE          0xac60
+@@ -846,6 +850,27 @@ gpucc_extra_clocks(void)
+ 	    *cxo, *rbcpr, *gfx3d, grd(R_RBBM_STATUS));
+ }
+ 
++/*
++ * A530/A540 power domains, as Linux a5xx_pm_resume: RBCCU first (voltage
++ * droop), then SP/TP, each waiting for PWR_CLK_STATUS bit 20. Test 0111:
++ * writes to SP/TP/UCHE registers left RBBM_STATUS busy for good (domains
++ * off), so CP_WAIT_FOR_IDLE never completed.
++ */
++static bool
++gpmu_domain_on(uint32_t cntl, uint32_t status, const char *name)
++{
++	gwr(cntl, 0x778000);
++	delay(3);
++	int i;
++	for (i = 0; i < 200 && !(grd(status) & (1u << 20)); i++) {
++		delay(5);
++	}
++	uint32_t st = grd(status);
++	printf("SWEET GPU B: %s domain: PWR_CLK_STATUS 0x%08x after %d x 5 us (%s), RBBM_STATUS 0x%08x\n",
++	    name, st, i, (st & (1u << 20)) ? "on" : "TIMEOUT", grd(R_RBBM_STATUS));
++	return (st & (1u << 20)) != 0;
++}
++
+ static int
+ stage_b(int mode)
+ {
+@@ -910,6 +935,10 @@ stage_b(int mode)
+ 	gwr(R_RBBM_SW_RESET_CMD, 0);
+ 	delay(10);
+ 	printf("SWEET GPU B: after soft reset RBBM_STATUS 0x%08x\n", grd(R_RBBM_STATUS));
++	if (!gpmu_domain_on(R_GPMU_RBCCU_POWER_CNTL, R_GPMU_RBCCU_PWR_CLK_STATUS, "RBCCU")) {
++		return -12;
++	}
++	(void)gpmu_domain_on(R_GPMU_SP_POWER_CNTL, R_GPMU_SP_PWR_CLK_STATUS, "SP/TP");
+ 	trace_last = grd(R_RBBM_STATUS);
+ 	hw_init();
+ 	gwr64(R_CP_ME_INSTR_BASE_LO, dma_pa + DMA_PM4);
