@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -2234,9 +2234,23 @@ bo_l3_table(uint32_t t)
+ 	}
+ 	vm_offset_t va = bo_l3_chunk + 0x1000u * bo_l3_chunk_used++;
+ 	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va)) | (va & PAGE_MASK);
++	/*
++	 * Test 0128 panicked in phystokv (0x2e708000, below XNU's RAM at
++	 * 0x1_00000000) from a physical-address cache flush: flush the
++	 * tables by virtual address and refuse a table whose address is not
++	 * in XNU's RAM.
++	 */
++	static int logged;
++	if (logged++ < 4) {
++		printf("SWEET GPU: BO level-3 table %u: va 0x%lx pa 0x%llx\n", t, (unsigned long)va, pa);
++	}
++	if (pa < 0x100000000ull) {
++		printf("SWEET GPU: BO level-3 table %u: pa 0x%llx outside RAM; refusing\n", t, pa);
++		return false;
++	}
+ 	bo_l3_va[t] = va;
+ 	bo_l3_pa[t] = pa;
+-	flush_dcache64(pa, 0x1000, TRUE);
++	flush_dcache64((addr64_t)va, 0x1000, FALSE);
+ 	volatile uint64_t *l2 = (volatile uint64_t *)(dma + DMA_PT_L2D);
+ 	l2[t] = pa | PTE_TABLE;
+ 	flush_dcache64(dma_pa + DMA_PT_L2D + 8u * t, 8, TRUE);
+@@ -2296,7 +2310,7 @@ sweet_gpu_map(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t nseg, ui
+ 		}
+ 	}
+ 	for (uint64_t t = start >> 9; t <= (start + pages - 1) >> 9; t++) {
+-		flush_dcache64(bo_l3_pa[t], 0x1000, TRUE);
++		flush_dcache64((addr64_t)bo_l3_va[t], 0x1000, FALSE);
+ 	}
+ 	gpu_tlb_flush();
+ 	bo_pages_used += (int)pages;
+@@ -2324,7 +2338,7 @@ sweet_gpu_unmap(uint64_t iova, uint64_t size)
+ 	}
+ 	for (uint64_t t = start >> 9; t <= (start + pages - 1) >> 9; t++) {
+ 		if (bo_l3_va[t]) {
+-			flush_dcache64(bo_l3_pa[t], 0x1000, TRUE);
++			flush_dcache64((addr64_t)bo_l3_va[t], 0x1000, FALSE);
+ 		}
+ 	}
+ 	gpu_tlb_flush();
+@@ -2514,7 +2528,9 @@ sweet_gpu_present_copy(const uint64_t *seg_pa, const uint64_t *seg_len, uint32_t
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+ 	for (uint32_t i = 0; i < nseg; i++) {
+-		flush_dcache64(seg_pa[i], (unsigned)seg_len[i], TRUE);     /* backboardd drew with the CPU */
++		if (seg_pa[i] >= 0x100000000ull) {     /* only XNU's RAM has a kernel view to flush */
++			flush_dcache64(seg_pa[i], (unsigned)seg_len[i], TRUE);     /* backboardd drew with the CPU */
++		}
+ 	}
+ 	lck_mtx_lock(gpu_mtx);
+ 	if (!pt_map_surface(seg_pa, seg_len, nseg) || !rb_space(96)) {
