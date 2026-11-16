@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -521,11 +521,26 @@ AppleCLCD::hwScaleEnable(void)
+ 	mdp_wr(fMdp, qs + 0x40, sw | sh << 16);                                 /* SRC_SIZE_Y_RGB_A */
+ 	mdp_wr(fMdp, qs + 0x44, sw | sh << 16);                                 /* SRC_SIZE_UV */
+ 	mdp_wr(fMdp, qs + 0x48, dw | dh << 16);                                 /* DST_SIZE */
+-	mdp_wr(fMdp, qs + 0x04, 1u | 3u << 16 | 1u << 14 | 1u << 10 | 1u << 30); /* OP_MODE */
++	/*
++	 * SW pixel extension, as mainline _dpu_plane_setup_pixel_ext +
++	 * dpu_hw_sspp_setup_pe_config: no left/right/top/bottom repeat or
++	 * fetch, requested pixels = the source size. Test 0125 (sweetfb_hwscale=1)
++	 * without these: the fetcher kept ABL's 1080x1920 request and the panel
++	 * showed a black screen with a band of torn lines.
++	 */
++	uint32_t abl_lr = mdp_rd(fMdp, vig + 0x100), abl_req = mdp_rd(fMdp, vig + 0x108);
++	for (uint32_t c = 0; c < 3; c++) {
++		mdp_wr(fMdp, vig + 0x100 + 0x10 * c, 0);                        /* C0/C1C2/C3 LR */
++		mdp_wr(fMdp, vig + 0x104 + 0x10 * c, 0);                        /* TB */
++		mdp_wr(fMdp, vig + 0x108 + 0x10 * c, sw | sh << 16);            /* REQ_PIXELS */
++	}
++	/* enable, y/rgb bilinear, not DX, alpha on + bilinear, blend_cfg (mainline sets 1) */
++	mdp_wr(fMdp, qs + 0x04, 1u | 3u << 16 | 1u << 14 | 1u << 10 | 1u << 30 | 1u << 31); /* OP_MODE */
+ 	mdp_wr(fMdp, vig + 0x00, sw | sh << 16);                                /* fetch the logical size */
+ 	mdp_wr(fMdp, 0x1018, 1);                                                /* CTL0 FLUSH: VIG0 */
+-	IOLog("SWEET FB: VIG0 QSEED3 scales %ux%u -> %ux%u (op 0x%x src 0x%x)\n", sw, sh, dw, dh,
+-	    mdp_rd(fMdp, qs + 0x04), mdp_rd(fMdp, vig + 0x00));
++	IOLog("SWEET FB: VIG0 QSEED3 scales %ux%u -> %ux%u (op 0x%x src 0x%x; pixel ext LR 0x%x REQ 0x%x -> 0x%x)\n",
++	    sw, sh, dw, dh, mdp_rd(fMdp, qs + 0x04), mdp_rd(fMdp, vig + 0x00), abl_lr, abl_req,
++	    mdp_rd(fMdp, vig + 0x108));
+ 	return true;
+ }
+ 
