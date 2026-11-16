@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -1278,6 +1278,19 @@ stage_b(int mode)
+ 		ok = drained && mem_write_test(0xc0ffee06, true, "MEM_WRITE after fault");
+ 		printf("SWEET GPU B: fault test: CB0 FSR 0x%08x, CP %s\n", srd(SMMU_CB(0) + CB_FSR),
+ 		    ok ? "still runs" : "stopped");
++		/*
++		 * Test 0115: with FSR.TF pending the next valid write was lost
++		 * (CP drained the ring, idle). Clear the fault as the Linux
++		 * arm-smmu context fault handler does, only with RBBM_STATUS idle
++		 * (test 0102: clearing with the CP busy hung the phone), retry.
++		 */
++		if (!ok && drained && (grd(R_RBBM_STATUS) & (uint32_t)busy_mask) == 0) {
++			uint32_t fsr = srd(SMMU_CB(0) + CB_FSR);
++			swr(SMMU_CB(0) + CB_FSR, fsr);
++			printf("SWEET GPU B: fault test: CP idle, FSR 0x%08x cleared -> 0x%08x\n", fsr,
++			    srd(SMMU_CB(0) + CB_FSR));
++			ok = mem_write_test(0xc0ffee07, true, "MEM_WRITE after FSR clear");
++		}
+ 	}
+ 	gpu_dump("end");
+ 	printf("SWEET GPU B: SMMU sGFSR 0x%08x CB0 FSR 0x%08x\n", srd(0x48), srd(SMMU_CB(0) + CB_FSR));
