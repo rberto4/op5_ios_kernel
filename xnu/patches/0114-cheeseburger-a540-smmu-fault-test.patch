@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -8,7 +8,9 @@
+  *                                  =4: no secure exit, MEM_WRITE, then
+  *                                  WAIT_FOR_IDLE + MEM_WRITE (-11 = that hung),
+  *                                  =5: as 1 with CB0 translating through page
+- *                                  tables, -13 = page table setup refused), CP microcode, ME_INIT,
++ *                                  tables, -13 = page table setup refused,
++ *                                  =6: as 5, then a write to an unmapped
++ *                                  GPU address and one more valid write), CP microcode, ME_INIT,
+  *                                  zap shader (TrustZone PAS 13), leave
+  *                                  secure mode, one CP_MEM_WRITE test
+  * Reading kern.sweetgpu_stage returns the last step reached (negative =
+@@ -166,6 +168,7 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_SIZE        0x25000
+ #define IOVA_DMA        0x10000000ull   /* mode 5: GPU address of the DMA area */
+ #define IOVA_TEST       0x20000000ull   /* mode 5: GPU address of DMA_TEST */
++#define IOVA_UNMAPPED   0x30000000ull   /* mode 6: no page table entry */
+ 
+ static vm_offset_t gpu, smmu, dma;
+ static uint64_t dma_pa;
+@@ -1010,7 +1013,7 @@ stage_b(int mode)
+ 		return -3;
+ 	}
+ 	use_iova = false;
+-	if (mode == 5 && !smmu_translate_setup()) {
++	if ((mode == 5 || mode == 6) && !smmu_translate_setup()) {
+ 		return -13;
+ 	}
+ 
+@@ -1030,7 +1033,7 @@ stage_b(int mode)
+ 	memset((void *)(dma + DMA_RB), 0, RB_SIZE);
+ 	*(volatile uint32_t *)(dma + DMA_SCRATCH) = 0xdeadbeef;
+ 	flush_dcache64(dma_pa, DMA_SIZE, TRUE);
+-	use_iova = (mode == 5);
++	use_iova = (mode == 5 || mode == 6);
+ 
+ 	/* 3. missing GPU clocks, soft reset, hardware init, ring, micro engine */
+ 	gpucc_extra_clocks();
+@@ -1120,9 +1123,25 @@ stage_b(int mode)
+ 
+ 	/* 6. the GPU writes values into our memory (mode 5: also through the second mapping) */
+ 	bool ok = mem_write_test(0xc0ffee01, false, "MEM_WRITE");
+-	if (ok && mode == 5) {
++	if (ok && (mode == 5 || mode == 6)) {
+ 		ok = mem_write_at(DMA_TEST, IOVA_TEST, 0xc0ffee05, true, "MEM_WRITE test page");
+ 	}
++	if (ok && mode == 6) {
++		/*
++		 * Phase C fault test: a write to an unmapped GPU address. CB0
++		 * terminates it (SCTLR.CFCFG 0); see whether the CP goes on. The
++		 * fault is only reported, never cleared with the CP running.
++		 */
++		rb_pkt7(CP_MEM_WRITE, 3);
++		rb_out((uint32_t)IOVA_UNMAPPED);
++		rb_out((uint32_t)(IOVA_UNMAPPED >> 32));
++		rb_out(0xbad0bad0);
++		bool drained = rb_flush_wait("MEM_WRITE unmapped");
++		gpu_dump("after unmapped write");
++		ok = drained && mem_write_test(0xc0ffee06, true, "MEM_WRITE after fault");
++		printf("SWEET GPU B: fault test: CB0 FSR 0x%08x, CP %s\n", srd(SMMU_CB(0) + CB_FSR),
++		    ok ? "still runs" : "stopped");
++	}
+ 	gpu_dump("end");
+ 	printf("SWEET GPU B: SMMU sGFSR 0x%08x CB0 FSR 0x%08x\n", srd(0x48), srd(SMMU_CB(0) + CB_FSR));
+ 	return ok ? 6 : -9;
+@@ -1137,7 +1156,7 @@ sysctl_sweetgpu_stage SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value >= 1 && value <= 5) {
++	if (value >= 1 && value <= 6) {
+ 		/*
+ 		 * Test 0105: a second run on a live CP hung the phone. One run per
+ 		 * boot until the CP is stopped cleanly before the reset.
