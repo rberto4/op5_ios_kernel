@@ -1,0 +1,206 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -13,15 +13,16 @@
+  *
+  * Firmware is read from the root file system, never built in (Qualcomm
+  * files, not redistributable): /usr/local/share/op5fw/{a530_pm4.fw,
+- * a530_pfp.fw, a540_zap.mdt, a540_zap.b02} (copied from the phone's own
++ * a530_pfp.fw, a540_zap.mdt, a540_zap.b02, a540_gpmu.fw2} (copied from the phone's own
+  * /vendor/firmware).
+  *
+  * Sequence after Linux drivers/gpu/drm/msm/adreno/a5xx_gpu.c (a5xx_hw_init,
+  * a5xx_me_init, zap), adreno_gpu.c (zap_shader_load_mdt),
+  * drivers/soc/qcom/mdt_loader.c and drivers/firmware/qcom_scm*.c
+  * (SMCCC SIP calls, QCOM_SCM_ARGS encoding). Register offsets from
+- * a5xx.xml.h. Hardware clock gating, GPMU/limits management, preemption
+- * and interrupts are not set up (polled, low clock).
++ * a5xx.xml.h; GPMU start after a5xx_power.c (kern.sweetgpu_gpmu=0 skips it,
++ * -10 = GPMU step failed). Hardware clock gating, preemption and
++ * interrupts are not set up (polled, low clock).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -102,6 +103,18 @@ bool sweet_a540_powered(void);
+ #define R_CP_HW_FAULT           0x0b1a
+ #define R_CP_INTERRUPT_STATUS   0x0b18
+ #define R_CP_PROTECT_STATUS     0x0b1c
++#define R_RBBM_STATUS3          0x0530   /* bit 24: SMMU stalled on fault */
++#define R_GPMU_INST_RAM_BASE    0x8800
++#define R_GPMU_DATA_RAM_BASE    0x9800
++#define R_GPMU_PWR_COL_STAGGER  0xa891
++#define R_GPMU_PWR_COL_IF_CTRL  0xa892
++#define R_GPMU_PWR_COL_IF_HYST  0xa893
++#define R_GPMU_PWR_COL_BIN_CTRL 0xa894
++#define R_GPMU_CM3_SYSRESET     0xa8d8
++#define R_GPMU_GENERAL_0        0xa8e0
++#define R_GPMU_GENERAL_1        0xa8e1
++#define R_GPMU_VOLTAGE          0xac60
++#define R_GPMU_PWR_THRESHOLD    0xac80
+ 
+ static const uint16_t addr_mode_regs[] = {
+ 	0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */,
+@@ -114,6 +127,10 @@ static const uint16_t addr_mode_regs[] = {
+ #define CP_ME_INIT              72
+ #define CP_MEM_WRITE            61
+ #define CP_SET_SECURE_MODE      102
++#define CP_SET_PROTECTED_MODE   95
++#define CP_INDIRECT_BUFFER_PFE  63
++#define CP_TYPE4_PKT            0x40000000u
++#define TYPE4_MAX_PAYLOAD       127u
+ #define RB_SIZE                 0x8000u     /* 32 KiB */
+ #define RB_CNTL_NO_UPDATE       0x08000000u
+ 
+@@ -122,6 +139,7 @@ static const uint16_t addr_mode_regs[] = {
+ #define DMA_PM4         0x08000
+ #define DMA_PFP         0x10000
+ #define DMA_SCRATCH     0x18000
++#define DMA_GPMU        0x19000     /* GPMU microcode IB, up to 28 KiB */
+ #define DMA_SIZE        0x20000
+ 
+ static vm_offset_t gpu, smmu, dma;
+@@ -155,9 +173,10 @@ static void
+ gpu_dump(const char *why)
+ {
+ 	printf("SWEET GPU B: %s: RBBM_STATUS 0x%08x INT_0 0x%08x CP_HW_FAULT 0x%08x CP_INT 0x%08x "
+-	    "CP_PROTECT_STATUS 0x%08x RPTR %u WPTR %u SMMU gFSR 0x%08x CB0 FSR 0x%08x\n",
++	    "CP_PROTECT_STATUS 0x%08x RPTR %u WPTR %u RBBM_STATUS3 0x%08x SMMU gFSR 0x%08x CB0 FSR 0x%08x\n",
+ 	    why, grd(R_RBBM_STATUS), grd(R_RBBM_INT_0_STATUS), grd(R_CP_HW_FAULT),
+ 	    grd(R_CP_INTERRUPT_STATUS), grd(R_CP_PROTECT_STATUS), grd(R_CP_RB_RPTR), grd(R_CP_RB_WPTR),
++	    grd(R_RBBM_STATUS3),
+ 	    *(volatile uint32_t *)(smmu + 0x48), *(volatile uint32_t *)(smmu + 0x8000 + 0x58));
+ }
+ 
+@@ -493,6 +512,122 @@ hw_init(void)
+ 	gwr(R_SECVID_TSB_ADDR_MODE, 1);
+ }
+ 
++/*
++ * A540 power init as Linux a5xx_power_init (a540_lm_setup, a5xx_pc_init,
++ * a5xx_gpmu_init with the a5xx_gpmu_ucode_init IB). Test 0106: with no GPMU
++ * the CP stayed busy (CP_ME_BUSY) after CP_SET_SECURE_MODE 0.
++ * sysctl kern.sweetgpu_gpmu=0 skips it.
++ */
++static int gpmu_enable = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_gpmu, CTLFLAG_RW | CTLFLAG_LOCKED, &gpmu_enable, 0,
++    "SWEET GPU stage B: start the GPMU before the zap shader");
++
++#define AGC_INIT_MSG_MAGIC      (R_GPMU_DATA_RAM_BASE + 5)
++#define AGC_MSG_BASE            (R_GPMU_DATA_RAM_BASE + 7)
++#define AGC_MSG_STATE           (AGC_MSG_BASE + 0)
++#define AGC_MSG_COMMAND         (AGC_MSG_BASE + 1)
++#define AGC_MSG_PAYLOAD_SIZE    (AGC_MSG_BASE + 3)
++#define AGC_MSG_PAYLOAD(o)      (AGC_MSG_BASE + 5 + (o))
++#define AGC_LM_CONFIG           (136 / 4)
++#define AGC_LEVEL_CONFIG        (140 / 4)
++#define A540_PATCHID            1u          /* chip id 0x05040001 */
++#define A540_MVOLTS             700u        /* GX rail as set by stage A */
++#define A540_MHZ                19u         /* gfx3d on XO (stage A) */
++
++static void
++a540_lm_setup(void)
++{
++	uint32_t config = (1u << 24) /* BCL disabled */ | (A540_PATCHID << 17) |
++	    (2u << 8) /* throttle disabled */;
++	gwr(R_GPMU_VOLTAGE, 0x80000000u | 0);
++	gwr(R_GPMU_PWR_THRESHOLD, 0x80000000u | 6000);
++	gwr(AGC_MSG_STATE, 0x80000001u);
++	gwr(AGC_MSG_COMMAND, 1);        /* AGC_POWER_CONFIG_PRODUCTION_ID */
++	gwr(AGC_MSG_PAYLOAD(0), 5448);
++	gwr(AGC_MSG_PAYLOAD(1), 1);
++	gwr(AGC_MSG_PAYLOAD(2), A540_MVOLTS);
++	gwr(AGC_MSG_PAYLOAD(3), A540_MHZ);
++	gwr(AGC_MSG_PAYLOAD(AGC_LM_CONFIG), config);
++	gwr(AGC_MSG_PAYLOAD(AGC_LEVEL_CONFIG), ~0x303u);
++	gwr(AGC_MSG_PAYLOAD_SIZE, (AGC_LEVEL_CONFIG + 1) * 4);
++	gwr(AGC_INIT_MSG_MAGIC, 0xbabefaceu);
++}
++
++/* Build the GPMU microcode IB (type-4 writes into GPMU_INST_RAM); returns dwords, 0 on error. */
++static uint32_t
++gpmu_build_ib(void)
++{
++	size_t len = 0;
++	uint32_t *fw = fw_read("a540_gpmu.fw2", &len);
++	uint32_t dwords = 0;
++	if (!fw) {
++		return 0;
++	}
++	if (len < 12 || fw[0] < 2 || fw[0] >= len / 4 || fw[1] != 2 || fw[2] + 2 >= fw[0]) {
++		printf("SWEET GPU B: a540_gpmu.fw2 header not as expected\n");
++		goto out;
++	}
++	const uint32_t *cmds = fw + fw[2] + 3;
++	uint32_t left = fw[0] - fw[2] - 2, offset = 0;
++	uint32_t need = left + left / TYPE4_MAX_PAYLOAD + 1;
++	if (need * 4 > DMA_SIZE - DMA_GPMU) {
++		printf("SWEET GPU B: GPMU IB too big (%u dwords)\n", need);
++		goto out;
++	}
++	volatile uint32_t *ib = (volatile uint32_t *)(dma + DMA_GPMU);
++	while (left > 0) {
++		uint32_t n = left > TYPE4_MAX_PAYLOAD ? TYPE4_MAX_PAYLOAD : left;
++		uint32_t reg = R_GPMU_INST_RAM_BASE + offset;
++		ib[dwords++] = CP_TYPE4_PKT | n | (pm4_parity(n) << 7) | ((reg & 0x3ffffu) << 8) |
++		    (pm4_parity(reg) << 27);
++		for (uint32_t i = 0; i < n; i++) {
++			ib[dwords++] = *cmds++;
++		}
++		offset += n;
++		left -= n;
++	}
++	flush_dcache64(dma_pa + DMA_GPMU, dwords * 4, TRUE);
++out:
++	kfree_data(fw, FW_MAX);
++	return dwords;
++}
++
++static int
++power_init(void)
++{
++	a540_lm_setup();
++	/* SP/TP power collapse */
++	gwr(R_GPMU_PWR_COL_IF_CTRL, 0x7f);
++	gwr(R_GPMU_PWR_COL_BIN_CTRL, 0);
++	gwr(R_GPMU_PWR_COL_IF_HYST, 0xa0080);
++	gwr(R_GPMU_PWR_COL_STAGGER, 0x600040);
++
++	uint32_t dwords = gpmu_build_ib();
++	if (dwords == 0) {
++		return -1;
++	}
++	uint64_t iova = dma_pa + DMA_GPMU;
++	rb_pkt7(CP_SET_PROTECTED_MODE, 1);
++	rb_out(0);
++	rb_pkt7(CP_INDIRECT_BUFFER_PFE, 3);
++	rb_out((uint32_t)iova);
++	rb_out((uint32_t)(iova >> 32));
++	rb_out(dwords);
++	rb_pkt7(CP_SET_PROTECTED_MODE, 1);
++	rb_out(1);
++	if (!rb_flush_wait("GPMU microcode IB")) {
++		return -1;
++	}
++	gwr(R_GPMU_CM3_SYSRESET, 0);
++	int i;
++	for (i = 0; i < 2000 && grd(R_GPMU_GENERAL_0) != 0xbabefaceu; i++) {
++		delay(50);
++	}
++	printf("SWEET GPU B: GPMU started: GENERAL_0 0x%08x after %d x 50 us, GENERAL_1 0x%08x, "
++	    "RBBM_STATUS 0x%08x\n", grd(R_GPMU_GENERAL_0), i, grd(R_GPMU_GENERAL_1), grd(R_RBBM_STATUS));
++	return 0;
++}
++
+ static int
+ stage_b(int mode)
+ {
+@@ -582,6 +717,9 @@ stage_b(int mode)
+ 	if (!rb_flush_wait("ME_INIT")) {
+ 		return -5;
+ 	}
++	if (gpmu_enable && power_init() != 0) {
++		return -10;
++	}
+ 
+ 	/* 5. zap shader, then leave secure mode (mode 3: no zap, direct write as Linux without one) */
+ 	if (mode == 3) {
