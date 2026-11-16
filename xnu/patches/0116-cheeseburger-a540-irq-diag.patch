@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -584,6 +584,8 @@ smmu_translate_setup(void)
+ #define GICD_IGROUPR(n)         (0x0080u + 4u * ((n) / 32u))
+ #define GICD_ISENABLER(n)       (0x0100u + 4u * ((n) / 32u))
+ #define GICD_ICENABLER(n)       (0x0180u + 4u * ((n) / 32u))
++#define GICD_ISPENDR(n)         (0x0200u + 4u * ((n) / 32u))
++#define GICD_ICFGR(n)           (0x0c00u + 4u * ((n) / 16u))
+ #define GICD_IPRIORITYR(n)      (0x0400u + (n))
+ #define GICD_IROUTER(n)         (0x6000u + 8u * (n))
+ #define GPU_INTID               (32u + 300u)
+@@ -634,7 +636,11 @@ irq_test(void)
+ 	if (!gicd) {
+ 		return false;
+ 	}
+-	gwr(R_RBBM_INT_CLEAR_CMD, 0xffffffffu);
++	/* test 0115: clear only what is set, as Linux does (CLEAR_CMD 0xffffffff left STATUS 0 for good?) */
++	uint32_t st0 = grd(R_RBBM_INT_0_STATUS);
++	if (st0) {
++		gwr(R_RBBM_INT_CLEAR_CMD, st0);
++	}
+ 	irq_count = 0;
+ 	irq_last_status = 0;
+ 	if (sweet_irq_register(GPU_INTID, gpu_irq) != 0) {
+@@ -643,6 +649,8 @@ irq_test(void)
+ 	}
+ 	gicd_spi_enable(GPU_INTID, true);
+ 	gwr(R_RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS | INT_CP_SW);
++	printf("SWEET GPU B: IRQ: INT_0_STATUS before 0x%08x, INT_0_MASK 0x%08x, ICFGR 0x%08x\n", st0,
++	    grd(R_RBBM_INT_0_MASK), *(volatile uint32_t *)(gicd + GICD_ICFGR(GPU_INTID)));
+ 	printf("SWEET GPU B: IRQ: INTID %u enabled: IGROUPR 0x%08x ISENABLER 0x%08x IROUTER 0x%llx\n", GPU_INTID,
+ 	    *(volatile uint32_t *)(gicd + GICD_IGROUPR(GPU_INTID)),
+ 	    *(volatile uint32_t *)(gicd + GICD_ISENABLER(GPU_INTID)),
+@@ -659,10 +667,22 @@ irq_test(void)
+ 	flush_dcache64(dma_pa + DMA_RB, RB_SIZE, TRUE);
+ 	uint64_t t0 = mach_absolute_time();
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+-	int i;
++	int i, st_at = -1, pend_at = -1;
++	uint32_t st_seen = 0;
++	uint32_t pbit = 1u << (GPU_INTID % 32u);
+ 	for (i = 0; i < 2000 && irq_count == 0; i++) {
++		uint32_t st = grd(R_RBBM_INT_0_STATUS);
++		if (st && st_at < 0) {
++			st_at = i;
++			st_seen = st;
++		}
++		if (pend_at < 0 && (*(volatile uint32_t *)(gicd + GICD_ISPENDR(GPU_INTID)) & pbit)) {
++			pend_at = i;
++		}
+ 		delay(50);
+ 	}
++	printf("SWEET GPU B: IRQ: RBBM INT_0_STATUS first 0x%08x at %d x 50 us, GIC pending at %d x 50 us "
++	    "(-1 = never)\n", st_seen, st_at, pend_at);
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 	flush_dcache64(dma_pa + DMA_SCRATCH, 64, TRUE);
