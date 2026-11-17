@@ -4165,6 +4165,37 @@ static const char fragment_fetch[] =
 static const char fragment_fetch_end[] =
     "\n#undef main\n"
     "void main() { sweet_last[0] = sweet_colour; sweet_main(); sweet_colour = sweet_data[0]; }\n";
+/*
+ * op5 (Adreno 540): freedreno has EXT_shader_framebuffer_fetch on a6xx only. Without it a shader
+ * that reads what is there (sgl_vcm) did not compile, its program did not link, and CoreAnimation's
+ * draws with it went out with whatever program was in use before (0134-ca: 37 glUseProgram 0x502,
+ * artefacts). There, what is there reads as nothing (transparent): the layer draws nothing rather
+ * than garbage, until the framebuffer is copied for it.
+ */
+static const char fragment_nofetch[] =
+    "layout(location = 0) out highp vec4 sweet_colour;\n"
+    "highp vec4 sweet_last[1];\n"
+    "#define gl_LastFragData sweet_last\n"
+    "#define main sweet_main\n"
+    "#line 1\n";
+static const char fragment_nofetch_end[] =
+    "\n#undef main\n"
+    "void main() { sweet_last[0] = vec4(0.); sweet_main(); sweet_colour = sweet_data[0]; }\n";
+
+/* 1: the library offers EXT_shader_framebuffer_fetch (asked once, with a context current) */
+static int
+have_fbfetch(void)
+{
+	static int known = -1;
+
+	if (known < 0) {
+		const char *x = (const char *)glGetString(GL_EXTENSIONS);
+		known = x != NULL && strstr(x, "GL_EXT_shader_framebuffer_fetch") != NULL;
+		say("sweet-gl: EXT_shader_framebuffer_fetch %s\n", known ? "offered" : "NOT offered: what is there reads as nothing");
+	}
+	return known;
+}
+
 static const char vertex_start[] =
     "#define attribute in\n"
     "#define varying out\n"
@@ -4308,6 +4339,10 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	for (line = text; (line = strstr(line, "#extension")) != NULL; line += 2) {
 		size_t length = strcspn(line, "\n");
 
+		if (fetch && !have_fbfetch() && strnstr(line, "framebuffer_fetch", length) != NULL) {
+			line[0] = line[1] = '/';        /* not offered: dropped (fragment_nofetch) */
+			continue;
+		}
 		strncat(head, line, length);
 		strcat(head, "\n");
 		line[0] = line[1] = '/';
@@ -4315,14 +4350,14 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	}
 	/* a shader that reads what is there only through one of our texture functions (sgl_vcm): CoreAnimation
 	 * did not ask for the extension (boot 42: "cannot be declared as both input and output") */
-	if (fetch && strstr(head, "GL_EXT_shader_framebuffer_fetch") == NULL) {
+	if (fetch && have_fbfetch() && strstr(head, "GL_EXT_shader_framebuffer_fetch") == NULL) {
 		strcat(head, "#extension GL_EXT_shader_framebuffer_fetch : require\n");
 	}
 	parts[0] = head;
 	parts[3] = text;
 	if (fragment) {
-		parts[2] = fetch ? fragment_fetch : fragment_plain;
-		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
+		parts[2] = !fetch ? fragment_plain : have_fbfetch() ? fragment_fetch : fragment_nofetch;
+		parts[4] = !fetch ? fragment_plain_end : have_fbfetch() ? fragment_fetch_end : fragment_nofetch_end;
 	}
 	free((void *)e->sources[shader % 256]);
 	e->sources[shader % 256] = text;
