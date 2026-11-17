@@ -11,15 +11,18 @@
  *   3. a PM4 command buffer: CP_MEM_WRITE of 256 dwords into the data buffer
  *   4. GEM_SUBMIT, WAIT_FENCE, CPU_PREP, check every dword
  *   5. 200 submit + wait round trips: average latency
+ *   6. (kernel 0134+) an IOSurface as a buffer (request 0x7e): the GPU writes
+ *      256 dwords into the surface, read back through IOSurface's own mapping
  *
  * Build: xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 \
- *        -framework IOKit -framework CoreFoundation -o sweetgpu-msm-test sweetgpu-msm-test.c
+ *        -framework IOKit -framework IOSurface -framework CoreFoundation -o sweetgpu-msm-test sweetgpu-msm-test.c
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 /* include/uapi/drm/msm_drm.h (Copyright (C) 2013 Red Hat, MIT license) */
 #define DRM_COMMAND_BASE                0x40
@@ -55,6 +58,12 @@ struct drm_msm_gem_submit {
 struct drm_msm_wait_fence { uint32_t fence, flags; struct drm_msm_timespec timeout; uint32_t queueid; };
 struct drm_msm_submitqueue { uint32_t flags, prio, id; };
 struct drm_gem_close { uint32_t handle, pad; };
+#define SWEET_GPU_SURFACE               0x7e    /* SweetGPU.cpp (0134): an IOSurface's memory as a buffer */
+struct sweet_surface_request {
+	uint32_t surface, handle;
+	uint64_t size;
+	uint32_t offset, row_bytes, width, height, pixel_format, planes;
+};
 
 #define CP_TYPE7_PKT    0x70000000u
 #define CP_MEM_WRITE    61
@@ -113,6 +122,80 @@ now_ns(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static CFNumberRef
+num(int v)
+{
+	return CFNumberCreate(NULL, kCFNumberIntType, &v);
+}
+
+/* 1: the GPU wrote into an IOSurface imported with 0x7e, 0: it did not, -1: no import */
+static int
+surface_test(uint32_t hc, uint64_t ic, volatile uint32_t *cc, uint32_t queue)
+{
+	const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat };
+	const void *vals[] = { num(64), num(64), num(4), num('BGRA') };
+	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 4, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surf = IOSurfaceCreate(props);
+	CFRelease(props);
+	if (surf == NULL) {
+		printf("surface: IOSurfaceCreate failed\n");
+		return -1;
+	}
+	uint32_t sid = IOSurfaceGetID(surf);
+	IOSurfaceLock(surf, 0, NULL);
+	volatile uint32_t *px = (volatile uint32_t *)IOSurfaceGetBaseAddress(surf);
+	for (int k = 0; k < N_WORDS; k++) {
+		px[k] = 0x5a5a5a5a;             /* this processor writes it first: the kernel must push that out */
+	}
+	IOSurfaceUnlock(surf, 0, NULL);
+	struct sweet_surface_request d = { .surface = sid, .handle = 0xffffffffu };
+	int r = call(SWEET_GPU_SURFACE, &d, sizeof(d));
+	printf("surface %u describe: %d size %llu offset %u row %u %ux%u fmt 0x%x planes %u\n", sid, r,
+	    (unsigned long long)d.size, d.offset, d.row_bytes, d.width, d.height, d.pixel_format, d.planes);
+	struct sweet_surface_request q = { .surface = sid };
+	if (r != 0 || (r = call(SWEET_GPU_SURFACE, &q, sizeof(q))) != 0) {
+		printf("surface: import failed 0x%x\n", r);
+		CFRelease(surf);
+		return -1;
+	}
+	struct drm_msm_gem_info i = { .handle = q.handle, .info = MSM_INFO_GET_IOVA };
+	r = call(DRM_COMMAND_BASE + DRM_MSM_GEM_INFO, &i, sizeof(i));
+	uint64_t at = i.value + q.offset;
+	printf("surface: handle %u iova 0x%llx (info %d)\n", q.handle, (unsigned long long)i.value, r);
+	uint32_t n = 0;
+	cc[n++] = pkt7(CP_MEM_WRITE, 2 + N_WORDS);
+	cc[n++] = (uint32_t)at;
+	cc[n++] = (uint32_t)(at >> 32);
+	for (int k = 0; k < N_WORDS; k++) {
+		cc[n++] = 0x5f000000u | (uint32_t)k;
+	}
+	__sync_synchronize();
+	struct drm_msm_gem_submit_bo bos[2] = {
+		{ .flags = MSM_SUBMIT_BO_READ, .handle = hc, .presumed = ic },
+		{ .flags = MSM_SUBMIT_BO_WRITE, .handle = q.handle, .presumed = i.value },
+	};
+	struct drm_msm_gem_submit_cmd cmd = { .type = MSM_SUBMIT_CMD_BUF, .submit_idx = 0, .size = n * 4 };
+	struct drm_msm_gem_submit s = {
+		.flags = 1, .nr_bos = 2, .nr_cmds = 1, .bos = (uintptr_t)bos, .cmds = (uintptr_t)&cmd, .queueid = queue,
+	};
+	r = call(DRM_COMMAND_BASE + DRM_MSM_GEM_SUBMIT, &s, sizeof(s));
+	struct drm_msm_wait_fence w = { .fence = s.fence, .timeout = { 1, 0 }, .queueid = queue };
+	int rw = r ? -1 : call(DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE, &w, sizeof(w));
+	IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+	int bad = 0;
+	for (int k = 0; k < N_WORDS; k++) {
+		bad += px[k] != (0x5f000000u | (uint32_t)k);
+	}
+	printf("surface: submit %d wait %d: %d/%d words wrong, px[0] 0x%08x px[255] 0x%08x\n", r, rw, bad, N_WORDS,
+	    px[0], px[N_WORDS - 1]);
+	IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+	struct drm_gem_close c = { .handle = q.handle };
+	call(DRM_GEM_CLOSE, &c, sizeof(c));
+	CFRelease(surf);
+	return r == 0 && rw == 0 && bad == 0;
 }
 
 int
@@ -215,11 +298,18 @@ main(void)
 		    (unsigned long long)((now_ns() - b0) / 200000), fails, s.fence);
 	}
 
+	/* 6. an IOSurface as a buffer */
+	int surface_ok = -1;                    /* -1: not tried / not supported by this kernel */
+	if (r == 0 && rw == 0 && bad == 0) {
+		surface_ok = surface_test(hc, ic, cc, q.id);
+	}
+
 	struct drm_gem_close c1 = { .handle = hc }, c2 = { .handle = hd };
 	call(DRM_GEM_CLOSE, &c1, sizeof(c1));
 	call(DRM_GEM_CLOSE, &c2, sizeof(c2));
 	IOServiceClose(conn);
 	int ok = r == 0 && rw == 0 && bad == 0;
-	printf("RESULT %s\n", ok ? "OK" : "FAIL");
+	printf("RESULT %s (surface: %s)\n", ok ? "OK" : "FAIL",
+	    surface_ok < 0 ? "not tried/unsupported" : surface_ok ? "OK" : "FAIL");
 	return ok ? 0 : 1;
 }
