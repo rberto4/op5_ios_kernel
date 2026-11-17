@@ -3370,6 +3370,104 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 	}
 }
 
+#define GL_RGBA8                         0x8058
+#define GL_ACTIVE_TEXTURE                0x84e0
+#define GL_TEXTURE_MIN_FILTER_FE         0x2801
+#define FE_UNIT                          7u
+#define FE_PROGRAMS                      4096u
+static GLint fe_location[FE_PROGRAMS];  /* program -> location of sweet_fb + 1 (0: it reads no copy) */
+static GLuint fe_texture, fe_framebuffer;
+static GLsizei fe_width, fe_height;
+static unsigned long fe_copies;
+
+/* After a link: whether the program reads what is there from a copy (fragment_nofetch). */
+static void
+fetch_copy_note(GLuint program)
+{
+	if (program < FE_PROGRAMS) {
+		GLint at = glGetUniformLocation(program, "sweet_fb");
+
+		fe_location[program] = at >= 0 ? at + 1 : 0;
+		if (at >= 0) {
+			say("sweet-gl: program %u reads what is there from a copy of the framebuffer\n", program);
+		}
+	}
+}
+
+/*
+ * Before a draw: for a program that reads what is there, the bound framebuffer (as far as the
+ * viewport reaches) is copied into our texture on unit FE_UNIT; true: unit FE_UNIT is to be put
+ * back after the draw (fetch_copy_end()).
+ */
+static bool
+fetch_copy_begin(struct eagl *e)
+{
+	GLuint program = e->program;
+	GLint viewport[4], read = 0, draw = 0, active = 0;
+	GLboolean scissor;
+	GLsizei width, height;
+
+	if (program == 0 || program >= FE_PROGRAMS || fe_location[program] == 0) {
+		return false;
+	}
+	glGetIntegerv(GL_VIEWPORT, viewport);
+	width = viewport[0] + viewport[2];
+	height = viewport[1] + viewport[3];
+	if (width <= 0 || height <= 0) {
+		return false;
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	glActiveTexture(GL_TEXTURE0 + FE_UNIT);
+	if (fe_texture == 0) {
+		glGenTextures(1, &fe_texture);
+		glGenFramebuffers(1, &fe_framebuffer);
+	}
+	glBindTexture(GL_TEXTURE_2D, fe_texture);
+	if (width > fe_width || height > fe_height) {
+		fe_width = width > fe_width ? width : fe_width;
+		fe_height = height > fe_height ? height : fe_height;
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fe_width, fe_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_FE, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fe_framebuffer);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fe_texture, 0);
+		say("sweet-gl: framebuffer copies for reading what is there: %d x %d\n", fe_width, fe_height);
+	}
+	scissor = glIsEnabled(GL_SCISSOR_TEST);
+	if (scissor) {
+		glDisable(GL_SCISSOR_TEST);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)draw);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fe_framebuffer);
+	glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glUniform1i(fe_location[program] - 1, (GLint)FE_UNIT);
+	glActiveTexture((GLenum)active);
+	if (fe_copies++ == 0) {
+		say("sweet-gl: first framebuffer copy for program %u: %d x %d (error %#x)\n", program, width, height,
+		    glGetError());
+	}
+	return true;
+}
+
+/* After that draw: unit FE_UNIT holds CoreAnimation's texture again. */
+static void
+fetch_copy_end(struct eagl *e)
+{
+	GLint active = 0;
+
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+	glActiveTexture(GL_TEXTURE0 + FE_UNIT);
+	glBindTexture(GL_TEXTURE_2D, e->bound[FE_UNIT]);
+	glActiveTexture((GLenum)active);
+}
+
 static void
 my_glUseProgram(void *context, GLuint program)
 {
@@ -3452,6 +3550,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (trace_placing) {
 		trace_placed_draw(e, mode, 0, NULL, first, count);
 	}
+	bool copied = fetch_copy_begin(e);
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: nothing is drawn, so that what this program puts there can be seen missing */
 	} else if (group_draw_begin(e, enabled)) {
@@ -3463,6 +3562,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
+	}
+	if (copied) {
+		fetch_copy_end(e);
 	}
 	if (trace_listed) {
 		trace_placed_look(e);
@@ -3492,6 +3594,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (trace_placing) {
 		trace_placed_draw(e, mode, type, indices, 0, count);
 	}
+	bool copied = fetch_copy_begin(e);
 	if (skipping != 0 && skip_draw(e)) {
 		/* glskip=N: see my_glDrawArrays */
 	} else if (group_draw_begin(e, enabled)) {
@@ -3503,6 +3606,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 		if (plain) {
 			plain_draw_end(e, enabled);
 		}
+	}
+	if (copied) {
+		fetch_copy_end(e);
 	}
 	if (trace_listed) {
 		trace_placed_look(e);
@@ -4169,18 +4275,20 @@ static const char fragment_fetch_end[] =
  * op5 (Adreno 540): freedreno has EXT_shader_framebuffer_fetch on a6xx only. Without it a shader
  * that reads what is there (sgl_vcm) did not compile, its program did not link, and CoreAnimation's
  * draws with it went out with whatever program was in use before (0134-ca: 37 glUseProgram 0x502,
- * artefacts). There, what is there reads as nothing (transparent): the layer draws nothing rather
- * than garbage, until the framebuffer is copied for it.
+ * artefacts). There, what is there is a copy: before each draw of such a program the framebuffer
+ * is blitted into a texture of ours on unit FE_UNIT (fetch_copy_begin()), which the shader reads
+ * at its own pixel (sweet_fb).
  */
 static const char fragment_nofetch[] =
     "layout(location = 0) out highp vec4 sweet_colour;\n"
+    "uniform highp sampler2D sweet_fb;\n"
     "highp vec4 sweet_last[1];\n"
     "#define gl_LastFragData sweet_last\n"
     "#define main sweet_main\n"
     "#line 1\n";
 static const char fragment_nofetch_end[] =
     "\n#undef main\n"
-    "void main() { sweet_last[0] = vec4(0.); sweet_main(); sweet_colour = sweet_data[0]; }\n";
+    "void main() { sweet_last[0] = texelFetch(sweet_fb, ivec2(gl_FragCoord.xy), 0); sweet_main(); sweet_colour = sweet_data[0]; }\n";
 
 /* 1: the library offers EXT_shader_framebuffer_fetch (asked once, with a context current) */
 static int
@@ -4413,6 +4521,8 @@ my_glLinkProgram(void *context, GLuint program)
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
 		say("sweet-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
+	} else if (!have_fbfetch()) {
+		fetch_copy_note(program);
 	}
 	EAGL_LEAVE(e, 0x12c0);
 }
