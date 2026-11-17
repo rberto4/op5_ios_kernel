@@ -1,16 +1,15 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -36,6 +36,8 @@ void sweet_gpu_unmap(uint64_t iova, uint64_t size);
+@@ -36,6 +36,7 @@ void sweet_gpu_unmap(uint64_t iova, uint64_t size);
  uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, uint32_t n);
  int sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
  void sweet_gpu_flush_va(uintptr_t va, size_t len);
-+int copyin(const unsigned long long uaddr, void *kaddr, size_t len);      /* user_addr_t */
 +task_t current_task(void);
  }
  
  /* ---- msm_drm.h (MIT, see above) ---- */
-@@ -186,18 +188,17 @@ SweetGPUUserClient::readUser(uint64_t address, void *out, size_t size)
+@@ -186,18 +187,17 @@ SweetGPUUserClient::readUser(uint64_t address, void *out, size_t size)
  	if (size == 0) {
  		return kIOReturnSuccess;
  	}
