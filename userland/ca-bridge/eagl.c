@@ -167,6 +167,7 @@ static int frame_lines;                 /* boot-arg glframes=1: a line for every
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
+static uint64_t gl_us, gl_calls;        /* (op5 perf line) time inside the library's GL calls, and their number */
 static uint64_t now_us(void);
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
@@ -417,9 +418,7 @@ eagl_enter(struct eagl *e, unsigned offset)
 	}
 	slot_calls[offset / 8]++;
 	e->calls++;
-	if (slow_calls_us != 0) {
-		call_began_us = now_us();
-	}
+	call_began_us = now_us();
 }
 
 static void
@@ -432,8 +431,12 @@ eagl_leave(struct eagl *e, unsigned offset)
 			say("sweet-gl: %s: error %#x\n", eagl_slot_name(offset), error);
 		}
 	}
+	uint64_t ended = now_us();
+
+	gl_us += ended - call_began_us;
+	gl_calls++;
 	if (slow_calls_us != 0) {
-		uint64_t now = now_us();
+		uint64_t now = ended;
 
 		/* "tl: slow NAME US at US, frame N": a call that took long, and when it ended (tools/frames.py) */
 		if (now - call_began_us >= slow_calls_us) {
@@ -1341,6 +1344,47 @@ scan_frame(IOSurfaceRef surface, int width, int height)
 }
 
 static void frame_functions(struct eagl *e);
+static uint64_t fe_pixels;
+
+/*
+ * (op5) One line every PERF_FRAMES frames: frames per second over the window, and per frame on
+ * average the time CoreAnimation drew (began -> frame end), the wait at the frame's end (glFinish
+ * or the flush) and the pixels copied for reading what is there. Not behind a boot-arg: one line
+ * every two seconds or so.
+ */
+#define PERF_FRAMES 120
+static void
+perf_note(struct eagl *e, uint64_t before, uint64_t waited, uint64_t after, bool display)
+{
+	static uint64_t window_start, drew, waits, fe_start, gl_start, calls_start, busy;
+	static unsigned frames, shown, draws_start;
+
+	if (frames == 0) {
+		window_start = e->began;
+		drew = waits = busy = 0;
+		shown = 0;
+		fe_start = fe_pixels;
+		gl_start = gl_us;
+		calls_start = gl_calls;
+		draws_start = 0;
+	}
+	shown += display;
+	busy += after - e->began;
+	draws_start += e->draws;
+	drew += before > e->began ? before - e->began : 0;
+	waits += waited - before;
+	if (++frames < PERF_FRAMES) {
+		return;
+	}
+	uint64_t span = after > window_start ? after - window_start : 1;
+	say("sweet-gl: perf %u frames in %llu ms (%u to the display = %llu fps), busy %llu%%; per frame: draw %llu us "
+	    "(in GL %llu us, %llu calls, %u draws), end wait %llu us, fetch copy %llu px; %s\n", frames, span / 1000,
+	    shown, shown * 1000000ull / span, busy * 100 / span, drew / frames, (gl_us - gl_start) / frames,
+	    (gl_calls - calls_start) / frames, draws_start / frames, waits / frames, (fe_pixels - fe_start) / frames,
+	    wait_for_frames ? "glFinish" : "flush only");
+	frames = 0;
+}
+
 static void
 frame_end(struct eagl *e, bool finished)
 {
@@ -1413,6 +1457,7 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	perf_note(e, before, waited, after, scan_surface != NULL);
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -3379,6 +3424,7 @@ static GLint fe_location[FE_PROGRAMS];  /* program -> location of sweet_fb + 1 (
 static GLuint fe_texture, fe_framebuffer;
 static GLsizei fe_width, fe_height;
 static unsigned long fe_copies;
+static int fetch_whole;                 /* boot-arg glfetch_whole=1: copy the whole viewport, as before */
 
 /* After a link: whether the program reads what is there from a copy (fragment_nofetch). */
 static void
@@ -3436,12 +3482,35 @@ fetch_copy_begin(struct eagl *e)
 		say("sweet-gl: framebuffer copies for reading what is there: %d x %d\n", fe_width, fe_height);
 	}
 	scissor = glIsEnabled(GL_SCISSOR_TEST);
+	/*
+	 * Only what the draw can touch is copied: the viewport, and inside it the scissor box when
+	 * there is one (CoreAnimation scissors to what has changed). The shader reads the copy at
+	 * gl_FragCoord, so the box keeps its place. (A whole 750x1334 copy per draw cost most of a
+	 * frame with the lock screen's vibrancy.)
+	 */
+	GLint x0 = viewport[0] > 0 ? viewport[0] : 0, y0 = viewport[1] > 0 ? viewport[1] : 0;
+	GLint x1 = width, y1 = height;
 	if (scissor) {
+		GLint box[4];
+
+		glGetIntegerv(GL_SCISSOR_BOX, box);
+		x0 = box[0] > x0 ? box[0] : x0;
+		y0 = box[1] > y0 ? box[1] : y0;
+		x1 = box[0] + box[2] < x1 ? box[0] + box[2] : x1;
+		y1 = box[1] + box[3] < y1 ? box[1] + box[3] : y1;
 		glDisable(GL_SCISSOR_TEST);
 	}
+	if (fetch_whole) {
+		x0 = y0 = 0;
+		x1 = width;
+		y1 = height;
+	}
+	fe_pixels += x1 > x0 && y1 > y0 ? (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0) : 0;
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)draw);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fe_framebuffer);
-	glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	if (x1 > x0 && y1 > y0) {
+		glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 	if (scissor) {
@@ -5249,7 +5318,15 @@ install(void)
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
-		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
+		fetch_whole = strstr(arguments, "glfetch_whole=1") != NULL;
+		/*
+		 * (op5) With sweetfb_gpu=1 the A540 copies each frame to the panel from the same ring
+		 * Mesa submits to, under one lock, after a CP_WAIT_FOR_IDLE: the copy cannot start
+		 * before what was submitted ahead of it is done. A frame need only be sent (sync_frames),
+		 * not waited for.
+		 */
+		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL &&
+		    (display_waits() || strstr(arguments, "sweetfb_gpu=1") != NULL))) {
 			wait_for_frames = 0;
 		}
 		say("sweet-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :

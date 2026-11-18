@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+index faa276d..f92f56c 100644
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -467,6 +467,7 @@ out:
+ /* ---- ring ---- */
+ 
+ static uint32_t rb_wptr;
++static uint32_t rb_flushed;             /* 0136: ring dwords cleaned up to here (rb_flush_written) */
+ 
+ static uint32_t
+ pm4_parity(uint32_t v)
+@@ -1953,6 +1954,7 @@ stage_b(int mode)
+ 	gwr(R_CP_RB_CNTL, 12u | (2u << 8) | RB_CNTL_NO_UPDATE);  /* 32 KiB, 32-byte blocks */
+ 	gwr(R_RBBM_INT_0_MASK, 0);
+ 	rb_wptr = 0;
++	rb_flushed = 0;
+ 	gwr(R_CP_RB_WPTR, 0);
+ 	trace_status("ring setup", R_CP_RB_CNTL);
+ 	delay(100);
+@@ -2167,6 +2169,36 @@ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_bo_pages, CTLFLAG_RD | CTLFLAG_LOCKED, &bo_
+ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_submits, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_submits, 0,
+     "SWEET GPU: user command submissions");
+ 
++/*
++ * 0136: what pushing IOSurfaces out of the CPU cache costs (SweetGPU.cpp
++ * pushSurfaces), and how often it happens: kern.sweetgpu_push_ms, writable
++ * (boot-arg sweetgpu_push_ms; 0 = only when a surface's seed changes).
++ */
++int sweet_gpu_push_ms = 4;
++static int gpu_push_count;
++static int64_t gpu_push_us, gpu_push_mb_bytes, gpu_ring_flush_bytes;
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_push_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_gpu_push_ms, 0,
++    "SWEET GPU: ms between cache pushes of an unchanged IOSurface (0: only on seed change)");
++SYSCTL_INT(_kern, OID_AUTO, sweetgpu_push_count, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_push_count, 0,
++    "SWEET GPU: IOSurface cache pushes");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetgpu_push_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_push_us,
++    "SWEET GPU: microseconds spent in IOSurface cache pushes");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetgpu_push_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_push_mb_bytes,
++    "SWEET GPU: bytes of IOSurface pushed out of the cache");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetgpu_ring_flush_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_ring_flush_bytes,
++    "SWEET GPU: ring bytes cleaned at submissions");
++
++void sweet_gpu_push_note(uint64_t ticks, uint64_t bytes);
++void
++sweet_gpu_push_note(uint64_t ticks, uint64_t bytes)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(ticks, &ns);
++	__atomic_add_fetch(&gpu_push_count, 1, __ATOMIC_RELAXED);
++	__atomic_add_fetch(&gpu_push_us, (int64_t)(ns / 1000u), __ATOMIC_RELAXED);
++	__atomic_add_fetch(&gpu_push_mb_bytes, (int64_t)bytes, __ATOMIC_RELAXED);
++}
++
+ static bool
+ gpu_core_init(void)
+ {
+@@ -2212,6 +2244,32 @@ rb_space(uint32_t n)
+ }
+ 
+ /* CACHE_FLUSH_TS writing the next sequence number, then start the CP. Lock held. */
++/*
++ * 0136: clean only the ring dwords written since the last kick (from
++ * rb_flushed up to rb_wptr, across the wrap), not the whole 32 KiB, on
++ * every submission. Lock held.
++ */
++static void
++rb_flush_written(void)
++{
++	uint32_t size = RB_SIZE / 4u, from = rb_flushed % size, to = rb_wptr;
++	if (from == to) {
++		return;
++	}
++	if (to > from) {
++		flush_dcache64((addr64_t)(dma + DMA_RB + 4u * from), 4u * (to - from), FALSE);
++		gpu_ring_flush_bytes += 4u * (to - from);
++	} else {
++		flush_dcache64((addr64_t)(dma + DMA_RB + 4u * from), 4u * (size - from), FALSE);
++		gpu_ring_flush_bytes += 4u * (size - from);
++		if (to != 0) {
++			flush_dcache64((addr64_t)(dma + DMA_RB), 4u * to, FALSE);
++			gpu_ring_flush_bytes += 4u * to;
++		}
++	}
++	rb_flushed = to;
++}
++
+ static uint32_t
+ rb_fence_kick(void)
+ {
+@@ -2223,7 +2281,7 @@ rb_fence_kick(void)
+ 	rb_out((uint32_t)(fence >> 32));
+ 	rb_out(seq);
+ 	gpu_seq = seq;
+-	flush_dcache64((addr64_t)(dma + DMA_RB), RB_SIZE, FALSE);
++	rb_flush_written();
+ 	gwr(R_CP_RB_WPTR, rb_wptr);
+ 	return seq;
+ }
+@@ -2496,6 +2554,7 @@ present_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t l = 43;
+ 	PE_parse_boot_argn("sweetgpu_l", &l, sizeof(l));
++	PE_parse_boot_argn("sweetgpu_push_ms", &sweet_gpu_push_ms, sizeof(sweet_gpu_push_ms));
+ 	pll_l = (int)l;
+ 	if (!stage_b_claim()) {
+ 		printf("SWEET GPU P: stage B already used by sysctl; GPU present off\n");
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 7544afa..0e4aa4f 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -48,6 +48,8 @@ void sweet_gpu_unmap(uint64_t iova, uint64_t size);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, uint32_t n);
+ int sweet_gpu_wait(uint32_t seq, uint32_t timeout_us);
+ void sweet_gpu_flush_va(uintptr_t va, size_t len);
++void sweet_gpu_push_note(uint64_t ticks, uint64_t bytes);
++extern int sweet_gpu_push_ms;
+ task_t current_task(void);
+ }
+ 
+@@ -117,7 +119,6 @@ struct sweet_surface_request {                  /* userland/mesa/redwood-drm: st
+ #define SWEET_GPU_MAX_SUBMIT_BOS 1024
+ #define SWEET_GPU_MAX_IBS       64
+ #define SWEET_GPU_WAIT_US       2000000u        /* the most a fence or CPU_PREP wait blocks */
+-#define SWEET_GPU_PUSH_AGAIN_MS 4u              /* a surface is pushed out of the cache again this long after the last time */
+ #define SWEET_SURFACE_STATE_SEED 0xc            /* u32 in a surface's state page (SweetSurface.cpp) */
+ 
+ class SweetGPU : public IOService {
+@@ -393,12 +394,19 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+  * has changed, and in any case once every few milliseconds, which is once a
+  * frame rather than once a submission (not everybody who writes a surface
+  * says so). After HackiOS / ios-apollo 0114.
++ *
++ * 0136: a push is a dc civac over the whole surface (4 MiB for a 750x1334
++ * one, ~65,000 lines): with the 4 ms default most submissions paid one or
++ * more (~600 us a submission in backboardd). The interval is the sysctl
++ * kern.sweetgpu_push_ms (boot-arg sweetgpu_push_ms); 0 = only when the seed
++ * changes. kern.sweetgpu_push_count / _push_us / _push_mb say what it costs.
+  */
+ void
+ SweetGPUUserClient::pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32_t nbo)
+ {
+ 	uint64_t now = mach_absolute_time(), again = 0;
+-	nanoseconds_to_absolutetime((uint64_t)SWEET_GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
++	int ms = sweet_gpu_push_ms;
++	nanoseconds_to_absolutetime((uint64_t)(ms > 0 ? ms : 0) * NSEC_PER_MSEC, &again);
+ 	for (uint32_t i = 0; i < nbo; i++) {
+ 		Bo &b = fBo[bos[i].handle];
+ 		if (b.surface == NULL || b.kernel == 0) {
+@@ -406,13 +414,16 @@ SweetGPUUserClient::pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32
+ 		}
+ 		uint32_t seed = b.surface->state != NULL ?
+ 		    *(volatile uint32_t *)((uint8_t *)b.surface->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0;
+-		if (b.pushed != 0 && seed == b.seed && now - b.pushed < again) {
++		if (b.pushed != 0 && seed == b.seed && (ms <= 0 || now - b.pushed < again)) {
+ 			continue;
+ 		}
+ 		b.seed = seed;
+ 		b.pushed = now;
+ 		uint64_t len = b.mem->getLength();
+-		sweet_gpu_flush_va(b.kernel, (size_t)(b.surface->allocSize < len ? b.surface->allocSize : len));
++		size_t bytes = (size_t)(b.surface->allocSize < len ? b.surface->allocSize : len);
++		uint64_t t0 = mach_absolute_time();
++		sweet_gpu_flush_va(b.kernel, bytes);
++		sweet_gpu_push_note(mach_absolute_time() - t0, bytes);
+ 	}
+ }
+ 

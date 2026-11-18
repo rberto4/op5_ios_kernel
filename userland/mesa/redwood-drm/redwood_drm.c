@@ -12,6 +12,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <stdio.h>
+#include <mach/mach_time.h>
 #include <IOKit/IOKitLib.h>
 
 #include "xf86drm.h"
@@ -49,11 +51,78 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	return dup(connection_fd);
 }
 
+/*
+ * (op5) What the kernel is asked, and how long it takes: a line on stderr every two seconds
+ * ("redwood: ..."), per request number the calls and microseconds, and the buffer maps and unmaps.
+ * Environment REDWOOD_STATS=0 turns it off.
+ */
+#define STAT_SLOTS 0x100
+static uint64_t stat_calls[STAT_SLOTS], stat_ticks[STAT_SLOTS];
+static uint64_t stat_maps, stat_map_ticks, stat_unmaps, stat_unmap_ticks, stat_window;
+static int stat_on = -1;
+
+static uint64_t
+ticks_to_us(uint64_t ticks)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return ticks * base.numer / base.denom / 1000;
+}
+
+static void
+stat_report(uint64_t now)
+{
+	char line[1024];
+	int n;
+
+	if (stat_on < 0) {
+		const char *setting = getenv("REDWOOD_STATS");
+
+		stat_on = setting == NULL || strcmp(setting, "0") != 0;
+	}
+	if (!stat_on) {
+		return;
+	}
+	if (stat_window == 0) {
+		stat_window = now;
+		return;
+	}
+	if (ticks_to_us(now - stat_window) < 2000000) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "redwood: %llu ms: map %llu/%llu us unmap %llu/%llu us",
+	    ticks_to_us(now - stat_window) / 1000, stat_maps, ticks_to_us(stat_map_ticks), stat_unmaps,
+	    ticks_to_us(stat_unmap_ticks));
+	for (unsigned i = 0; i < STAT_SLOTS && n < (int)sizeof(line) - 40; i++) {
+		if (stat_calls[i] != 0) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, "; %#x %llu/%llu us", i, stat_calls[i],
+			    ticks_to_us(stat_ticks[i]));
+		}
+	}
+	if (n < (int)sizeof(line) - 1) {
+		line[n++] = '\n';
+	}
+	write(2, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line)));
+	memset(stat_calls, 0, sizeof(stat_calls));
+	memset(stat_ticks, 0, sizeof(stat_ticks));
+	stat_maps = stat_map_ticks = stat_unmaps = stat_unmap_ticks = 0;
+	stat_window = now;
+}
+
 static int
 call(unsigned number, void *data, size_t size)
 {
 	size_t returned = size;
+	uint64_t began = mach_absolute_time();
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	uint64_t ended = mach_absolute_time();
+
+	stat_calls[number % STAT_SLOTS]++;
+	stat_ticks[number % STAT_SLOTS] += ended - began;
+	stat_report(ended);
 
 	switch (result) {
 	case 0:
@@ -95,10 +164,22 @@ drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long siz
 	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
 }
 
+/*
+ * (op5) DRM_MSM_GEM_MADVISE: the kernel's driver has nothing that takes memory back from idle
+ * buffers and answers "retained" to every request (SweetGPU.cpp). freedreno's buffer cache asks it
+ * thousands of times a second (12,000 calls, ~240 ms every 2 s in backboardd): answered here.
+ */
+#define REDWOOD_MSM_GEM_MADVISE 0x08
+struct redwood_msm_gem_madvise { uint32_t handle, madv, retained; };
+
 int
 drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 {
 	(void)fd;
+	if (index == REDWOOD_MSM_GEM_MADVISE && size == sizeof(struct redwood_msm_gem_madvise)) {
+		((struct redwood_msm_gem_madvise *)data)->retained = 1;
+		return 0;
+	}
 	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
 }
 
@@ -150,6 +231,9 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	mach_vm_address_t address = 0;
 	mach_vm_size_t mapped = 0;
 
+	uint64_t began = mach_absolute_time();
+	kern_return_t result;
+
 	(void)fd;
 	(void)size;
 	/*
@@ -163,8 +247,11 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * explicitly: with a cached mapping the commands stayed in this CPU's
 	 * cache and the GPU read zeros (test 0131).
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
-	    kIOMapAnywhere | kIOMapWriteCombineCache) != 0) {
+	result = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+	    kIOMapAnywhere | kIOMapWriteCombineCache);
+	stat_maps++;
+	stat_map_ticks += mach_absolute_time() - began;
+	if (result != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
 	return (void *)(uintptr_t)address;
@@ -173,8 +260,12 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 void
 redwood_drm_unmap(int fd, uint32_t handle, void *address)
 {
+	uint64_t began = mach_absolute_time();
+
 	(void)fd;
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
+	stat_unmaps++;
+	stat_unmap_ticks += mach_absolute_time() - began;
 }
 
 int
