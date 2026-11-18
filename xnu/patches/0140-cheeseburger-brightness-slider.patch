@@ -1,0 +1,209 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4504dc4..0399674 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <sys/sysctl.h>
+ #include <sys/errno.h>
+ #include <libkern/c++/OSCollectionIterator.h>
++#include <kern/thread_call.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -95,7 +96,6 @@ enum {
+ #define SWEET_FB_DSI0                   0x0c994000
+ #define SWEET_FB_BL_MAX                 255
+ #define SWEET_FB_BL_INIT                160
+-#define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at level 255 */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -148,6 +148,10 @@ public:
+ 	uint64_t      fDsiCmdPhys;
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;         /* 1..255, kept while the display is off */
++	volatile uint32_t fBlWanted;    /* 0140: the level the worker is to send (0..255, ~0u: none) */
++	thread_call_t fBlCall;          /* 0140: sends fBlWanted off backboardd's thread */
++	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
++	void          setPanelLevelAsync(uint32_t level);
+ 	void          dsiSetup(void);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          setPanelLevel(uint32_t level);
+@@ -177,17 +181,21 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ /*
+- * 0138 (topaz 0105): CoreBrightness (-[CBDisplayContaineriOS findBacklight])
+- * matches {IOPropertyMatch: {backlight-control: true}} and needs this class;
+- * without it the brightness slider does nothing. It sets "brightness-nits"
+- * here and IOMFBBrightnessLevel on the framebuffer. Published only with
+- * boot-arg sweetbl=1 (topaz 0110: CoreBrightness then also dims digitally,
+- * a colour filter over every frame).
++ * 0140: CoreBrightness (backboardd) takes the service of this class with
++ * backlight-control = true, reads IODisplayParameters brightness {min 0,
++ * max 255, value} and sets {brightness, FadePeriod (s, 16.16)} -- the form
++ * ios-sailfish 0168 / ios-spes 0145 / ios-apollo 0154 (MIT) have working on
++ * the same iOS 16.7 identity. 0138's form (topaz 0105: brightness-nits,
++ * max-nits, IOMFBBrightnessLevel on the framebuffer) stalled the UI under
++ * 1 fps here (test 0139 with sweetbl=1), as those ports also saw. On by
++ * default; boot-arg sweetbl=0 leaves it out.
+  */
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
++	uint32_t fLogged;
+ public:
+ 	AppleCLCD *fFB;
++	void publish(uint32_t value);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -949,20 +957,24 @@ AppleCLCD::dsiSetup(void)
+ 	IOLog("SWEET BL: DSI0 hw %#x ctrl %#x status %#x dma_ctrl %#x trig %#x; command at pa %#llx\n",
+ 	    dsi_rd(fDsi, 0x000), dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x03c),
+ 	    dsi_rd(fDsi, 0x084), fDsiCmdPhys);
+-	setProperty("IOMFBBrightnessLevel", (unsigned long long)((uint64_t)SWEET_FB_MAX_NITS * SWEET_FB_BL_INIT /
+-	    SWEET_FB_BL_MAX) << 16, 32);
++	fBlWanted = ~0u;
++	fBlCall = thread_call_allocate_with_options(&AppleCLCD::blWork, this, THREAD_CALL_PRIORITY_USER, 0);
+ 
+-	uint32_t blOn = 0;
++	uint32_t blOn = 1;
+ 	(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+-	AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
++	AppleARMBacklight *bl = blOn && fBlCall != NULL ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 	if (bl != NULL && bl->init()) {
+ 		bl->fFB = this;
+ 		bl->setProperty("backlight-control", true);
+-		bl->setProperty("brightness-nits", (unsigned long long)SWEET_FB_MAX_NITS * SWEET_FB_BL_INIT / SWEET_FB_BL_MAX, 32);
+-		bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++		/* the level as iOS's perceived 0..255: the inverse of the square below */
++		uint32_t value = 0;
++		while (value < 255 && (value + 1) * (value + 1) <= SWEET_FB_BL_INIT * 255) {
++			value++;
++		}
++		bl->publish(value);
+ 		if (bl->attach(this)) {
+ 			bl->registerService();
+-			IOLog("SWEET BL: AppleARMBacklight published\n");
++			IOLog("SWEET BL: AppleARMBacklight published (brightness %u of 255)\n", value);
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(bl);
+@@ -1061,45 +1073,88 @@ sweet_bl_log(const char *who, OSDictionary *d)
+ 	OSSafeReleaseNULL(it);
+ }
+ 
+-/* CoreBrightness: IOMFBBrightnessLevel, nits in 16.16 -> level 1..255. */
++/* 0140: CoreBrightness talks to AppleARMBacklight; the framebuffer takes no property. */
+ IOReturn
+ AppleCLCD::setProperties(OSObject *properties)
+ {
+-	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+-	sweet_bl_log("iomfb", d);
+-	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
+-	if (n == NULL || fDsi == NULL) {
+-		return kIOReturnUnsupported;
+-	}
+-	uint64_t v = n->unsigned64BitValue();
+-	setProperty("IOMFBBrightnessLevel", v, 32);
+-	uint64_t level = (v * SWEET_FB_BL_MAX) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
+-	level = level > SWEET_FB_BL_MAX ? SWEET_FB_BL_MAX : level < 1 ? 1 : level;
+-	setPanelLevel((uint32_t)level);
+-	return kIOReturnSuccess;
++	sweet_bl_log("iomfb", OSDynamicCast(OSDictionary, properties));
++	return kIOReturnUnsupported;
++}
++
++/* 0140: the panel command goes out on a thread call: backboardd never waits for the panel. */
++void
++AppleCLCD::blWork(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	uint32_t level = __atomic_exchange_n(&fb->fBlWanted, ~0u, __ATOMIC_ACQ_REL);
++	if (level != ~0u) {
++		(void)fb->setPanelLevel(level);
++	}
++}
++
++void
++AppleCLCD::setPanelLevelAsync(uint32_t level)
++{
++	if (fBlCall == NULL) {
++		return;
++	}
++	__atomic_store_n(&fBlWanted, level, __ATOMIC_RELEASE);
++	thread_call_enter(fBlCall);     /* (already pending: the newest level is the one sent) */
++}
++
++void
++AppleARMBacklight::publish(uint32_t value)
++{
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSDictionary *parameters = OSDictionary::withCapacity(1);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32), *max = OSNumber::withNumber(255ULL, 32);
++	OSNumber *now = OSNumber::withNumber(value, 32);
++
++	if (brightness != NULL && parameters != NULL && min != NULL && max != NULL && now != NULL) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", now);
++		parameters->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", parameters);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(now);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(parameters);
+ }
+ 
++/*
++ * {brightness 0..255 (perceived), FadePeriod}: the panel level is the square
++ * (value^2 / 255, at least 1; 0 = dark, as iOS's own fade before the display
++ * goes off). No fade of our own: CoreBrightness sends its steps itself.
++ */
+ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+-	sweet_bl_log("backlight", d);
+-	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
+-	if (n != NULL && fFB != NULL) {
+-		OSDictionary *m = OSDictionary::withCapacity(1);
+-		uint64_t v = n->unsigned64BitValue();
+-		if (v < 0x10000) {
+-			v <<= 16;               /* plain nits */
+-		}
+-		OSNumber *nn = OSNumber::withNumber(v, 64);
+-		if (m != NULL && nn != NULL) {
+-			m->setObject("IOMFBBrightnessLevel", nn);
+-			fFB->setProperties(m);
+-		}
+-		OSSafeReleaseNULL(nn);
+-		OSSafeReleaseNULL(m);
+-		setProperty("brightness-nits", n);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *b = OSDynamicCast(OSNumber, d->getObject("brightness"));
++	OSNumber *f = OSDynamicCast(OSNumber, d->getObject("FadePeriod"));
++	if (b == NULL || fFB == NULL) {
++		sweet_bl_log("backlight", d);
++		return kIOReturnSuccess;
++	}
++	int32_t v = (int32_t)b->unsigned32BitValue();
++	uint32_t value = v < 0 ? 0 : v > 255 ? 255 : (uint32_t)v;
++	uint32_t level = value == 0 ? 0 : value * value / 255;
++	level = value != 0 && level == 0 ? 1 : level;
++	if (fLogged < 30) {
++		char name[32];
++		fLogged++;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET BL: %s sets brightness %u (fade %u ms) -> panel %u\n", name, value,
++		    f != NULL ? (uint32_t)(((uint64_t)f->unsigned32BitValue() * 1000) >> 16) : 0, level);
+ 	}
++	fFB->setPanelLevelAsync(level);
++	publish(value);
+ 	return kIOReturnSuccess;
+ }
+ 
