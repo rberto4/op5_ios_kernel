@@ -1,0 +1,309 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b9bf4d9..4504dc4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,9 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -83,6 +86,16 @@ enum {
+ #define SWEET_FB_LOGICAL_W              750
+ #define SWEET_FB_LOGICAL_H              1334
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++/*
++ * 0138: panel brightness (after topaz 0104/0105/0110). cheeseburger's
++ * Samsung S6E3FA5 (stock DT qcom,mdss_dsi_samsung_s6e3fa5_1080p_cmd) is a
++ * command-mode panel on DSI0 (0xc994000) with bl_ctrl_dcs, levels 1..255:
++ * DCS 0x51 with one byte (its on-sequence already sends 0x53 0x20).
++ */
++#define SWEET_FB_DSI0                   0x0c994000
++#define SWEET_FB_BL_MAX                 255
++#define SWEET_FB_BL_INIT                160
++#define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at level 255 */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -128,6 +141,16 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	/* 0138: brightness, DCS 0x51 over DSI0 */
++	volatile uint8_t *fDsi;
++	uintptr_t     fDsiCmd;          /* 64 bytes after the panel's last row (its memory: the DSI reads it) */
++	uint64_t      fDsiCmdPhys;
++	IOLock       *fBlLock;
++	uint32_t      fBlLevel;         /* 1..255, kept while the display is off */
++	void          dsiSetup(void);
++	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
++	bool          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -153,6 +176,25 @@ class IOAcceleratorES : public IOService {
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * 0138 (topaz 0105): CoreBrightness (-[CBDisplayContaineriOS findBacklight])
++ * matches {IOPropertyMatch: {backlight-control: true}} and needs this class;
++ * without it the brightness slider does nothing. It sets "brightness-nits"
++ * here and IOMFBBrightnessLevel on the framebuffer. Published only with
++ * boot-arg sweetbl=1 (topaz 0110: CoreBrightness then also dims digitally,
++ * a colour filter over every frame).
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static AppleCLCD *sweet_fb_main;        /* for kern.sweetbl_level */
++
+ /*
+  * The panel's kernel mapping, for the A540 driver's screen blits (test
+  * 0123: a second 8 MiB mapping of the panel ran out of I/O space).
+@@ -293,6 +335,7 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	dsiSetup();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -857,4 +900,226 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++/* ---- 0138: panel brightness over DSI0 (after topaz 0104/0105/0110) ---- */
++
++static inline uint32_t dsi_rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void
++dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* (this kernel's flush_dcache64 is a bare DSB: __ARM_COHERENT_CACHE__) */
++static void
++sweet_fb_dc_civac(uintptr_t va, size_t len)
++{
++	for (uintptr_t a = va & ~(uintptr_t)63; a < va + len; a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * DSI0 registers, and 64 bytes of the panel's memory after its last row for
++ * the command packet: the display already reads that memory (the ABL's
++ * continuous splash), whatever stands between it and DRAM. The mapping of
++ * the panel memory is whole 16K pages, so there is room after the rows.
++ */
++void
++AppleCLCD::dsiSetup(void)
++{
++	uint64_t used = (uint64_t)fRowBytes * fHeight;
++	uint64_t mapped = (used + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	sweet_fb_main = this;
++	fBlLock = IOLockAlloc();
++	fBlLevel = SWEET_FB_BL_INIT;
++	if (fBlLock == NULL || mapped - used < 64) {
++		IOLog("SWEET BL: no room for the DSI command after the panel rows (%llu of %llu)\n", used, mapped);
++		return;
++	}
++	fDsi = (volatile uint8_t *)ml_io_map(SWEET_FB_DSI0, 0x400);
++	if (fDsi == NULL) {
++		IOLog("SWEET BL: DSI0 not mapped\n");
++		return;
++	}
++	fDsiCmd = fPixels + (uintptr_t)used;
++	fDsiCmdPhys = fPhys + used;
++	IOLog("SWEET BL: DSI0 hw %#x ctrl %#x status %#x dma_ctrl %#x trig %#x; command at pa %#llx\n",
++	    dsi_rd(fDsi, 0x000), dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x03c),
++	    dsi_rd(fDsi, 0x084), fDsiCmdPhys);
++	setProperty("IOMFBBrightnessLevel", (unsigned long long)((uint64_t)SWEET_FB_MAX_NITS * SWEET_FB_BL_INIT /
++	    SWEET_FB_BL_MAX) << 16, 32);
++
++	uint32_t blOn = 0;
++	(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++	AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
++	if (bl != NULL && bl->init()) {
++		bl->fFB = this;
++		bl->setProperty("backlight-control", true);
++		bl->setProperty("brightness-nits", (unsigned long long)SWEET_FB_MAX_NITS * SWEET_FB_BL_INIT / SWEET_FB_BL_MAX, 32);
++		bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++		if (bl->attach(this)) {
++			bl->registerService();
++			IOLog("SWEET BL: AppleARMBacklight published\n");
++		}
++	}
++	OSSafeReleaseNULL(bl);
++}
++
++/*
++ * DCS long write by the DSI command DMA (topaz 0104): header = word count,
++ * data type 0x39, flags last|long; software trigger. The panel runs in
++ * command mode: the command waits until the controller is not sending a
++ * frame (STATUS0 CMD_MODE_ENGINE/DMA/MDP busy, bits 0-2). fBlLock held.
++ */
++bool
++AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
++{
++	if (fDsi == NULL || fDsiCmd == 0 || len > 56) {
++		return false;
++	}
++	uint8_t *p = (uint8_t *)fDsiCmd;
++	uint32_t size = (4 + len + 3) & ~3u;
++	memset(p, 0xff, 64);
++	p[0] = (uint8_t)len;
++	p[1] = (uint8_t)(len >> 8);
++	p[2] = 0x39;
++	p[3] = 0xc0;
++	memcpy(p + 4, payload, len);
++	sweet_fb_dc_civac((uintptr_t)p, 64);
++	for (int i = 0; i < 400 && (dsi_rd(fDsi, 0x008) & 7u) != 0; i++) {
++		IODelay(50);                            /* up to 20 ms: one frame */
++	}
++	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
++	if ((trig & 7) != 4) {
++		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
++	}
++	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
++	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
++	dsi_wr(fDsi, 0x048, (uint32_t)fDsiCmdPhys);
++	dsi_wr(fDsi, 0x04c, size);
++	uint32_t dma = dsi_rd(fDsi, 0x03c);
++	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
++	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
++	bool done = false;
++	for (int i = 0; i < 50 && !done; i++) {
++		done = (dsi_rd(fDsi, 0x110) & 1) != 0;
++		if (!done) {
++			IODelay(200);
++		}
++	}
++	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
++	dsi_wr(fDsi, 0x03c, dma);
++	dsi_wr(fDsi, 0x004, ctrl);
++	if (trig != dsi_rd(fDsi, 0x084)) {
++		dsi_wr(fDsi, 0x084, trig);
++	}
++	return done;
++}
++
++bool
++AppleCLCD::setPanelLevel(uint32_t level)
++{
++	if (fDsi == NULL || fBlLock == NULL) {
++		return false;
++	}
++	level = level > SWEET_FB_BL_MAX ? SWEET_FB_BL_MAX : level;
++	uint8_t cmd[2] = { 0x51, (uint8_t)level };
++	IOLockLock(fBlLock);
++	bool done = dsiDcsLong(cmd, sizeof(cmd));
++	if (level != 0) {
++		fBlLevel = level;
++	}
++	IOLockUnlock(fBlLock);
++	static uint32_t logs;
++	if (logs++ < 8 || !done) {
++		IOLog("SWEET BL: panel level %u: %s (status %#x)\n", level, done ? "done" : "NO DONE",
++		    dsi_rd(fDsi, 0x008));
++	}
++	return done;
++}
++
++static void
++sweet_bl_log(const char *who, OSDictionary *d)
++{
++	static uint32_t logs;
++	if (d == NULL || logs >= 24) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		if (logs++ < 24) {
++			IOLog("SWEET BL: %s set %s = %s %llu\n", who, k->getCStringNoCopy(),
++			    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0);
++		}
++	}
++	OSSafeReleaseNULL(it);
++}
++
++/* CoreBrightness: IOMFBBrightnessLevel, nits in 16.16 -> level 1..255. */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("iomfb", d);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (n == NULL || fDsi == NULL) {
++		return kIOReturnUnsupported;
++	}
++	uint64_t v = n->unsigned64BitValue();
++	setProperty("IOMFBBrightnessLevel", v, 32);
++	uint64_t level = (v * SWEET_FB_BL_MAX) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
++	level = level > SWEET_FB_BL_MAX ? SWEET_FB_BL_MAX : level < 1 ? 1 : level;
++	setPanelLevel((uint32_t)level);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("backlight", d);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
++	if (n != NULL && fFB != NULL) {
++		OSDictionary *m = OSDictionary::withCapacity(1);
++		uint64_t v = n->unsigned64BitValue();
++		if (v < 0x10000) {
++			v <<= 16;               /* plain nits */
++		}
++		OSNumber *nn = OSNumber::withNumber(v, 64);
++		if (m != NULL && nn != NULL) {
++			m->setObject("IOMFBBrightnessLevel", nn);
++			fFB->setProperties(m);
++		}
++		OSSafeReleaseNULL(nn);
++		OSSafeReleaseNULL(m);
++		setProperty("brightness-nits", n);
++	}
++	return kIOReturnSuccess;
++}
++
++/* kern.sweetbl_level: the panel level 1..255 by hand (read: the last one set) */
++static int
++sysctl_sweetbl_level SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	AppleCLCD *fb = sweet_fb_main;
++	int value = fb != NULL ? (int)fb->fBlLevel : -1;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (fb == NULL || fb->fDsi == NULL || value < 1 || value > SWEET_FB_BL_MAX) {
++		return EINVAL;
++	}
++	return fb->setPanelLevel((uint32_t)value) ? 0 : EIO;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetbl_level, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweetbl_level, "I", "SWEET panel brightness 1..255 (DCS 0x51 over DSI0)");
++
+ #endif /* SWEET */
