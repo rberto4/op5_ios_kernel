@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..1dac29f 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -24,6 +24,8 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+@@ -232,10 +234,27 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/*
++	 * 0143: one IOLog per call cost more than the calls (coreduetd asks the
++	 * lock state ~29000 times in a 0136 boot, each line also goes out over
++	 * the USB log). The first sweetaks_log calls are said (default 64,
++	 * boot-arg), then one line per 10000 calls.
++	 */
++	static UInt32 calls;
++	static int said = -1;
++	UInt32 n = (UInt32)OSIncrementAtomic((volatile SInt32 *)&calls) + 1;
++	if (said < 0) {
++		int lines = 64;
++		(void)PE_parse_boot_argn("sweetaks_log", &lines, sizeof(lines));
++		said = lines < 0 ? 0 : lines;
++	}
++	if (n <= (UInt32)said || n % 10000 == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x (call %u%s)\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret, n,
++		    n == (UInt32)said ? "; quiet from here, one line per 10000" : "");
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
