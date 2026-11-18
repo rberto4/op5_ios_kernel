@@ -1,0 +1,114 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index f371769..fc0e506 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -130,6 +130,13 @@ struct sweet_surface_request {                  /* userland/mesa/redwood-drm: st
+ #define SWEET_GPU_MAX_IBS       64
+ #define SWEET_GPU_WAIT_US       2000000u        /* the most a fence or CPU_PREP wait blocks */
+ #define SWEET_SURFACE_STATE_SEED 0xc            /* u32 in a surface's state page (SweetSurface.cpp) */
++/*
++ * 0142: a client's IOSurface buffers by IOSurface ID, a hash of chains
++ * through the buffers themselves (Bo.surfNext, a handle; 0 ends a chain).
++ * 0x7d (once per GPU draw of a surface) and SURFACE (once per import)
++ * walked all SWEET_GPU_MAX_BOS handles (~200 us); now a chain of a few.
++ */
++#define SWEET_GPU_SURF_BUCKETS  256
+ 
+ class SweetGPU : public IOService {
+ 	OSDeclareDefaultStructors(SweetGPU);
+@@ -148,8 +155,10 @@ class SweetGPUUserClient : public IOUserClient {
+ 		uintptr_t kernel;               /* ... its pixels in the kernel's cached view (0: none) */
+ 		uint32_t seed;                  /* ... its seed when last pushed out of the cache, */
+ 		uint64_t pushed;                /* ... and when (0: never) */
++		uint16_t surfNext;              /* ... the next surface buffer of its chain (0142) */
+ 	};
+ 	Bo       *fBo;
++	uint16_t  fSurfBucket[SWEET_GPU_SURF_BUCKETS];  /* 0142: first handle of each chain */
+ 	IOLock   *fLock;
+ 	uint64_t *fSegPA, *fSegLen;
+ 	uint32_t  fLastFence;
+@@ -159,6 +168,9 @@ class SweetGPUUserClient : public IOUserClient {
+ 	uint64_t mapMemory(IOMemoryDescriptor *mem, uint64_t size);
+ 	IOReturn gemNew(struct drm_msm_gem_new *req);
+ 	IOReturn surfaceBuffer(struct sweet_surface_request *req);
++	static uint32_t surfBucket(uint32_t id) { return (id * 2654435761u) >> 24; }
++	void surfLink(uint32_t h);
++	void surfUnlink(uint32_t h);
+ 	void pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32_t nbo);
+ 	uint32_t surfaceSeed(const Bo &b);
+ 	IOReturn surfaceDrawn(struct sweet_surface_drawn *req);
+@@ -210,6 +222,7 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 	if (fBo != NULL) {
+ 		bzero(fBo, SWEET_GPU_MAX_BOS * sizeof(Bo));
+ 	}
++	bzero(fSurfBucket, sizeof(fSurfBucket));
+ 	fSegPA = (uint64_t *)IOMallocData(SWEET_GPU_MAX_SEGS * sizeof(uint64_t));
+ 	fSegLen = (uint64_t *)IOMallocData(SWEET_GPU_MAX_SEGS * sizeof(uint64_t));
+ 	fLock = IOLockAlloc();
+@@ -365,7 +378,7 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 		return kIOReturnSuccess;
+ 	}
+ 	uint32_t h;
+-	for (h = 1; h < SWEET_GPU_MAX_BOS; h++) {
++	for (h = fSurfBucket[surfBucket(s->id)]; h != 0; h = fBo[h].surfNext) {
+ 		if (fBo[h].mem != NULL && fBo[h].surface == s) {
+ 			req->handle = h;
+ 			s->release();           /* (the buffer holds it already) */
+@@ -395,10 +408,35 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 	fBo[h].kernel = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL ? s->kernelAddress() : 0;
+ 	fBo[h].seed = 0;
+ 	fBo[h].pushed = 0;
++	surfLink(h);
+ 	req->handle = h;
+ 	return kIOReturnSuccess;
+ }
+ 
++/* 0142: a surface buffer into / out of its ID's chain. With the lock held. */
++void
++SweetGPUUserClient::surfLink(uint32_t h)
++{
++	uint16_t *head = &fSurfBucket[surfBucket(fBo[h].surface->id)];
++	fBo[h].surfNext = *head;
++	*head = (uint16_t)h;
++}
++
++void
++SweetGPUUserClient::surfUnlink(uint32_t h)
++{
++	if (fBo[h].surface == NULL) {
++		return;
++	}
++	for (uint16_t *link = &fSurfBucket[surfBucket(fBo[h].surface->id)]; *link != 0; link = &fBo[*link].surfNext) {
++		if (*link == h) {
++			*link = fBo[h].surfNext;
++			fBo[h].surfNext = 0;
++			return;
++		}
++	}
++}
++
+ /*
+  * What this processor's cache holds of the IOSurfaces a submission names
+  * (somebody drew into one with this processor, or read it) goes out of the
+@@ -450,7 +488,7 @@ IOReturn
+ SweetGPUUserClient::surfaceDrawn(struct sweet_surface_drawn *req)
+ {
+ 	req->marked = 0;
+-	for (uint32_t h = 1; h < SWEET_GPU_MAX_BOS; h++) {
++	for (uint32_t h = fSurfBucket[surfBucket(req->surface)]; h != 0; h = fBo[h].surfNext) {
+ 		Bo &b = fBo[h];
+ 		if (b.mem == NULL || b.surface == NULL || b.surface->id != req->surface || b.pushed == 0) {
+ 			continue;
+@@ -471,10 +509,12 @@ SweetGPUUserClient::gemClose(uint32_t h)
+ 	if (fBo[h].fence != 0 && sweet_gpu_wait(fBo[h].fence, SWEET_GPU_WAIT_US) != 0) {
+ 		/* the GPU may still use it: leak rather than free memory under it */
+ 		IOLog("SWEET GPU: buffer %u closed with fence %u pending; leaked\n", h, fBo[h].fence);
++		surfUnlink(h);
+ 		fBo[h].mem = NULL;
+ 		fBo[h].surface = NULL;
+ 		return;
+ 	}
++	surfUnlink(h);
+ 	sweet_gpu_unmap(fBo[h].iova, fBo[h].size);
+ 	OSSafeReleaseNULL(fBo[h].mem);
+ 	OSSafeReleaseNULL(fBo[h].surface);

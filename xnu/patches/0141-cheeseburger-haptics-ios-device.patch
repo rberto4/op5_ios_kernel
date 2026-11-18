@@ -1,0 +1,324 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 3879967..d0cc1e9 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -35,11 +35,17 @@
+ #include <kern/locks.h>
+ #include <sys/sysctl.h>
+ #include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <miscfs/devfs/devfs.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ extern int sweet_hid_ringer(int silent);  /* clients reached */
+ void sweet_keys_init(void);
++static void hap_ios_start(void);        /* 0141 */
+ 
+ #define KEYS_CORE_PA     0x0800f000u
+ #define KEYS_OBS_PA      0x09400000u
+@@ -337,6 +343,7 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
+ 	slider_init();
++	hap_ios_start();
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -526,4 +533,293 @@ sysctl_sweethaptic_ms SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweethaptic_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     sysctl_sweethaptic_ms, "I", "SWEET vibration: write N to play N ms (PMI8998 haptics)");
+ 
++/*
++ * ---- 0141: the motor for iOS (/dev/sweet-haptic) ----
++ *
++ * As ios-apollo 0146/0147 (sweet_haptic.c, apollo_haptic=5, MIT): iOS
++ * plays its haptics as a one-channel s16 48 kHz waveform on the audio
++ * server's "Actuator" device (userland/audio plug-in), which writes the
++ * samples here. Writes never block and only note when sound (|s| >
++ * HIOS_SILENT) was last heard and how loud. A kernel thread polls every
++ * 4 ms: sound heard within HIOS_ACTIVE_US = the motor plays (direct mode,
++ * PLAY on), VMAX follows the loudness (Android's level from a third of
++ * full scale up, down to 5/8 of it for the softest); silence = PLAY off
++ * once it has played HIOS_MIN_ON_US (a tap still makes a few LRA cycles).
++ * The PMI8998 has no waveform RAM in direct mode: the strength is VMAX.
++ *
++ * Limits (apollo's, the motor is never left on): one vibration is cut
++ * after kern.sweethaptic_max_ms (default 2000), the motor drives at most
++ * kern.sweethaptic_duty_ms in any 2 s window (default 1800), and after a
++ * cut it rests kern.sweethaptic_rest_ms (default 500). Boot-args of the
++ * same names; sweethaptic_ios=0 makes no device. Counters:
++ * kern.sweethaptic_frames / _plays / _cuts.
++ */
++#define HIOS_SILENT        256u          /* of 32768 */
++#define HIOS_ACTIVE_US     30000u
++#define HIOS_MIN_ON_US     20000u
++#define HIOS_FOLLOW_US     20000u
++#define HIOS_POLL_MS       4u
++#define HIOS_WINDOW_MS     2000u
++#define HIOS_SLOT_MS       100u
++#define HIOS_SLOTS         (HIOS_WINDOW_MS / HIOS_SLOT_MS)
++#define HIOS_VMAX_TOP      18u           /* 2088 mV / 116, the stock DT */
++#define HIOS_VMAX_LOW      11u           /* 5/8 of it */
++#define HIOS_TOLD          24u
++
++static uint32_t hios_max_ms = 2000, hios_duty_ms = 1800, hios_rest_ms = 500;
++static volatile uint64_t hios_heard_us;
++static volatile uint32_t hios_peak;
++static uint32_t hios_frames;           /* (wraps after a day of haptics) */
++static uint32_t hios_plays, hios_cuts;
++
++static uint64_t
++hios_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* From the audio server's I/O thread: never waits. */
++static int
++hios_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[256];
++	int error = 0;
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t bytes = uio_resid(uio);
++		uint32_t peak = 0;
++		if (bytes > (user_ssize_t)sizeof(samples)) {
++			bytes = sizeof(samples);
++		}
++		bytes &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < bytes / 2; i++) {
++			int32_t v = samples[i];
++			uint32_t a = (uint32_t)(v < 0 ? -v : v);
++			peak = a > peak ? a : peak;
++		}
++		hios_frames += (uint32_t)(bytes / 2);
++		if (peak > HIOS_SILENT) {
++			uint64_t now = hios_now_us();
++			if (hios_heard_us == 0 || now - hios_heard_us >= HIOS_ACTIVE_US) {
++				hios_peak = 0;
++			}
++			hios_heard_us = now;
++			hios_peak = peak > hios_peak ? peak : hios_peak;
++		}
++	}
++	return error;
++}
++
++static int
++hios_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw hios_cdevsw = {
++	.d_open = hios_open, .d_close = hios_open, .d_read = eno_rdwrt, .d_write = hios_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static uint8_t
++hios_vmax_for(uint32_t peak)
++{
++	uint32_t third = 32767u / 3u;
++	uint32_t v = peak >= third ? HIOS_VMAX_TOP :
++	    HIOS_VMAX_LOW + (HIOS_VMAX_TOP - HIOS_VMAX_LOW) * peak / third;
++	return (uint8_t)(v << 1);
++}
++
++/* PLAY on at this VMAX (lock taken here). */
++static bool
++hios_on(uint8_t vmax)
++{
++	bool ok;
++	lck_mtx_lock(&sweet_hap_mtx);
++	ok = hap_setup() == 1 && hap_write(0x51, vmax) && hap_write(0x46, 0x80) && hap_write(0x70, 0x80);
++	lck_mtx_unlock(&sweet_hap_mtx);
++	return ok;
++}
++
++static bool
++hios_vmax(uint8_t vmax)
++{
++	bool ok;
++	lck_mtx_lock(&sweet_hap_mtx);
++	ok = hap_write(0x51, vmax);
++	lck_mtx_unlock(&sweet_hap_mtx);
++	return ok;
++}
++
++/* PLAY off, brake, EN off; short circuit cleared. Always tries every write. */
++static bool
++hios_off(void)
++{
++	bool ok;
++	int st;
++	lck_mtx_lock(&sweet_hap_mtx);
++	ok = hap_write(0x70, 0x00);
++	delay(HAP_STOP_US);
++	ok = hap_write(0x46, 0x00) && ok;
++	ok = hap_write(0x51, HIOS_VMAX_TOP << 1) && ok;         /* the sysctl test plays at the DT's level */
++	st = hap_read(0x0a);
++	if (st >= 0 && (st & 0x08)) {
++		printf("SWEET HAPTIC: short circuit (STATUS %#x): cleared\n", st);
++		(void)hap_write(0x59, 0x01);
++	}
++	lck_mtx_unlock(&sweet_hap_mtx);
++	return ok;
++}
++
++static void
++hios_serve(void)
++{
++	enum { IDLE, ON, REST } state = IDLE;
++	uint64_t since = 0, rest_until = 0, followed = 0, duty_last = hios_now_us();
++	uint64_t duty_slot = duty_last / (HIOS_SLOT_MS * 1000u);
++	uint32_t driven[HIOS_SLOTS] = { 0 };
++	uint8_t playing = 0;
++	unsigned errors = 0;
++
++	for (;;) {
++		uint64_t now = hios_now_us(), window = 0;
++		uint64_t slot = now / (HIOS_SLOT_MS * 1000u);
++		bool active = hios_heard_us != 0 && now - hios_heard_us < HIOS_ACTIVE_US;
++		uint8_t vmax = hios_vmax_for(hios_peak);
++
++		for (uint64_t s = duty_slot + 1; s <= slot && s <= duty_slot + HIOS_SLOTS; s++) {
++			driven[s % HIOS_SLOTS] = 0;
++		}
++		duty_slot = slot;
++		if (state == ON) {
++			uint64_t spent = now - duty_last;
++			driven[slot % HIOS_SLOTS] += spent > HIOS_WINDOW_MS * 1000u ? HIOS_WINDOW_MS * 1000u : (uint32_t)spent;
++		}
++		duty_last = now;
++		for (unsigned i = 0; i < HIOS_SLOTS; i++) {
++			window += driven[i];
++		}
++
++		switch (state) {
++		case IDLE:
++			if (active && window < hios_duty_ms * 1000ull) {
++				if (hios_on(vmax)) {
++					state = ON;
++					since = followed = now;
++					playing = vmax;
++					if (hios_plays++ < HIOS_TOLD) {
++						printf("SWEET HAPTIC: iOS plays (%u): peak %u of 32768, VMAX %#x\n", hios_plays, hios_peak, vmax);
++					}
++				} else if (errors++ < HIOS_TOLD) {
++					printf("SWEET HAPTIC: cannot start the motor for iOS\n");
++				}
++			}
++			break;
++		case ON: {
++			bool over = now - since > hios_max_ms * 1000ull || window >= hios_duty_ms * 1000ull;
++			if (over || (!active && now - since >= HIOS_MIN_ON_US)) {
++				(void)hios_off();
++				if (over) {
++					rest_until = now + hios_rest_ms * 1000ull;
++					state = REST;
++					if (hios_cuts++ < HIOS_TOLD) {
++						printf("SWEET HAPTIC: CUT after %llu ms (%llu ms driven in %u ms): rests %u ms\n",
++						    (now - since) / 1000, window / 1000, HIOS_WINDOW_MS, hios_rest_ms);
++					}
++				} else {
++					state = IDLE;
++				}
++				break;
++			}
++			if (active && now - followed >= HIOS_FOLLOW_US) {
++				followed = now;
++				hios_peak = 0;
++				if (vmax != playing && (vmax > playing + 2 || vmax + 2 < playing)) {
++					(void)hios_vmax(vmax);
++					playing = vmax;
++				}
++			}
++			break;
++		}
++		case REST:
++			if (now >= rest_until) {
++				state = IDLE;
++			}
++			break;
++		}
++		delay(HIOS_POLL_MS * 1000u);
++	}
++}
++
++static void
++hios_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	/* devfs and the root before the node: the audio server opens it much later */
++	for (unsigned waited = 0; waited < 600 && rootvnode == NULLVP; waited++) {
++		delay(200000);
++	}
++	int major = cdevsw_add(-1, &hios_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-haptic") == NULL) {
++		printf("SWEET HAPTIC: /dev/sweet-haptic cannot be made (major %d)\n", major);
++		return;
++	}
++	printf("SWEET HAPTIC: /dev/sweet-haptic ready (max %u ms, duty %u/%u ms, rest %u ms)\n",
++	    hios_max_ms, hios_duty_ms, HIOS_WINDOW_MS, hios_rest_ms);
++	hios_serve();
++}
++
++static void
++hap_ios_start(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweethaptic_ios", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweethaptic_max_ms", &hios_max_ms, sizeof(hios_max_ms));
++	(void)PE_parse_boot_argn("sweethaptic_duty_ms", &hios_duty_ms, sizeof(hios_duty_ms));
++	(void)PE_parse_boot_argn("sweethaptic_rest_ms", &hios_rest_ms, sizeof(hios_rest_ms));
++	hios_max_ms = hios_max_ms < 50 ? 50 : hios_max_ms > HAP_MAX_MS ? HAP_MAX_MS : hios_max_ms;
++	hios_duty_ms = hios_duty_ms < 100 ? 100 : hios_duty_ms > HIOS_WINDOW_MS ? HIOS_WINDOW_MS : hios_duty_ms;
++	hios_rest_ms = hios_rest_ms > 10000 ? 10000 : hios_rest_ms;
++	if (!enabled) {
++		printf("SWEET HAPTIC: no device for iOS (sweethaptic_ios=0)\n");
++		return;
++	}
++	if (kernel_thread_start(hios_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET HAPTIC: kernel_thread_start failed\n");
++	}
++}
++
++/* Limits: written values are clamped as at boot. */
++static int
++sysctl_hios_limit SYSCTL_HANDLER_ARGS
++{
++	uint32_t *limit = arg1, lo = (uint32_t)(arg2 >> 16), hi = (uint32_t)(arg2 & 0xffff);
++	int value = (int)*limit;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	*limit = value < (int)lo ? lo : value > (int)hi ? hi : (uint32_t)value;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweethaptic_max_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &hios_max_ms,
++    (50 << 16) | HAP_MAX_MS, sysctl_hios_limit, "I", "SWEET vibration for iOS: longest vibration, ms");
++SYSCTL_PROC(_kern, OID_AUTO, sweethaptic_duty_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &hios_duty_ms,
++    (100 << 16) | HIOS_WINDOW_MS, sysctl_hios_limit, "I", "SWEET vibration for iOS: most driving in 2 s, ms");
++SYSCTL_PROC(_kern, OID_AUTO, sweethaptic_rest_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, &hios_rest_ms,
++    10000, sysctl_hios_limit, "I", "SWEET vibration for iOS: rest after a cut, ms");
++SYSCTL_UINT(_kern, OID_AUTO, sweethaptic_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &hios_frames, 0,
++    "SWEET vibration for iOS: samples written to /dev/sweet-haptic");
++SYSCTL_UINT(_kern, OID_AUTO, sweethaptic_plays, CTLFLAG_RD | CTLFLAG_LOCKED, &hios_plays, 0,
++    "SWEET vibration for iOS: times the motor started");
++SYSCTL_UINT(_kern, OID_AUTO, sweethaptic_cuts, CTLFLAG_RD | CTLFLAG_LOCKED, &hios_cuts, 0,
++    "SWEET vibration for iOS: vibrations cut by a limit");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

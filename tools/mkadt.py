@@ -75,6 +75,19 @@ def d20ap_node(want, path=D20AP_ADT):
     print(f'warning: {path}: no /{want} node', file=sys.stderr)
     return None
 
+def d20ap_child(parent, want, path=D20AP_ADT):
+    """Properties of the child node WANT of the top-level node PARENT of the
+    real D20AP tree (as d20ap_node). None if absent."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == parent.encode() + b'\0':
+            for g in c.children:
+                if dict((k, v) for k, f, v in g.props).get('name') == want.encode() + b'\0':
+                    return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -270,7 +283,17 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cont
     # ('w30r', 'b3a8') that this kernel does not provide: Safari pages stay blank.
     if product_props:
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/haptics (closed-loop 1), as the iPhone 8 has it: MobileGestalt's
+    # DeviceSupportsClosedLoopHaptics. With it iOS plays its haptics as
+    # waveforms on the audio server's "Actuator" (userland/audio), which the
+    # kernel plays on the PMI8998 motor (xnu 0141, /dev/sweet-haptic). As
+    # ios-apollo's mkadt.py. MobileGestalt caches the answer: reset its cache
+    # once (NOTES-OP5.md, 0141 test).
+    haptics = d20ap_child('product', 'haptics') if product_props else None
+    if product_props and haptics is None:
+        print('warning: the D20AP tree has no /product/haptics: iOS will not play haptics', file=sys.stderr)
+    product = [node('product', [ph()] + product_props, [node('haptics', [ph()] + haptics)] if haptics else [])] \
+        if product_props else []
 
     # Identity of the iPhone 8 whose userland runs here: compatible[0] is
     # hw.model/hw.target (D20AP), model is hw.machine/hw.product

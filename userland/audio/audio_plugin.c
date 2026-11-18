@@ -973,6 +973,20 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
  */
 static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
 static unsigned haptic_said;
+static UInt64 haptic_retry;      /* frames since the last failed open: tried again every 2 s */
+
+/* cheeseburger (xnu 0141): /dev/sweet-haptic, PMI8998 in direct mode; topaz's name after it */
+static int
+actuator_open(void)
+{
+	int fd = open("/dev/sweet-haptic", O_WRONLY | O_NONBLOCK);
+
+	if (fd < 0) {
+		fd = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
+	}
+	say("redwood: audio: the actuator's motor driver: %s\n", fd >= 0 ? "open" : strerror(errno));
+	return fd >= 0 ? fd : -2;
+}
 
 static void
 actuator_write(const int16_t *samples, UInt32 frames)
@@ -984,9 +998,12 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 		peak = v > peak ? v : peak;
 	}
+	if (haptic == -2 && (haptic_retry += frames) >= 2 * REDWOOD_AUDIO_RATE) {
+		haptic_retry = 0;
+		haptic = -1;
+	}
 	if (haptic == -1) {
-		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
-		haptic = haptic >= 0 ? haptic : -2;
+		haptic = actuator_open();
 	}
 	if (haptic >= 0) {
 		(void)write(haptic, samples, (size_t)frames * 2);
@@ -994,7 +1011,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	if (peak > 0 && haptic_said < 12) {
 		haptic_said++;
 		say("redwood: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
-		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
+		    haptic >= 0 ? "" : " (no /dev/sweet-haptic: not felt)");
 	}
 }
 
