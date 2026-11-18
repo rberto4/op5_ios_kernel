@@ -11,7 +11,7 @@ CC=(xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0)
 python3 "$here/mkeagl.py" "$here/eagl_slots.txt" "$mesa/gl.xml" "$mesa/exported-gl.txt" "$here/eagl.c" > "$out/eagl_gen.h"
 "${CC[@]}" -O1 -Wall -dynamiclib -install_name /usr/local/lib/libsweet-gl.dylib -I"$out" -I"$here" \
 	-framework CoreFoundation -framework IOKit -framework IOSurface -lobjc "$mesa/libOSMesa.8.dylib" \
-	-o "$out/libsweet-gl.dylib" "$here/eagl.c" "$here/sweet_gl_osmesa.c"
+	-o "$out/libsweet-gl.dylib" "$here/eagl.c" "$here/sweet_gl_osmesa.c" "$here/sweet_prof.c"
 "${CC[@]}" -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
 	-framework IOKit -o "$out/libsweet-ca.dylib" "$here/sweet_ca.c"
 # Mesa's own install name may name another phone's folder: ours is /usr/local/lib

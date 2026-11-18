@@ -83,6 +83,7 @@
 #include <unistd.h>
 
 #include "sweet_gl.h"
+#include "sweet_prof.h"
 
 /* IOKitLib, as far as it is used here (the iPhoneOS SDK has the framework, not its headers) */
 typedef mach_port_t io_object_t;
@@ -824,6 +825,29 @@ surface_to_texture(struct eagl *e, struct image *image)
 }
 
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+/*
+ * (op5, xnu 0137) The seed moved above because the GPU drew the surface, not this processor: the
+ * kernel is told, or the next submission naming it pushes all of it out of the processor's cache
+ * (~1.6 ms for 750x1334). Through Mesa's connection (redwood_drm_surface_drawn).
+ */
+static void
+surface_drawn_by_gpu(IOSurfaceRef surface)
+{
+	static int (*drawn)(uint32_t);
+	static int looked, refused;
+
+	if (!looked) {
+		looked = 1;
+		drawn = (int (*)(uint32_t))dlsym(RTLD_DEFAULT, "redwood_drm_surface_drawn");
+		say("sweet-gl: surfaces drawn by the GPU %s\n", drawn != NULL ? "are told to the kernel" :
+		    "cannot be told to the kernel (Mesa without redwood_drm_surface_drawn)");
+	}
+	if (drawn != NULL && !refused && drawn(IOSurfaceGetID(surface)) < 0) {
+		refused = 1;
+		say("sweet-gl: the kernel does not take surfaces drawn by the GPU (before xnu 0137)\n");
+	}
+}
+
 static void
 target_to_surface(struct eagl *e, struct image *image)
 {
@@ -855,6 +879,7 @@ target_to_surface(struct eagl *e, struct image *image)
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
+		surface_drawn_by_gpu(surface);
 		return;
 	}
 	if (image->shared) {
@@ -862,6 +887,7 @@ target_to_surface(struct eagl *e, struct image *image)
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			IOSurfaceUnlock(surface, 0, NULL);
 		}
+		surface_drawn_by_gpu(surface);
 		return;
 	}
 	if (e->reader == 0) {
@@ -1358,6 +1384,8 @@ perf_note(struct eagl *e, uint64_t before, uint64_t waited, uint64_t after, bool
 {
 	static uint64_t window_start, drew, waits, fe_start, gl_start, calls_start, busy;
 	static unsigned frames, shown, draws_start;
+
+	sweet_prof_thread();
 
 	if (frames == 0) {
 		window_start = e->began;
@@ -5348,6 +5376,7 @@ install(void)
 		}
 	}
 
+	sweet_prof_start();
 	install_texture_functions();
 	if (class == Nil && dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY) != NULL) {
 		class = objc_getClass("EAGLContext");

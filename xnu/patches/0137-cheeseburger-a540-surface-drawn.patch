@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 0e4aa4f..f371769 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -70,6 +70,16 @@ task_t current_task(void);
+ #define DRM_MSM_SUBMITQUEUE_QUERY       0x0C
+ #define SWEET_GPU_SURFACE               0x7e    /* not Linux's (HackiOS's): an IOSurface's memory as a buffer */
+ #define SWEET_GPU_SURFACE_DESCRIBE      0xffffffffu
++/*
++ * 0137, not Linux's either: "the GPU has drawn this surface" (by IOSurface ID).
++ * The CA bridge marks a surface changed after the GPU drew it (a write lock,
++ * which moves its seed); without this the next submission naming it pushed
++ * all of it (4 MiB, ~1.6 ms) out of this processor's cache for nothing.
++ * The seed it has now counts as pushed. A surface never pushed stays so
++ * (what the processor wrote before the GPU's first use still goes out).
++ */
++#define SWEET_GPU_SURFACE_DRAWN         0x7d
++struct sweet_surface_drawn { uint32_t surface, marked; };
+ #define MSM_INFO_GET_OFFSET             0x00
+ #define MSM_INFO_GET_IOVA               0x01
+ #define MSM_INFO_SET_NAME               0x02
+@@ -150,6 +160,8 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOReturn gemNew(struct drm_msm_gem_new *req);
+ 	IOReturn surfaceBuffer(struct sweet_surface_request *req);
+ 	void pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32_t nbo);
++	uint32_t surfaceSeed(const Bo &b);
++	IOReturn surfaceDrawn(struct sweet_surface_drawn *req);
+ 	void gemClose(uint32_t handle);
+ 	IOReturn gemInfo(struct drm_msm_gem_info *req);
+ 	IOReturn cpuPrep(struct drm_msm_gem_cpu_prep *req);
+@@ -412,8 +424,7 @@ SweetGPUUserClient::pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32
+ 		if (b.surface == NULL || b.kernel == 0) {
+ 			continue;
+ 		}
+-		uint32_t seed = b.surface->state != NULL ?
+-		    *(volatile uint32_t *)((uint8_t *)b.surface->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0;
++		uint32_t seed = surfaceSeed(b);
+ 		if (b.pushed != 0 && seed == b.seed && (ms <= 0 || now - b.pushed < again)) {
+ 			continue;
+ 		}
+@@ -427,6 +438,30 @@ SweetGPUUserClient::pushSurfaces(const struct drm_msm_gem_submit_bo *bos, uint32
+ 	}
+ }
+ 
++uint32_t
++SweetGPUUserClient::surfaceSeed(const Bo &b)
++{
++	return b.surface->state != NULL ?
++	       *(volatile uint32_t *)((uint8_t *)b.surface->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED) : 0;
++}
++
++/* 0137: see SWEET_GPU_SURFACE_DRAWN. With the lock held. */
++IOReturn
++SweetGPUUserClient::surfaceDrawn(struct sweet_surface_drawn *req)
++{
++	req->marked = 0;
++	for (uint32_t h = 1; h < SWEET_GPU_MAX_BOS; h++) {
++		Bo &b = fBo[h];
++		if (b.mem == NULL || b.surface == NULL || b.surface->id != req->surface || b.pushed == 0) {
++			continue;
++		}
++		b.seed = surfaceSeed(b);
++		b.pushed = mach_absolute_time();
++		req->marked++;
++	}
++	return kIOReturnSuccess;
++}
++
+ void
+ SweetGPUUserClient::gemClose(uint32_t h)
+ {
+@@ -639,6 +674,13 @@ SweetGPUUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments
+ 	}
+ 	case DRM_COMMAND_BASE + DRM_MSM_GEM_CPU_FINI:
+ 		return kIOReturnSuccess;
++	case SWEET_GPU_SURFACE_DRAWN: {
++		REQ(struct sweet_surface_drawn);
++		IOLockLock(fLock);
++		ret = surfaceDrawn(req);
++		IOLockUnlock(fLock);
++		return ret;
++	}
+ 	case SWEET_GPU_SURFACE: {
+ 		REQ(struct sweet_surface_request);
+ 		IOLockLock(fLock);

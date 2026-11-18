@@ -283,6 +283,27 @@ redwood_drm_surface(int fd, struct redwood_drm_surface *surface)
 	return 0;
 }
 
+/*
+ * (op5, xnu 0137) The GPU has drawn IOSurface `surface`: its seed as it is now needs no push out
+ * of the processor's cache at the next submission (SweetGPU.cpp SWEET_GPU_SURFACE_DRAWN). For the
+ * CA bridge (eagl.c, through dlsym: Mesa's own symbols are hidden), over Mesa's connection, whose
+ * buffers they are. -1 when the kernel does not know the request (before 0137).
+ */
+#define REDWOOD_GPU_SURFACE_DRAWN 0x7d
+__attribute__((visibility("default"))) int redwood_drm_surface_drawn(uint32_t surface);
+int
+redwood_drm_surface_drawn(uint32_t surface)
+{
+	struct {
+		uint32_t surface, marked;
+	} request = { .surface = surface };
+
+	if (connection == 0 || call(REDWOOD_GPU_SURFACE_DRAWN, &request, sizeof(request)) != 0) {
+		return -1;
+	}
+	return (int)request.marked;
+}
+
 int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
