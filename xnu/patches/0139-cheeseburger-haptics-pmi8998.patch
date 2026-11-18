@@ -1,0 +1,201 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 98d5c19..3879967 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -32,6 +32,9 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -341,4 +344,186 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++/*
++ * ---- 0139: vibration motor, PMI8998 haptics (cheeseburger) ----
++ *
++ * Stock DT qcom,haptic@c000 (qcom,qpnp-haptic): PMI8998 SID 3, PPID 0x3c0,
++ * LRA, vmax 2088 mV, ilim 800 mA, sine, play rate 4255 us, int PWM 505 kHz,
++ * sc-deb 8 cycles, brake 3/3/3/3. Register offsets and encodings from
++ * Linux msm-4.4 qpnp-haptic.c (facts only): CFG1 0x4c (bit0 0 = LRA),
++ * CFG2 0x4d (bit0 0 = sine), SEL 0x4e (bits 5:4 play mode, 0 = direct),
++ * LRA_AUTO_RES 0x4f, VMAX 0x51 (mV/116 << 1), ILIM 0x52 (mA/400 - 1),
++ * SC_DEB 0x53, RATE_CFG1/2 0x54/0x55 (us/5, low byte / bits 11:8),
++ * INT_PWM 0x56 and PWM_CAP 0x58 (1 = 505 kHz), SC_CLR 0x59, EN_CTL2 0x48
++ * (bit0 brake), BRAKE 0x5c, EN_CTL 0x46 (bit7), PLAY 0x70 (bit7), STATUS
++ * 0x0a (bit1 busy, bit3 short circuit). Direct mode, no auto-resonance
++ * (its enable is behind the secure-access register): the motor is driven
++ * at the DT's period.
++ *
++ * Writes go through the arbiter v3 read/write channel of the APID (chnls
++ * 0x8400000 + 0x8000 * APID, EE 0): WDATA0 0x10, CMD 0x00 = EXT_WRITEL
++ * (opcode 0) | address << 4, STATUS 0x08 (bit0 done, bits 3:1 errors).
++ * Only this peripheral is ever written, and only if the arbiter says the
++ * apps EE owns it (cnfg owner 0). kern.sweethaptic_ms=N plays N ms (at
++ * most HAP_MAX_MS); reading it gives the last STATUS (or -errno).
++ */
++#define HAP_CHNLS_PA     0x08400000u
++#define HAP_PPID         0x3c0u
++#define HAP_MAX_MS       2000u
++#define HAP_STOP_US      (4u * 4255u)   /* the driver's wait after PLAY off: 4 drive periods */
++
++static LCK_GRP_DECLARE(sweet_hap_grp, "sweet_haptic");
++static LCK_MTX_DECLARE(sweet_hap_mtx, &sweet_hap_grp);
++static vm_offset_t hap_rw, hap_obs;
++static uint16_t hap_apid = KEYS_NO_APID;
++static int hap_state;           /* 0 untried, 1 ready, -errno refused */
++static int hap_last;            /* kern.sweethaptic_ms read: last STATUS, or -errno */
++
++static bool
++hap_wait(vm_offset_t ch, uint32_t *status)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = keys_rd(ch, 0x08u);
++		if (st & 1u) {
++			*status = st;
++			return (st & 0x0eu) == 0;
++		}
++		delay(1);
++	}
++	*status = 0;
++	return false;
++}
++
++static bool
++hap_write(uint8_t addr, uint8_t value)
++{
++	uint32_t st;
++	*(volatile uint32_t *)(hap_rw + 0x10u) = value;                 /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(hap_rw + 0x00u) = (uint32_t)addr << 4;   /* EXT_WRITEL, one byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	if (!hap_wait(hap_rw, &st)) {
++		printf("SWEET HAPTIC: write %#x <- %#x failed, status %#x\n", addr, value, st);
++		return false;
++	}
++	return true;
++}
++
++static int
++hap_read(uint8_t addr)
++{
++	uint32_t st;
++	*(volatile uint32_t *)hap_obs = (1u << 27) | ((uint32_t)addr << 4);     /* EXT_READL */
++	__asm__ volatile("dsb osh" ::: "memory");
++	if (!hap_wait(hap_obs, &st)) {
++		return -1;
++	}
++	return (int)(keys_rd(hap_obs, 0x18u) & 0xffu);
++}
++
++/* Once: find and check the channel, configure the motor. Lock held. */
++static int
++hap_setup(void)
++{
++	static const uint8_t config[][2] = {
++		{ 0x4c, 0x00 },         /* CFG1: LRA */
++		{ 0x4f, 0x47 },         /* LRA_AUTO_RES: zxd-eop (4 << 4), high-z opt1 (1 << 2), cal period 32 (3) */
++		{ 0x4e, 0x00 },         /* SEL: direct */
++		{ 0x51, 18u << 1 },     /* VMAX: 2088 mV / 116 */
++		{ 0x52, 0x01 },         /* ILIM: 800 mA */
++		{ 0x53, 0x01 },         /* SC_DEB: 8 cycles */
++		{ 0x56, 0x01 },         /* INT_PWM: 505 kHz */
++		{ 0x58, 0x01 },         /* PWM_CAP */
++		{ 0x4d, 0x00 },         /* CFG2: sine */
++		{ 0x54, 851u & 0xffu }, /* RATE_CFG1: 4255 us / 5 = 851 */
++		{ 0x55, 851u >> 8 },    /* RATE_CFG2 */
++		{ 0x48, 0x01 },         /* EN_CTL2: brake */
++		{ 0x5c, 0xff },         /* BRAKE: 3, 3, 3, 3 */
++	};
++	if (hap_state != 0) {
++		return hap_state;
++	}
++	if (!keys_core) {
++		keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
++	}
++	if (!keys_cnfg) {
++		keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
++	}
++	if (!keys_core || !keys_cnfg) {
++		return hap_state = -ENXIO;
++	}
++	hap_apid = keys_find_apid(HAP_PPID);
++	if (hap_apid == KEYS_NO_APID) {
++		printf("SWEET HAPTIC: PPID %#x not mapped by the arbiter\n", HAP_PPID);
++		return hap_state = -ENODEV;
++	}
++	uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * hap_apid) & 7u;
++	if (owner != 0) {
++		printf("SWEET HAPTIC: APID %#x owned by EE %u, not apps: not writing\n", hap_apid, owner);
++		return hap_state = -EPERM;
++	}
++	hap_obs = keys_obs_map(hap_apid);
++	hap_rw = ml_io_map(HAP_CHNLS_PA + KEYS_OBS_STRIDE * hap_apid, 0x1000);
++	if (!hap_obs || !hap_rw) {
++		return hap_state = -ENXIO;
++	}
++	printf("SWEET HAPTIC: APID %#x; before: type %#x subtype %#x EN_CTL %#x SEL %#x VMAX %#x RATE %#x/%#x STATUS %#x\n",
++	    hap_apid, hap_read(0x04), hap_read(0x05), hap_read(0x46), hap_read(0x4e), hap_read(0x51),
++	    hap_read(0x54), hap_read(0x55), hap_read(0x0a));
++	for (unsigned i = 0; i < sizeof(config) / sizeof(config[0]); i++) {
++		if (!hap_write(config[i][0], config[i][1])) {
++			return hap_state = -EIO;
++		}
++	}
++	printf("SWEET HAPTIC: configured: SEL %#x VMAX %#x ILIM %#x RATE %#x/%#x BRAKE %#x\n", hap_read(0x4e),
++	    hap_read(0x51), hap_read(0x52), hap_read(0x54), hap_read(0x55), hap_read(0x5c));
++	return hap_state = 1;
++}
++
++/* Play ms milliseconds (1..HAP_MAX_MS); STATUS after, or -errno. */
++static int
++hap_play(uint32_t ms)
++{
++	int result;
++	ms = ms > HAP_MAX_MS ? HAP_MAX_MS : ms;
++	lck_mtx_lock(&sweet_hap_mtx);
++	result = hap_setup();
++	if (result == 1) {
++		bool ok = hap_write(0x46, 0x80) && hap_write(0x70, 0x80);       /* EN_CTL, PLAY */
++		if (ok) {
++			delay(ms * 1000u);
++		}
++		ok = hap_write(0x70, 0x00) && ok;
++		delay(HAP_STOP_US);
++		ok = hap_write(0x46, 0x00) && ok;
++		result = hap_read(0x0a);
++		if (result >= 0 && (result & 0x08)) {
++			printf("SWEET HAPTIC: short circuit (STATUS %#x): cleared\n", result);
++			(void)hap_write(0x59, 0x01);
++		}
++		result = ok ? result : -EIO;
++	}
++	lck_mtx_unlock(&sweet_hap_mtx);
++	return result;
++}
++
++static int
++sysctl_sweethaptic_ms SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = hap_last;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (value < 1) {
++		return EINVAL;
++	}
++	hap_last = hap_play((uint32_t)value);
++	printf("SWEET HAPTIC: played %d ms: %d\n", value, hap_last);
++	return hap_last < 0 ? -hap_last : 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweethaptic_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    sysctl_sweethaptic_ms, "I", "SWEET vibration: write N to play N ms (PMI8998 haptics)");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
