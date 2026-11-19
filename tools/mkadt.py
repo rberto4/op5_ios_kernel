@@ -164,6 +164,15 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cont
         # of the A11 that the iPhone 8 userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # MobileGestalt's network addresses (UniqueDeviceID etc.): iBoot sets
+        # these on an iPhone. Without mac-address-wifi0 MobileGestalt waits
+        # for an IONetworkController and times out on every question, so
+        # lsd's LaunchServices seed never ends (sampler 2026-11-18: lsd in
+        # GenerateBuiltInAppInstallSessionID -> MG semaphore; Bergamota
+        # mkadt.py). Synthetic locally administered addresses, not the phone's.
+        ('mac-address-wifi0', bytes([0x02, 0x4f, 0x50, 0x35, 0x00, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x4f, 0x50, 0x35, 0x00, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x4f, 0x50, 0x35, 0x00, 0x03])),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
@@ -289,7 +298,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cont
     # kernel plays on the PMI8998 motor (xnu 0141, /dev/sweet-haptic). As
     # ios-apollo's mkadt.py. MobileGestalt caches the answer: reset its cache
     # once (NOTES-OP5.md, 0141 test).
-    haptics = d20ap_child('product', 'haptics') if product_props else None
+    haptics = d20ap_child('product', 'haptics') if product_props and not os.environ.get('NO_HAPTICS') else None
     if product_props and haptics is None:
         print('warning: the D20AP tree has no /product/haptics: iOS will not play haptics', file=sys.stderr)
     product = [node('product', [ph()] + product_props, [node('haptics', [ph()] + haptics)] if haptics else [])] \

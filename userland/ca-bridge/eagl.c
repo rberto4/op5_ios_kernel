@@ -131,6 +131,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_RGBA                         0x1908
+#define GL_ALPHA                        0x1906
 #define GL_VENDOR                       0x1f00
 #define GL_RENDERER                     0x1f01
 #define GL_VERSION                      0x1f02
@@ -169,6 +170,9 @@ static int latency_lines;               /* boot-arg touch_lat=1: when every fram
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
 static uint64_t gl_us, gl_calls;        /* (op5 perf line) time inside the library's GL calls, and their number */
+/* (op5 perf line) IOSurfaces that are copied, not shared: adding them up (surface_changed()) and copying them */
+static uint64_t sum_us, sum_bytes, sum_count, copy_us, copy_bytes, copy_count;
+static uint64_t refused_bgra, refused_alpha, refused_rgba, refused_other;
 static uint64_t now_us(void);
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
@@ -363,6 +367,7 @@ static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
+static uint64_t slot_us[SLOTS];           /* (op5 perf line) time in each function since the last line */
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
@@ -436,6 +441,7 @@ eagl_leave(struct eagl *e, unsigned offset)
 
 	gl_us += ended - call_began_us;
 	gl_calls++;
+	slot_us[offset / 8] += ended - call_began_us;
 	if (slow_calls_us != 0) {
 		uint64_t now = ended;
 
@@ -704,6 +710,15 @@ surface_shared(struct eagl *e, struct image *image)
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !sweet_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
 		e->refused++;
+		if (image->format == GL_BGRA) {
+			refused_bgra++;
+		} else if (image->format == GL_ALPHA) {
+			refused_alpha++;
+		} else if (image->format == GL_RGBA) {
+			refused_rgba++;
+		} else {
+			refused_other++;
+		}
 		return false;
 	}
 	image->shared = true;
@@ -732,11 +747,15 @@ surface_changed(struct eagl *e, struct image *image)
 		return false;
 	}
 	image->looked = e->frames + 1;
+	uint64_t began = now_us();
 	for (size_t at = 0; at + 8 <= size; at += 8) {
 		memcpy(&word, base + at, 8);
 		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
 		sum ^= sum >> 29;
 	}
+	sum_us += now_us() - began;
+	sum_bytes += size;
+	sum_count++;
 	if (sum == image->sum) {
 		return false;
 	}
@@ -759,6 +778,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	if (image->shared) {
 		return;
 	}
+	uint64_t copy_began = now_us();
 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
 		say("sweet-gl: an IOSurface cannot be locked\n");
 		return;
@@ -822,6 +842,9 @@ surface_to_texture(struct eagl *e, struct image *image)
 	image->seed = IOSurfaceGetSeed(surface);
 	e->uploads++;
 	e->upload_bytes += row * (size_t)image->height;
+	copy_us += now_us() - copy_began;
+	copy_bytes += row * (size_t)image->height;
+	copy_count++;
 }
 
 /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
@@ -1410,6 +1433,32 @@ perf_note(struct eagl *e, uint64_t before, uint64_t waited, uint64_t after, bool
 	    shown, shown * 1000000ull / span, busy * 100 / span, drew / frames, (gl_us - gl_start) / frames,
 	    (gl_calls - calls_start) / frames, draws_start / frames, waits / frames, (fe_pixels - fe_start) / frames,
 	    wait_for_frames ? "glFinish" : "flush only");
+	say("sweet-gl: perf surfaces in these %u frames: summed %llu (%llu KB, %llu us a frame), copied %llu (%llu KB, %llu us a "
+	    "frame); refused so far bgra %llu alpha %llu rgba %llu other %llu\n", frames, sum_count, sum_bytes >> 10,
+	    sum_us / frames, copy_count, copy_bytes >> 10, copy_us / frames, refused_bgra, refused_alpha,
+	    refused_rgba, refused_other);
+	sum_us = sum_bytes = sum_count = copy_us = copy_bytes = copy_count = 0;
+	{
+		unsigned top[6] = { 0 };
+		char list[400] = "";
+		size_t used = 0;
+
+		for (unsigned i = 0; i < SLOTS; i++) {
+			for (unsigned k = 0; k < 6; k++) {
+				if (slot_us[i] > slot_us[top[k]]) {
+					memmove(&top[k + 1], &top[k], (5 - k) * sizeof(top[0]));
+					top[k] = i;
+					break;
+				}
+			}
+		}
+		for (unsigned k = 0; k < 6 && used < sizeof(list); k++) {
+			used += (size_t)snprintf(list + used, sizeof(list) - used, " %s %llu", eagl_slot_name(top[k] * 8),
+			    slot_us[top[k]] / frames);
+		}
+		say("sweet-gl: perf us a frame by function:%s\n", list);
+		bzero(slot_us, sizeof(slot_us));
+	}
 	frames = 0;
 }
 
@@ -5239,6 +5288,33 @@ install_texture_functions(void)
 	}
 }
 
+/*
+ * (op5) NAME=VALUE lines of a file put into the environment for the library, like boot-arg glenv=
+ * but changed without a reboot: the window server reads it when it starts (kill backboardd).
+ */
+static void
+env_from_file(const char *path)
+{
+	char line[160];
+	FILE *file = fopen(path, "r");
+
+	if (file == NULL) {
+		return;
+	}
+	while (fgets(line, sizeof(line), file) != NULL) {
+		char *value = strchr(line, '=');
+
+		line[strcspn(line, "\r\n")] = 0;
+		if (line[0] == '#' || value == NULL || value == line) {
+			continue;
+		}
+		*value = 0;
+		setenv(line, value + 1, 1);
+		say("sweet-gl: in the environment (%s): %s=%s\n", path, line, value + 1);
+	}
+	fclose(file);
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -5376,6 +5452,7 @@ install(void)
 		}
 	}
 
+	env_from_file("/usr/local/lib/glenv");
 	sweet_prof_start();
 	install_texture_functions();
 	if (class == Nil && dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY) != NULL) {

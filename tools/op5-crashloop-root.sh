@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 SSH=(ssh -F ../dumps/ssh_config op5)
 SCP=(scp -O -F ../dumps/ssh_config)
 DIS=/private/var/db/com.apple.xpc.launchd/disabled.plist
-JOBS=(com.apple.nanotimekitcompaniond)
+JOBS=(com.apple.nanotimekitcompaniond com.apple.voicemail.vmd)
 APPEX=(
 	/System/Library/PrivateFrameworks/TextToSpeechKonaSupport.framework/PlugIns/KonaSynthesizer.appex
 	/System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex
