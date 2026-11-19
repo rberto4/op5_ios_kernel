@@ -1,0 +1,1027 @@
+From 1e570c771aa156ee75b45ce7226d7f89c003af01 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 23:26:39 +0100
+Subject: [PATCH] cheeseburger: modem W2 part 2: SMP2P out, MPSS load + auth,
+ SMP2P watch (steps 7-10)
+
+sweet_mpss.c: outbound SMP2P item 428 under TCSR mutex 3, modem.mdt metadata auth, modem.bNN segments via unmappable 1 MiB windows, AUTH_COMPLETE, inbound 435 negotiation/SSR ack/ready, clean stop. sweet_mss.c: Linux-style ownership masks, shared header, steps 1-10.
+---
+ bsd/conf/files       |   1 +
+ bsd/dev/sweet_mpss.c | 565 +++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_mss.c  | 190 ++++++++++-----
+ bsd/dev/sweet_mss.h  |  51 ++++
+ 4 files changed, 747 insertions(+), 60 deletions(-)
+ create mode 100644 bsd/dev/sweet_mpss.c
+ create mode 100644 bsd/dev/sweet_mss.h
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a43e364..2c80b17 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_a540.c			standard
+ bsd/dev/sweet_a540_b.c			standard
+ bsd/dev/sweet_mss.c			standard
++bsd/dev/sweet_mpss.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+new file mode 100644
+index 0000000..5187032
+--- /dev/null
++++ b/bsd/dev/sweet_mpss.c
+@@ -0,0 +1,565 @@
++/*
++ * Modem W2 part 2 for cheeseburger (OnePlus 5, MSM8998): from "MBA alive"
++ * (sweet_mss.c steps 1-6) to a running, authenticated modem firmware.
++ *
++ *   7  SMP2P: our outbound item 428 in the apps<->modem SMEM partition
++ *      (qcom_smem_alloc_private under TCSR mutex 3 + qcom_smp2p_alloc_outbound_item,
++ *      "master-kernel" entry), doorbell APCS IPC bit 14
++ *   8  modem.mdt metadata (ELF header + hash) to MBA: META_DATA_READY -> status 3
++ *   9  modem.bNN segments into the MPSS carve-out, LOAD_READY, code length,
++ *      carve-out to the modem -> status 4 "MPSS AUTHENTICATED"
++ *  10  watch the modem's inbound item 435 (negotiation, SSR ack) for
++ *      kern.sweetmss_hold seconds: "slave-kernel" bit 1 = "MPSS READY"
++ *
++ * Linux v6.12: remoteproc/qcom_q6v5_mss.c (q6v5_mpss_init_image,
++ * q6v5_mpss_load, q6v5_start), qcom_q6v5.c (request_stop), soc/qcom/
++ * mdt_loader.c (qcom_mdt_read_metadata), smem.c, smp2p.c, hwspinlock/
++ * qcom_hwspinlock.c; msm8998.dtsi smp2p-mpss: items <435>, <428>, local pid 0,
++ * remote pid 1, mboxes <&apcs_glb 14>.
++ *
++ * Carve-out windows are ml_io_map_unmappable (kernel_map; the I/O submap is
++ * only 8 MiB) write-combined, and are unmapped before the region goes to the
++ * modem. The SMEM partition stays mapped (the modem may keep running).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include "sweet_mss.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++
++#define WIMG_WCOMB      0x6             /* VM_WIMG_WCOMB: normal non-cacheable */
++#define MDATA_PA        0xb0000000u     /* low bank, unused by xnu (--highmem), Linux mdata range */
++#define MDT_MAX         0x10000u
++#define CHUNK           0x100000u
++#define SEG_MAX         64
++
++#define SMEM_PA         0x86000000u
++#define SMEM_SIZE       0x00200000u
++#define TCSR_MUTEX3_PA  0x01f43000u     /* tcsr_mutex 0x1f40000, stride 0x1000, lock 3 */
++#define APCS_PA         0x17911000u     /* apcs_glb; IPC doorbell at +8 */
++#define MPSS_DOORBELL   (1u << 14)
++#define APPS_PROC_ID    1
++
++#define SMP2P_IN        435
++#define SMP2P_OUT       428
++#define SMP2P_MAGIC     0x504d5324u     /* "$SMP" */
++#define SMP2P_ITEM_SIZE 340             /* 20 B header + 16 entries x 20 B */
++#define SMEM_CANARY     0xa5a5u
++
++/* ELF32 */
++#define PT_LOAD_        1
++#define MDT_TYPE(f)     (((f) >> 24) & 7)
++#define MDT_TYPE_HASH   2
++#define MDT_RELOC       (1u << 27)
++
++struct phdr32 {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++static vm_offset_t smem_ptable, smem_part, mutex3, apcs;
++static uint32_t part_size;
++static vm_offset_t smp2p_out;   /* our item, in smem_part */
++static bool negotiated, ssr_ack_enabled, ssr_ack;
++
++#define rd sweet_mss_rd
++#define wr sweet_mss_wr
++
++static void
++kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(apcs, 8, MPSS_DOORBELL);
++}
++
++/* ---- carve-out windows ---- */
++
++struct win {
++	vm_offset_t va, base;
++	vm_size_t len;
++};
++
++static bool
++win_map(struct win *w, uint64_t pa, size_t len)
++{
++	w->va = ml_io_map_unmappable((vm_offset_t)pa, len, WIMG_WCOMB);
++	w->base = w->va & ~(vm_offset_t)PAGE_MASK;
++	w->len = round_page(len + (w->va - w->base));
++	return w->va != 0;
++}
++
++static void
++win_unmap(struct win *w)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap(w->base, w->len);
++	w->va = 0;
++}
++
++/* ---- SMEM (smem.c) ---- */
++
++static bool
++smem_map(void)
++{
++	if (smem_part) {
++		return true;
++	}
++	smem_ptable = ml_io_map(SMEM_PA + SMEM_SIZE - 0x1000, 0x1000);
++	mutex3 = ml_io_map(TCSR_MUTEX3_PA, 0x1000);
++	apcs = ml_io_map(APCS_PA, 0x1000);
++	if (rd(smem_ptable, 0) != 0x434f5424u) {        /* "$TOC" */
++		printf("SWEET MPSS: no SMEM ptable\n");
++		return false;
++	}
++	uint32_t n = rd(smem_ptable, 8);
++	for (uint32_t i = 0; i < n && i < 32; ++i) {
++		vm_offset_t e = smem_ptable + 32 + 48 * i;
++		uint32_t off = rd(e, 0), size = rd(e, 4), hosts = rd(e, 12);
++		if ((hosts == 1 || hosts == 0x10000) && off && size && off + size <= SMEM_SIZE) {
++			smem_part = ml_io_map_unmappable(SMEM_PA + off, size, WIMG_WCOMB);
++			part_size = size;
++			printf("SWEET MPSS: apps<->modem partition +%#x size %#x free %#x/%#x\n", off, size,
++			    rd(smem_part, 12), rd(smem_part, 16));
++			return rd(smem_part, 0) == 0x54525024u;         /* "$PRT" */
++		}
++	}
++	printf("SWEET MPSS: no apps<->modem partition\n");
++	return false;
++}
++
++/* Find a private uncached item; returns its data address or 0. */
++static vm_offset_t
++smem_find(uint32_t item, uint32_t *size_out)
++{
++	uint32_t end = rd(smem_part, 12);
++	uint32_t off = 32;
++	while (off + 16 <= end && end <= part_size) {
++		uint32_t w0 = rd(smem_part, off), size = rd(smem_part, off + 4);
++		uint32_t pad = rd(smem_part, off + 8) >> 16;
++		if ((w0 & 0xffff) != SMEM_CANARY) {
++			printf("SWEET MPSS: bad SMEM canary at +%#x\n", off);
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*size_out = size;
++			return smem_part + off + 16 + pad;
++		}
++		off += 16 + pad + size;
++	}
++	return 0;
++}
++
++static bool
++hwlock(void)
++{
++	for (unsigned i = 0; i < 1000000; ++i) {
++		wr(mutex3, 0, APPS_PROC_ID);
++		if (rd(mutex3, 0) == APPS_PROC_ID) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* qcom_smem_alloc_private; nothing is printed while the lock is held. */
++static int
++smem_alloc(uint32_t item, uint32_t size)
++{
++	uint32_t asize = (size + 7) & ~7u, have = 0;
++	if (smem_find(item, &have)) {
++		return have >= size ? 0 : EEXIST;
++	}
++	if (!hwlock()) {
++		return EBUSY;
++	}
++	uint32_t end = rd(smem_part, 12), cached = rd(smem_part, 16);
++	int err = 0;
++	if (end + 16 + asize > cached || cached > part_size) {
++		err = ENOSPC;
++	} else {
++		wr(smem_part, end, SMEM_CANARY | item << 16);
++		wr(smem_part, end + 4, asize);
++		wr(smem_part, end + 8, asize - size);   /* padding_data, padding_hdr 0 */
++		wr(smem_part, end + 12, 0);
++		wr(smem_part, 12, end + 16 + asize);    /* wr() orders the header first */
++	}
++	wr(mutex3, 0, 0);
++	return err;
++}
++
++/* ---- SMP2P (smp2p.c) ---- */
++
++static int
++smp2p_alloc_out(struct mss_state *s)
++{
++	uint32_t size = 0;
++	int err = smem_alloc(SMP2P_OUT, SMP2P_ITEM_SIZE);
++	smp2p_out = err ? 0 : smem_find(SMP2P_OUT, &size);
++	printf("SWEET MPSS: SMEM item %u: err %d at +%#lx size %u\n", SMP2P_OUT, err,
++	    smp2p_out ? (unsigned long)(smp2p_out - smem_part) : 0ul, size);
++	if (!smp2p_out) {
++		return err ? err : ENOENT;
++	}
++	for (uint32_t o = 0; o < SMP2P_ITEM_SIZE; o += 4) {
++		wr(smp2p_out, o, 0);
++	}
++	wr(smp2p_out, 0, SMP2P_MAGIC);
++	wr(smp2p_out, 4, 1u << 8);              /* version 0 (not valid yet), features SSR_ACK */
++	wr(smp2p_out, 8, 0 | 1u << 16);         /* local pid 0, remote pid 1 */
++	wr(smp2p_out, 12, 16);                  /* total 16, valid 0 */
++	wr(smp2p_out, 4, 1 | 1u << 8);          /* version 1 last */
++	kick();
++	static const char name[16] = "master-kernel";
++	for (uint32_t o = 0; o < 16; o += 4) {
++		wr(smp2p_out, 20 + o, (uint32_t)(uint8_t)name[o] | (uint32_t)(uint8_t)name[o + 1] << 8 |
++		    (uint32_t)(uint8_t)name[o + 2] << 16 | (uint32_t)(uint8_t)name[o + 3] << 24);
++	}
++	wr(smp2p_out, 36, 0);
++	wr(smp2p_out, 12, 16 | 1u << 16);       /* valid 1 */
++	kick();
++	negotiated = ssr_ack_enabled = ssr_ack = false;
++	s->smp2p_out = true;
++	return 0;
++}
++
++/* One poll of the inbound item: negotiation, SSR ack, entries; returns slave-kernel value or ~0. */
++static uint32_t
++smp2p_poll(uint32_t *last, unsigned nlast, bool *seen_hdr)
++{
++	uint32_t size = 0;
++	vm_offset_t in = smem_find(SMP2P_IN, &size);
++	if (!in || rd(in, 0) != SMP2P_MAGIC) {
++		return ~0u;
++	}
++	uint32_t vf = rd(in, 4), pids = rd(in, 8), tv = rd(in, 12), flags = rd(in, 16);
++	if (!*seen_hdr) {
++		printf("SWEET MPSS: inbound %u: version %u features %#x pid %u->%u entries %u/%u flags %#x\n",
++		    SMP2P_IN, vf & 0xff, vf >> 8, pids & 0xffff, pids >> 16, tv >> 16, tv & 0xffff, flags);
++		*seen_hdr = true;
++	}
++	uint32_t outvf = rd(smp2p_out, 4);
++	if (!negotiated && (vf & 0xff) == (outvf & 0xff)) {
++		uint32_t feat = (outvf >> 8) & (vf >> 8);
++		wr(smp2p_out, 4, (outvf & 0xff) | feat << 8);
++		negotiated = true;
++		ssr_ack_enabled = feat & 1;
++		printf("SWEET MPSS: SMP2P negotiated, features %#x\n", feat);
++	}
++	if (ssr_ack_enabled && (flags & 1) != ssr_ack) {
++		ssr_ack = flags & 1;
++		wr(smp2p_out, 16, (rd(smp2p_out, 16) & ~2u) | (ssr_ack ? 2u : 0));
++		kick();
++		printf("SWEET MPSS: SSR ack %d\n", ssr_ack);
++	}
++	uint32_t valid = tv >> 16, slave = ~0u;
++	for (uint32_t i = 0; i < valid && i < 16 && i < nlast; ++i) {
++		char name[17];
++		for (uint32_t o = 0; o < 16; o += 4) {
++			uint32_t w = rd(in, 20 + 20 * i + o);
++			for (uint32_t k = 0; k < 4; ++k) {
++				name[o + k] = (char)(w >> (8 * k));
++			}
++		}
++		name[16] = 0;
++		uint32_t v = rd(in, 36 + 20 * i);
++		if (v != last[i]) {
++			printf("SWEET MPSS: inbound entry %u \"%s\" = %#x\n", i, name, v);
++			last[i] = v;
++		}
++		if (strncmp(name, "slave-kernel", 16) == 0) {
++			slave = v;
++		}
++	}
++	return slave;
++}
++
++/* ---- MPSS image (mdt_loader.c, q6v5_mpss_init_image / q6v5_mpss_load) ---- */
++
++static const struct phdr32 *
++mdt_phdrs(const uint8_t *mdt, size_t len, uint32_t *n_out)
++{
++	uint32_t phoff = *(const uint32_t *)(const void *)(mdt + 0x1c);
++	uint32_t n = *(const uint16_t *)(const void *)(mdt + 0x2c);
++	if (len < 52 || *(const uint32_t *)(const void *)mdt != 0x464c457fu || mdt[4] != 1 ||
++	    n < 2 || n > SEG_MAX || phoff + n * sizeof(struct phdr32) > len) {
++		return NULL;
++	}
++	*n_out = n;
++	return (const struct phdr32 *)(const void *)(mdt + phoff);
++}
++
++/* Step 8 */
++static int
++mpss_metadata(const uint8_t *mdt, size_t len, const struct phdr32 *ph, uint32_t n)
++{
++	uint32_t hash = 0;
++	for (uint32_t i = 1; i < n && !hash; ++i) {
++		hash = MDT_TYPE(ph[i].flags) == MDT_TYPE_HASH ? i : 0;
++	}
++	uint32_t ehdr = ph[0].filesz, hsize = hash ? ph[hash].filesz : 0;
++	uint32_t hoff = ehdr + hsize == len ? ehdr : ph[hash].offset;
++	if (!hash || ph[0].type == PT_LOAD_ || ehdr > len || hoff + hsize > len) {
++		printf("SWEET MPSS: modem.mdt: no usable header/hash (hash ph%u)\n", hash);
++		return EINVAL;
++	}
++	uint32_t mlen = ehdr + hsize;
++	struct win w;
++	if (!win_map(&w, MDATA_PA, mlen)) {
++		return ENOMEM;
++	}
++	memcpy((void *)w.va, mdt, ehdr);
++	memcpy((void *)(w.va + ehdr), mdt + hoff, hsize);
++	win_unmap(&w);
++	vm_offset_t rmb = sweet_mss_rmb();
++	wr(rmb, RMB_PMI_CODE_LENGTH, 0);
++	uint64_t perm = 1ull << VMID_HLOS;
++	if (sweet_mss_xfer(MDATA_PA, mlen, &perm, false, true)) {
++		return EIO;
++	}
++	wr(rmb, RMB_PMI_META_DATA, MDATA_PA);
++	wr(rmb, RMB_MBA_COMMAND, 1);            /* RMB_CMD_META_DATA_READY */
++	int32_t st = 0;
++	unsigned ms;
++	for (ms = 0; ms <= 1000; ++ms) {
++		st = (int32_t)rd(rmb, RMB_MBA_STATUS);
++		if (st < 0 || st == 3) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET MPSS: metadata %u B (header %u + hash ph%u %u): MBA status %d after %u ms\n", mlen,
++	    ehdr, hash, hsize, st, ms);
++	if (sweet_mss_xfer(MDATA_PA, mlen, &perm, true, false)) {
++		printf("SWEET MPSS: metadata buffer not reclaimed (outside xnu RAM; harmless)\n");
++	}
++	return st == 3 ? 0 : EACCES;
++}
++
++/* Copy one segment file into [pa, pa + memsz) in 1 MiB windows, zero the tail. */
++static int
++load_segment(uint32_t idx, uint64_t pa, uint32_t filesz, uint32_t memsz, uint8_t *buf)
++{
++	char name[64];
++	snprintf(name, sizeof(name), "%smodem.b%02u", MSS_FW_DIR, idx);
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int err = filesz ? vnode_open(name, FREAD, 0, 0, &vp, ctx) : 0;
++	if (err) {
++		printf("SWEET MPSS: %s: open error %d\n", name, err);
++		return err;
++	}
++	for (uint32_t off = 0; off < memsz && !err; off += CHUNK) {
++		uint32_t n = memsz - off < CHUNK ? memsz - off : CHUNK;
++		uint32_t fn = off < filesz ? (filesz - off < n ? filesz - off : n) : 0;
++		int resid = 0;
++		if (fn) {
++			err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)fn, (off_t)off, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			err = err ? err : (resid ? EIO : 0);
++		}
++		struct win w;
++		if (!err && win_map(&w, pa + off, n)) {
++			memcpy((void *)w.va, buf, fn);
++			bzero((void *)(w.va + fn), n - fn);
++			win_unmap(&w);
++		}
++	}
++	if (vp) {
++		vnode_close(vp, FREAD, ctx);
++	}
++	if (err) {
++		printf("SWEET MPSS: %s: read error %d\n", name, err);
++	}
++	return err;
++}
++
++/* Step 9 */
++static int
++mpss_segments(struct mss_state *s, const struct phdr32 *ph, uint32_t n)
++{
++	uint64_t min = ~0ull;
++	bool reloc = false;
++	for (uint32_t i = 0; i < n; ++i) {
++		if (ph[i].type == PT_LOAD_ && MDT_TYPE(ph[i].flags) != MDT_TYPE_HASH && ph[i].memsz) {
++			reloc |= (ph[i].flags & MDT_RELOC) != 0;
++			min = ph[i].paddr < min ? ph[i].paddr : min;
++		}
++	}
++	uint64_t base = reloc ? min : MPSS_PA;
++	if (sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &s->mpss_perm, true, false) ||
++	    sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &s->mpss_perm, true, true)) {
++		return EIO;
++	}
++	s->mpss_loading = true;
++	uint8_t *buf = kalloc_data(CHUNK, Z_WAITOK);
++	if (!buf) {
++		return ENOMEM;
++	}
++	vm_offset_t rmb = sweet_mss_rmb();
++	uint32_t size = 0, nseg = 0;
++	uint64_t t0 = mach_absolute_time();
++	int err = 0;
++	for (uint32_t i = 0; i < n && !err; ++i) {
++		if (ph[i].type != PT_LOAD_ || MDT_TYPE(ph[i].flags) == MDT_TYPE_HASH || !ph[i].memsz) {
++			continue;
++		}
++		uint64_t off = ph[i].paddr - base;
++		if (ph[i].paddr < base || off + ph[i].memsz > MPSS_SIZE || ph[i].filesz > ph[i].memsz) {
++			printf("SWEET MPSS: ph%u outside the carve-out or filesz > memsz\n", i);
++			err = EINVAL;
++			break;
++		}
++		err = load_segment(i, MPSS_PA + off, ph[i].filesz, ph[i].memsz, buf);
++		size += ph[i].memsz;
++		nseg++;
++		if (!err && rd(rmb, RMB_PMI_CODE_LENGTH) == 0) {
++			wr(rmb, RMB_PMI_CODE_START, reloc ? MPSS_PA : (uint32_t)min);
++			wr(rmb, RMB_MBA_COMMAND, 2);    /* RMB_CMD_LOAD_READY */
++		}
++		wr(rmb, RMB_PMI_CODE_LENGTH, size);
++		if (!err && (int32_t)rd(rmb, RMB_MBA_STATUS) < 0) {
++			printf("SWEET MPSS: MBA rejected ph%u: status %d\n", i, (int32_t)rd(rmb, RMB_MBA_STATUS));
++			err = EACCES;
++		}
++	}
++	kfree_data(buf, CHUNK);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET MPSS: %u segments, code length %#x, %llu ms, MBA status %d\n", nseg, size,
++	    ns / 1000000, (int32_t)rd(rmb, RMB_MBA_STATUS));
++	return err;
++}
++
++/* Step 9 end: MPSS to the modem only, wait RMB_MBA_AUTH_COMPLETE. */
++static int
++mpss_auth(struct mss_state *s)
++{
++	if (sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &s->mpss_perm, false, true)) {
++		return EIO;
++	}
++	vm_offset_t rmb = sweet_mss_rmb();
++	int32_t st = 0;
++	unsigned ms;
++	for (ms = 0; ms <= 10000; ++ms) {
++		st = (int32_t)rd(rmb, RMB_MBA_STATUS);
++		if (st < 0 || st == 4) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("SWEET MPSS: MBA status %d after %u ms%s\n", st, ms, st == 4 ? ": MPSS AUTHENTICATED" : "");
++	s->mpss_running = st == 4;
++	return st == 4 ? 0 : EACCES;
++}
++
++/* Step 10 */
++static bool
++smp2p_watch(struct mss_state *s, int hold_s)
++{
++	uint32_t last[16];
++	bool seen = false, found = false;
++	memset(last, 0xff, sizeof(last));
++	for (int i = 0; i < hold_s * 10; ++i) {
++		uint32_t v = smp2p_poll(last, 16, &seen);
++		if (seen && !found) {
++			found = true;
++		}
++		if (v != ~0u && (v & 1)) {
++			printf("SWEET MPSS: slave-kernel fatal bit set (%#x)\n", v);
++			s->ready = false;
++			return false;
++		}
++		if (v != ~0u && (v & 2) && !s->ready) {
++			s->ready = true;
++			printf("SWEET MPSS: MPSS READY after %d ms\n", i * 100);
++			/* q6v5_start: the MBA region goes back to HLOS once the modem runs */
++			(void)sweet_mss_xfer(MBA_PA, MBA_SIZE, &s->mba_perm, true, false);
++		}
++		delay(100 * 1000);
++	}
++	if (!found) {
++		printf("SWEET MPSS: inbound item %u never appeared\n", SMP2P_IN);
++	}
++	return s->ready;
++}
++
++void
++sweet_mpss_request_stop(struct mss_state *s)
++{
++	if (!smp2p_out || !s->ready) {
++		return;
++	}
++	wr(smp2p_out, 36, rd(smp2p_out, 36) | 1);       /* master-kernel bit 0 = stop */
++	kick();
++	uint32_t last[16];
++	bool seen = true;
++	unsigned ms = 0;
++	memset(last, 0xff, sizeof(last));
++	for (; ms < 5000; ms += 10) {
++		uint32_t v = smp2p_poll(last, 16, &seen);
++		if (v != ~0u && (v & 8)) {
++			break;
++		}
++		delay(10 * 1000);
++	}
++	wr(smp2p_out, 36, rd(smp2p_out, 36) & ~1u);
++	kick();
++	printf("SWEET MPSS: stop request: %s after %u ms\n", ms < 5000 ? "stop-ack" : "no ack", ms);
++}
++
++int
++sweet_mpss_run(struct mss_state *s, int last, int hold_s)
++{
++	int reached = 6;
++	size_t len = 0;
++	uint8_t *mdt = NULL;
++	uint32_t n = 0;
++	const struct phdr32 *ph;
++	sweet_mss_announce(7, "SMP2P outbound item 428 (first write into shared SMEM)");
++	if (!smem_map() || smp2p_alloc_out(s)) {
++		return reached;
++	}
++	reached = 7;
++	if (last < 8) {
++		return reached;
++	}
++	sweet_mss_announce(8, "modem.mdt metadata to the MBA");
++	mdt = sweet_mss_read_file("modem.mdt", MDT_MAX, &len);
++	ph = mdt ? mdt_phdrs(mdt, len, &n) : NULL;
++	if (!ph || mpss_metadata(mdt, len, ph, n)) {
++		goto out;
++	}
++	reached = 8;
++	if (last < 9) {
++		goto out;
++	}
++	sweet_mss_announce(9, "load modem.bNN into MPSS and authenticate");
++	if (mpss_segments(s, ph, n) || mpss_auth(s)) {
++		goto out;
++	}
++	reached = 9;
++	if (last < 10) {
++		goto out;
++	}
++	sweet_mss_announce(10, "watch the modem's SMP2P state");
++	if (smp2p_watch(s, hold_s > 0 ? hold_s : 20)) {
++		reached = 10;
++	}
++out:
++	if (mdt) {
++		kfree_data(mdt, MDT_MAX);
++	}
++	return reached;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+index 4d32e3d..276a95a 100644
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -13,6 +13,7 @@
+  *       4 GCC clocks + MSS restart deassert
+  *       5 SCM hyp-assign MPSS + MBA carve-outs HLOS -> MSS_MSA
+  *       6 QDSP6 power-up, wait PBL and MBA status ("MBA ALIVE")
++ *       7-10 MPSS load and SMP2P (sweet_mpss.c)
+  *
+  * Sequence: Linux v6.12 drivers/remoteproc/qcom_q6v5_mss.c (msm8998_mss,
+  * MSS_MSM8998: q6v5_load, q6v5_mba_load, q6v5proc_reset, q6v5_mba_reclaim),
+@@ -40,16 +41,12 @@
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <vm/pmap.h>
++#include "sweet_mss.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ 
+-/* Carve-outs (phone DT / Android dmesg) */
+-#define MPSS_PA         0x8d000000u
+-#define MPSS_SIZE       0x07000000u
+-#define MBA_PA          0x94500000u
+-#define MBA_SIZE        0x00200000u
+ #define MBA_MAX         0x00100000u     /* q6v5_load: MBA at most 1 MiB */
+ #define MBA_MAP         0x00040000u     /* CPU window: the phone's mba.mbn is 230056 B */
+ /*
+@@ -58,7 +55,6 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+  * with 3"): map only the pages that are read or written, once per boot.
+  */
+ #define WIN             0x4000u
+-#define MSS_FW_PATH     "/usr/local/share/op5fw/mba.mbn"
+ 
+ /* MMIO */
+ #define QDSP6_PA        0x04080000u
+@@ -81,10 +77,6 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ #define CBCR_EN                 (1u << 0)
+ #define CBCR_OFF                (1u << 31)
+ 
+-/* RMB */
+-#define RMB_MBA_IMAGE           0x00
+-#define RMB_PBL_STATUS          0x04
+-#define RMB_MBA_STATUS          0x0c
+ /* QDSP6SS */
+ #define Q6_RESET                0x014
+ #define Q6_GFMUX_CTL            0x020
+@@ -127,8 +119,6 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ #define SCM_MP_ASSIGN           0x16
+ #define SCM_VAL                 0
+ #define SCM_RO                  1
+-#define VMID_HLOS               3
+-#define VMID_MSS_MSA            15
+ #define PERM_RW                 0x6
+ #define PERM_RWX                0x7
+ 
+@@ -137,15 +127,9 @@ static LCK_MTX_DECLARE(sweet_mss_lock, &sweet_mss_grp);
+ 
+ static vm_offset_t gcc, halt, q6, rmb, mba_win, smem_hdr, smem_pt, smem_part;
+ static uint32_t smem_part_off;
+-static int probe_result, step_result, mss_keep, mba_status;
++static int probe_result, step_result, mss_keep, mba_status, mss_hold = 20;
+ static bool mss_dirty;          /* a teardown left something unreclaimed: no more runs */
+ 
+-/* What this run changed, for the teardown. */
+-struct mss_state {
+-	bool voted, gcc_on[4], rom_voted, gpll0_voted, reset_released;
+-	bool mpss_assigned, mba_assigned, booted, alive;
+-};
+-
+ /* ---- MMIO helpers ---- */
+ 
+ static uint32_t
+@@ -164,6 +148,24 @@ wr(vm_offset_t base, uint32_t off, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++uint32_t
++sweet_mss_rd(vm_offset_t base, uint32_t off)
++{
++	return rd(base, off);
++}
++
++void
++sweet_mss_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	wr(base, off, v);
++}
++
++vm_offset_t
++sweet_mss_rmb(void)
++{
++	return rmb;
++}
++
+ /* Poll until (reg & mask) == want; true on success. */
+ static bool
+ poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
+@@ -197,6 +199,12 @@ announce(int step, const char *what)
+ 	delay(1500 * 1000);
+ }
+ 
++void
++sweet_mss_announce(int step, const char *what)
++{
++	announce(step, what);
++}
++
+ /* ---- TrustZone (SMCCC SIP, 64-bit; same calling convention as the GPU zap loader) ---- */
+ 
+ struct scm_res {
+@@ -245,12 +253,13 @@ dcache_clean(vm_offset_t va, size_t len)
+ }
+ 
+ /*
+- * qcom_scm_assign_mem: one region, one source VMID, one destination. The
+- * buffer (src list @0, mem_map @64, dest list @128, extra args @192) must be
+- * physically contiguous; TZ reads it from memory, so it is cleaned to PoC.
++ * qcom_scm_assign_mem for one region. Buffer layout as Linux: source VMIDs
++ * @0, mem_map @64, destination perms @128 (24 B each), extra SMC args @256.
++ * It must be physically contiguous and is cleaned to PoC (TZ reads memory).
+  */
+ static int
+-scm_assign(uint32_t pa, uint32_t size, uint32_t src_vmid, uint32_t dst_vmid, uint32_t perm)
++scm_assign(uint32_t pa, uint32_t size, uint64_t src_bits, const uint32_t *dst, const uint32_t *perm,
++    unsigned ndst)
+ {
+ 	uint8_t *buf = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_ZERO);
+ 	if (!buf) {
+@@ -258,34 +267,68 @@ scm_assign(uint32_t pa, uint32_t size, uint32_t src_vmid, uint32_t dst_vmid, uin
+ 	}
+ 	vm_offset_t va = (vm_offset_t)buf;
+ 	uint64_t pa0 = ptoa_64(pmap_find_phys(kernel_pmap, va)) + (va & PAGE_MASK);
+-	uint64_t pa1 = ptoa_64(pmap_find_phys(kernel_pmap, va + 255)) + ((va + 255) & PAGE_MASK);
++	uint64_t pa1 = ptoa_64(pmap_find_phys(kernel_pmap, va + 511)) + ((va + 511) & PAGE_MASK);
+ 	int err = 0;
+-	if (pa0 == 0 || pa1 != pa0 + 255) {
++	if (pa0 == 0 || pa1 != pa0 + 511) {
+ 		printf("SWEET MSS: SCM buffer not contiguous (%#llx, %#llx)\n", pa0, pa1);
+ 		err = EFAULT;
+ 		goto out;
+ 	}
+-	*(uint32_t *)(buf + 0) = src_vmid;
+-	*(uint64_t *)(buf + 64) = pa;
+-	*(uint64_t *)(buf + 72) = size;
+-	*(uint32_t *)(buf + 128) = dst_vmid;    /* vmid, perm, ctx (u64), ctx_size, pad: 24 B */
+-	*(uint32_t *)(buf + 132) = perm;
+-	uint64_t *ext = (uint64_t *)(void *)(buf + 192);
+-	ext[0] = 4;                     /* args[3] src_sz */
++	uint32_t nsrc = 0;
++	for (uint32_t b = 0; b < 64 && nsrc < 16; ++b) {
++		if (src_bits & (1ull << b)) {
++			*(uint32_t *)(void *)(buf + 4 * nsrc++) = b;
++		}
++	}
++	*(uint64_t *)(void *)(buf + 64) = pa;
++	*(uint64_t *)(void *)(buf + 72) = size;
++	for (unsigned i = 0; i < ndst; ++i) {
++		*(uint32_t *)(void *)(buf + 128 + 24 * i) = dst[i];     /* vmid, perm, ctx, ctx_size, pad */
++		*(uint32_t *)(void *)(buf + 132 + 24 * i) = perm[i];
++	}
++	uint64_t *ext = (uint64_t *)(void *)(buf + 256);
++	ext[0] = 4 * nsrc;              /* args[3] src_sz */
+ 	ext[1] = pa0 + 128;             /* args[4] dest */
+-	ext[2] = 24;                    /* args[5] dest_sz */
++	ext[2] = 24 * ndst;             /* args[5] dest_sz */
+ 	ext[3] = 0;                     /* args[6] */
+-	dcache_clean(va, 256);
++	dcache_clean(va, 512);
+ 	/* QCOM_SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL): args 0-2 in x2-x4, 3-6 via x5 */
+-	struct scm_res r = scm_call(SCM_SVC_MP, SCM_MP_ASSIGN, 0x1117, pa0 + 64, 16, pa0, pa0 + 192);
+-	printf("SWEET MSS: hyp-assign %#x+%#x vmid %u -> %u perm %#x: a0 %lld a1 %lld\n", pa, size,
+-	    src_vmid, dst_vmid, perm, (long long)r.a0, (long long)r.a1);
++	struct scm_res r = scm_call(SCM_SVC_MP, SCM_MP_ASSIGN, 0x1117, pa0 + 64, 16, pa0, pa0 + 256);
++	printf("SWEET MSS: hyp-assign %#x+%#x src %#llx -> %u dest(s) %u/%#x: a0 %lld a1 %lld\n", pa,
++	    size, src_bits, ndst, dst[0], perm[0], (long long)r.a0, (long long)r.a1);
+ 	err = (r.a0 == 0 && r.a1 == 0) ? 0 : EIO;
+ out:
+ 	kfree_data(buf, PAGE_SIZE);
+ 	return err;
+ }
+ 
++int
++sweet_mss_xfer(uint32_t pa, uint32_t size, uint64_t *perm, bool local, bool remote)
++{
++	uint64_t hlos = 1ull << VMID_HLOS, mss = 1ull << VMID_MSS_MSA;
++	if (local == !!(*perm & hlos) && remote == !!(*perm & mss)) {
++		return 0;
++	}
++	uint32_t dst[2], prm[2];
++	unsigned n = 0;
++	if (local) {
++		dst[n] = VMID_HLOS;
++		prm[n++] = PERM_RWX;
++	}
++	if (remote) {
++		dst[n] = VMID_MSS_MSA;
++		prm[n++] = PERM_RW;
++	}
++	if (n == 0) {
++		return EINVAL;
++	}
++	int err = scm_assign(pa, (size + 0xfffu) & ~0xfffu, *perm, dst, prm, n);
++	if (!err) {
++		*perm = (local ? hlos : 0) | (remote ? mss : 0);
++	}
++	return err;
++}
++
+ /* ---- W1: read-only probe ---- */
+ 
+ static void
+@@ -382,37 +425,55 @@ mss_probe(void)
+ 
+ /* ---- W2 steps ---- */
+ 
+-/* Step 1: mba.mbn from the root (copied there from the modem partition). */
+-static uint8_t *
+-read_mba(size_t *len_out)
++uint8_t *
++sweet_mss_read_file(const char *name, size_t max, size_t *len_out)
+ {
++	char path[96];
++	snprintf(path, sizeof(path), "%s%s", MSS_FW_DIR, name);
+ 	vfs_context_t ctx = vfs_context_current();
+ 	vnode_t vp = NULLVP;
+-	int err = vnode_open(MSS_FW_PATH, FREAD, 0, 0, &vp, ctx);
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+ 	if (err) {
+-		printf("SWEET MSS: %s: open error %d\n", MSS_FW_PATH, err);
++		printf("SWEET MSS: %s: open error %d\n", path, err);
+ 		return NULL;
+ 	}
+-	uint8_t *buf = kalloc_data(MBA_MAX, Z_WAITOK | Z_ZERO);
++	uint8_t *buf = kalloc_data(max, Z_WAITOK | Z_ZERO);
+ 	int resid = 0;
+ 	if (buf) {
+-		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)MBA_MAX, 0, UIO_SYSSPACE, 0,
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)max, 0, UIO_SYSSPACE, 0,
+ 		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+ 	}
+ 	vnode_close(vp, FREAD, ctx);
+-	size_t len = MBA_MAX - (size_t)resid;
+-	if (!buf || err || len < 52 || len > MBA_MAP || *(uint32_t *)(void *)buf != 0x464c457fu) {
+-		printf("SWEET MSS: mba.mbn unusable (err %d, %zu bytes)\n", err, buf ? len : 0);
++	size_t len = max - (size_t)resid;
++	if (!buf || err || len == 0 || len == max) {
++		printf("SWEET MSS: %s unusable (err %d, %zu bytes)\n", path, err, buf ? len : 0);
+ 		if (buf) {
+-			kfree_data(buf, MBA_MAX);
++			kfree_data(buf, max);
+ 		}
+ 		return NULL;
+ 	}
+-	printf("SWEET MSS: mba.mbn %zu bytes, ELF ok\n", len);
+ 	*len_out = len;
+ 	return buf;
+ }
+ 
++/* Step 1: mba.mbn from the root (copied there from the modem partition). */
++static uint8_t *
++read_mba(size_t *len_out)
++{
++	size_t len = 0;
++	uint8_t *buf = sweet_mss_read_file("mba.mbn", MBA_MAX, &len);
++	if (buf && (len < 52 || len > MBA_MAP || *(uint32_t *)(void *)buf != 0x464c457fu)) {
++		printf("SWEET MSS: mba.mbn not a usable ELF (%zu bytes)\n", len);
++		kfree_data(buf, MBA_MAX);
++		buf = NULL;
++	}
++	if (buf) {
++		printf("SWEET MSS: mba.mbn %zu bytes, ELF ok\n", len);
++		*len_out = len;
++	}
++	return buf;
++}
++
+ /* Step 2: copy with aligned 32-bit stores through a permanent device mapping. */
+ static bool
+ copy_mba(const uint8_t *src, size_t len)
+@@ -499,12 +560,8 @@ clocks_on(struct mss_state *s)
+ static bool
+ assign_to_mss(struct mss_state *s)
+ {
+-	s->mpss_assigned = scm_assign(MPSS_PA, MPSS_SIZE, VMID_HLOS, VMID_MSS_MSA, PERM_RW) == 0;
+-	if (!s->mpss_assigned) {
+-		return false;
+-	}
+-	s->mba_assigned = scm_assign(MBA_PA, MBA_SIZE, VMID_HLOS, VMID_MSS_MSA, PERM_RW) == 0;
+-	return s->mba_assigned;
++	return sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &s->mpss_perm, false, true) == 0 &&
++	       sweet_mss_xfer(MBA_PA, MBA_SIZE, &s->mba_perm, false, true) == 0;
+ }
+ 
+ /* q6v5proc_reset, MSS_MSM8998 branch, up to "start core execution". */
+@@ -607,6 +664,9 @@ static void
+ teardown(struct mss_state *s)
+ {
+ 	printf("SWEET MSS: teardown\n");
++	if (s->ready) {
++		sweet_mpss_request_stop(s);
++	}
+ 	if (s->booted) {
+ 		halt_axi(0x0000, "q6");
+ 		halt_axi(0x2000, "modem");
+@@ -627,10 +687,14 @@ teardown(struct mss_state *s)
+ 	if (s->rom_voted) {
+ 		wr(gcc, GCC_VOTE_BOOT_ROM, rd(gcc, GCC_VOTE_BOOT_ROM) & ~(1u << 10));
+ 	}
+-	if (s->mba_assigned && scm_assign(MBA_PA, MBA_SIZE, VMID_MSS_MSA, VMID_HLOS, PERM_RWX)) {
++	if (sweet_mss_xfer(MBA_PA, MBA_SIZE, &s->mba_perm, true, false)) {
+ 		mss_dirty = true;
+ 	}
+-	if (s->mpss_assigned && scm_assign(MPSS_PA, MPSS_SIZE, VMID_MSS_MSA, VMID_HLOS, PERM_RWX)) {
++	if (s->mpss_loading) {
++		/* Linux too: the MPSS carve-out is reclaimed only with an MBA running; it stays with the modem. */
++		printf("SWEET MSS: MPSS carve-out left with the modem until reboot\n");
++		mss_dirty = true;
++	} else if (sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &s->mpss_perm, true, false)) {
+ 		mss_dirty = true;
+ 	}
+ 	/* CX/MX votes stay: lowering an apps vote below what the boot chain set can reset the SoC. */
+@@ -645,6 +709,7 @@ mss_run(int last)
+ 	uint8_t *fw = NULL;
+ 	int reached = 0;
+ 	bzero(&s, sizeof(s));
++	s.mpss_perm = s.mba_perm = 1ull << VMID_HLOS;
+ 	if (!map_regs()) {
+ 		return -1;
+ 	}
+@@ -688,11 +753,14 @@ mss_run(int last)
+ 			reached = 6;
+ 		}
+ 	}
++	if (last >= 7 && reached == 6) {
++		reached = sweet_mpss_run(&s, last, mss_hold);
++	}
+ done:
+ 	if (fw) {
+ 		kfree_data(fw, MBA_MAX);
+ 	}
+-	if (last < 6 || reached < last) {
++	if (reached < last || last < 6) {
+ 		printf("SWEET MSS: stopped after step %d (asked %d)\n", reached, last);
+ 	}
+ 	if (mss_keep && s.alive) {
+@@ -730,7 +798,7 @@ sysctl_sweetmss_step SYSCTL_HANDLER_ARGS
+ 	if (err || !req->newptr) {
+ 		return err;
+ 	}
+-	if (value < 1 || value > 6) {
++	if (value < 1 || value > 10) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sweet_mss_lock);
+@@ -748,7 +816,9 @@ sysctl_sweetmss_step SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweetmss_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweetmss_probe, "I", "SWEET MSS W1 read-only probe (write 1)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweetmss_step, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+-    0, 0, sysctl_sweetmss_step, "I", "SWEET MSS W2: run MBA bring-up steps 1..N (1-6)");
++    0, 0, sysctl_sweetmss_step, "I", "SWEET MSS W2: run modem bring-up steps 1..N (1-10)");
++SYSCTL_INT(_kern, OID_AUTO, sweetmss_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &mss_hold, 0,
++    "SWEET MSS: seconds step 10 watches the modem's SMP2P state");
+ SYSCTL_INT(_kern, OID_AUTO, sweetmss_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &mss_keep, 0,
+     "SWEET MSS: leave a live MBA running (no teardown)");
+ SYSCTL_INT(_kern, OID_AUTO, sweetmss_mba_status, CTLFLAG_RD | CTLFLAG_LOCKED, &mba_status, 0,
+diff --git a/bsd/dev/sweet_mss.h b/bsd/dev/sweet_mss.h
+new file mode 100644
+index 0000000..8686320
+--- /dev/null
++++ b/bsd/dev/sweet_mss.h
+@@ -0,0 +1,51 @@
++/*
++ * Shared between sweet_mss.c (MBA boot, W2 part 1) and sweet_mpss.c (MPSS
++ * load + SMP2P, W2 part 2) for cheeseburger (OnePlus 5, MSM8998).
++ */
++#ifndef _SWEET_MSS_H_
++#define _SWEET_MSS_H_
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#define MSS_FW_DIR      "/usr/local/share/op5fw/"
++
++/* Carve-outs (phone DT / Android dmesg) */
++#define MPSS_PA         0x8d000000u
++#define MPSS_SIZE       0x07000000u
++#define MBA_PA          0x94500000u
++#define MBA_SIZE        0x00200000u
++
++/* RMB registers */
++#define RMB_MBA_IMAGE           0x00
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_COMMAND         0x08
++#define RMB_MBA_STATUS          0x0c
++#define RMB_PMI_META_DATA       0x10
++#define RMB_PMI_CODE_START      0x14
++#define RMB_PMI_CODE_LENGTH     0x18
++
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++
++/* What one run changed, for the teardown. Ownership masks as in Linux q6v5 (BIT(vmid)). */
++struct mss_state {
++	bool voted, gcc_on[4], rom_voted, gpll0_voted, reset_released;
++	bool booted, alive;
++	uint64_t mpss_perm, mba_perm;
++	bool smp2p_out, mpss_loading, mpss_running, ready;
++};
++
++uint32_t sweet_mss_rd(vm_offset_t base, uint32_t off);
++void sweet_mss_wr(vm_offset_t base, uint32_t off, uint32_t v);
++void sweet_mss_announce(int step, const char *what);
++/* q6v5_xfer_mem_ownership: local = HLOS RWX, remote = MSS_MSA RW; updates *perm. */
++int sweet_mss_xfer(uint32_t pa, uint32_t size, uint64_t *perm, bool local, bool remote);
++/* Read a whole file of at most max bytes from MSS_FW_DIR (kalloc_data(max) buffer). */
++uint8_t *sweet_mss_read_file(const char *name, size_t max, size_t *len_out);
++vm_offset_t sweet_mss_rmb(void);
++
++/* sweet_mpss.c: steps 7..10 from "MBA alive"; returns the last step completed. */
++int sweet_mpss_run(struct mss_state *s, int last, int hold_s);
++/* sweet_mpss.c: clean stop request (SMP2P stop bit) when the modem reported ready. */
++void sweet_mpss_request_stop(struct mss_state *s);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* _SWEET_MSS_H_ */
+-- 
+2.54.0 (Apple Git-157)
+
