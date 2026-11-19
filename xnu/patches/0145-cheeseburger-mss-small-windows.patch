@@ -1,0 +1,98 @@
+From a14ae80791b7d4f0d78693707b49feba6f2103b1 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 22:30:23 +0100
+Subject: [PATCH] cheeseburger: MSS small I/O windows (0144 panicked in
+ ml_io_map)
+
+kmem_alloc(2 MiB) failed with KERN_NO_SPACE: MBA window 256 KiB, SMEM probe maps three 16 KiB pages instead of 2 MiB.
+---
+ bsd/dev/sweet_mss.c | 35 ++++++++++++++++++++++++++---------
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+index 10b5155..4d32e3d 100644
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -51,6 +51,13 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ #define MBA_PA          0x94500000u
+ #define MBA_SIZE        0x00200000u
+ #define MBA_MAX         0x00100000u     /* q6v5_load: MBA at most 1 MiB */
++#define MBA_MAP         0x00040000u     /* CPU window: the phone's mba.mbn is 230056 B */
++/*
++ * xnu's I/O mapping space is small and ml_io_map panics when it is full
++ * (0144: a 2 MiB MBA window after a 2 MiB SMEM one, "kmem_alloc ... failed
++ * with 3"): map only the pages that are read or written, once per boot.
++ */
++#define WIN             0x4000u
+ #define MSS_FW_PATH     "/usr/local/share/op5fw/mba.mbn"
+ 
+ /* MMIO */
+@@ -128,7 +135,8 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ static LCK_GRP_DECLARE(sweet_mss_grp, "sweet_mss");
+ static LCK_MTX_DECLARE(sweet_mss_lock, &sweet_mss_grp);
+ 
+-static vm_offset_t gcc, halt, q6, rmb, mba_win, smem;
++static vm_offset_t gcc, halt, q6, rmb, mba_win, smem_hdr, smem_pt, smem_part;
++static uint32_t smem_part_off;
+ static int probe_result, step_result, mss_keep, mba_status;
+ static bool mss_dirty;          /* a teardown left something unreclaimed: no more runs */
+ 
+@@ -283,14 +291,16 @@ out:
+ static void
+ probe_smem(void)
+ {
+-	if (!smem) {
+-		smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	if (!smem_hdr) {
++		smem_hdr = ml_io_map(SMEM_PA, WIN);
++		smem_pt = ml_io_map(SMEM_PA + SMEM_SIZE - WIN, WIN);
+ 	}
+-	if (!smem) {
++	if (!smem_hdr || !smem_pt) {
+ 		return;
+ 	}
+-	printf("SWEET MSS: SMEM initialized %u, version[7] %#x\n", rd(smem, 0xc0), rd(smem, 64 + 7 * 4));
+-	vm_offset_t pt = smem + SMEM_SIZE - 0x1000;
++	printf("SWEET MSS: SMEM initialized %u, version[7] %#x\n", rd(smem_hdr, 0xc0),
++	    rd(smem_hdr, 64 + 7 * 4));
++	vm_offset_t pt = smem_pt + WIN - 0x1000;
+ 	uint32_t magic = rd(pt, 0), n = rd(pt, 8);
+ 	printf("SWEET MSS: SMEM ptable magic %#x version %u entries %u\n", magic, rd(pt, 4), n);
+ 	if (magic != 0x434f5424u) {     /* "$TOC" */
+@@ -303,7 +313,14 @@ probe_smem(void)
+ 		printf("SWEET MSS: ptable %u: off %#x size %#x flags %#x hosts %u<->%u\n", i, off, size,
+ 		    rd(e, 8), h0, h1);
+ 		if (((h0 == 0 && h1 == 1) || (h0 == 1 && h1 == 0)) && off && off + 32 <= SMEM_SIZE) {
+-			vm_offset_t p = smem + off;
++			if (!smem_part) {
++				smem_part_off = off & ~(WIN - 1);
++				smem_part = ml_io_map(SMEM_PA + smem_part_off, WIN);
++			}
++			if (!smem_part || (off & ~(WIN - 1)) != smem_part_off) {
++				continue;
++			}
++			vm_offset_t p = smem_part + (off - smem_part_off);
+ 			printf("SWEET MSS:   apps<->modem partition magic %#x size %#x free_uncached %#x "
+ 			    "free_cached %#x\n", rd(p, 0), rd(p, 8), rd(p, 12), rd(p, 16));
+ 		}
+@@ -384,7 +401,7 @@ read_mba(size_t *len_out)
+ 	}
+ 	vnode_close(vp, FREAD, ctx);
+ 	size_t len = MBA_MAX - (size_t)resid;
+-	if (!buf || err || len < 52 || len == MBA_MAX || *(uint32_t *)(void *)buf != 0x464c457fu) {
++	if (!buf || err || len < 52 || len > MBA_MAP || *(uint32_t *)(void *)buf != 0x464c457fu) {
+ 		printf("SWEET MSS: mba.mbn unusable (err %d, %zu bytes)\n", err, buf ? len : 0);
+ 		if (buf) {
+ 			kfree_data(buf, MBA_MAX);
+@@ -401,7 +418,7 @@ static bool
+ copy_mba(const uint8_t *src, size_t len)
+ {
+ 	if (!mba_win) {
+-		mba_win = ml_io_map(MBA_PA, MBA_SIZE);
++		mba_win = ml_io_map(MBA_PA, MBA_MAP);
+ 	}
+ 	if (!mba_win) {
+ 		return false;
+-- 
+2.54.0 (Apple Git-157)
+
