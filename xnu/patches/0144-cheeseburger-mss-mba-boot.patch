@@ -1,0 +1,901 @@
+From 4be0dfffa1fcd0aad50af5a0119ce3e664df0f09 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 19 Nov 2026 21:25:27 +0100
+Subject: [PATCH] cheeseburger: MSS W1 probe + W2 MBA boot (sysctl-gated)
+
+kern.sweetmss_probe=1: read-only SMEM/GCC/TCSR/RMB probe and SCM info queries. kern.sweetmss_step=N: MBA bring-up steps 1..6 (read mba.mbn, copy, RPM CX/MX votes, GCC clocks + MSS restart, SCM hyp-assign, QDSP6 boot to MBA alive) with teardown. sweet_rpm: generic sweet_rpm_kvp.
+---
+ bsd/conf/files      |   1 +
+ bsd/dev/sweet_mss.c | 739 ++++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_rpm.c |  98 ++++--
+ 3 files changed, 810 insertions(+), 28 deletions(-)
+ create mode 100644 bsd/dev/sweet_mss.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1bf35e3..a43e364 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_a540.c			standard
+ bsd/dev/sweet_a540_b.c			standard
++bsd/dev/sweet_mss.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+new file mode 100644
+index 0000000..10b5155
+--- /dev/null
++++ b/bsd/dev/sweet_mss.c
+@@ -0,0 +1,739 @@
++/*
++ * Modem subsystem (MSS, Hexagon QDSP6 v62) for cheeseburger (OnePlus 5,
++ * MSM8998): Wi-Fi plan steps W1 (read-only probe) and W2 part 1 (MBA boot,
++ * up to "MBA alive"). Nothing runs at boot: only on a sysctl write.
++ *
++ *   kern.sweetmss_probe = 1   W1: SMEM table, GCC/TCSR/RMB state, SCM queries.
++ *                             Reads only (QDSP6SS/RMB only if their AHB clock
++ *                             is already on); the SCM calls are info queries.
++ *   kern.sweetmss_step = N    W2: run steps 1..N, then always tear down
++ *                             (unless kern.sweetmss_keep = 1 and MBA alive):
++ *       1 read mba.mbn        2 copy it into the MBA carve-out
++ *       3 RPM votes (CX/MX turbo level, QDSS clock)
++ *       4 GCC clocks + MSS restart deassert
++ *       5 SCM hyp-assign MPSS + MBA carve-outs HLOS -> MSS_MSA
++ *       6 QDSP6 power-up, wait PBL and MBA status ("MBA ALIVE")
++ *
++ * Sequence: Linux v6.12 drivers/remoteproc/qcom_q6v5_mss.c (msm8998_mss,
++ * MSS_MSM8998: q6v5_load, q6v5_mba_load, q6v5proc_reset, q6v5_mba_reclaim),
++ * drivers/firmware/qcom/qcom_scm.c (qcom_scm_assign_mem), pmdomain/qcom/
++ * rpmpd.c and clk/qcom/{gcc-msm8998,clk-smd-rpm}.c. Addresses from the
++ * phone's own DT (dtb.10) and its Android boot log: MPSS 0x8d000000+112 MiB,
++ * MBA 0x94500000+2 MiB, both outside xnu's RAM (--highmem).
++ *
++ * Lessons from other ports (design notes only): every step is logged and
++ * followed by a pause before it runs, so the last line names the step that
++ * stopped the phone; carve-out windows are device mappings that are never
++ * unmapped (ml_io_map is permanent); CX/MX votes are never lowered.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
++
++/* Carve-outs (phone DT / Android dmesg) */
++#define MPSS_PA         0x8d000000u
++#define MPSS_SIZE       0x07000000u
++#define MBA_PA          0x94500000u
++#define MBA_SIZE        0x00200000u
++#define MBA_MAX         0x00100000u     /* q6v5_load: MBA at most 1 MiB */
++#define MSS_FW_PATH     "/usr/local/share/op5fw/mba.mbn"
++
++/* MMIO */
++#define QDSP6_PA        0x04080000u
++#define RMB_PA          0x04180000u
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x000b0000u
++#define HALT_PA         0x01f63000u     /* tcsr_regs_1 + 0x3000: q6, nc +0x1000, modem +0x2000 */
++#define SMEM_PA         0x86000000u
++#define SMEM_SIZE       0x00200000u
++
++/* GCC (gcc-msm8998.c) */
++#define GCC_MSS_CFG_AHB         0x8a000         /* iface, BRANCH_HALT */
++#define GCC_MSS_MNOC_BIMC_AXI   0x8a004         /* mnoc_axi */
++#define GCC_MSS_SNOC_AXI        0x8a03c         /* snoc_axi */
++#define GCC_BIMC_MSS_Q6_AXI     0x4401c         /* bus */
++#define GCC_BOOT_ROM_AHB        0x38004         /* mem: halt reg, voted */
++#define GCC_VOTE_BOOT_ROM       0x52004         /* bit 10 */
++#define GCC_VOTE_GPLL0_MSS      0x5200c         /* bit 2, BRANCH_HALT_DELAY */
++#define GCC_MSS_RESTART         0x79000         /* BCR, bit 0 = assert */
++#define CBCR_EN                 (1u << 0)
++#define CBCR_OFF                (1u << 31)
++
++/* RMB */
++#define RMB_MBA_IMAGE           0x00
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_STATUS          0x0c
++/* QDSP6SS */
++#define Q6_RESET                0x014
++#define Q6_GFMUX_CTL            0x020
++#define Q6_PWR_CTL              0x030
++#define Q6V6_MEM_PWR_CTL        0x034
++#define Q6_XO_CBCR              0x038
++#define Q6_STRAP_ACC            0x110
++#define Q6_ACC_OVERRIDE         0x20
++#define Q6_STOP_CORE            (1u << 0)
++#define Q6_CORE_ARES            (1u << 1)
++#define Q6_BUS_ARES_EN          (1u << 2)
++#define Q6_CLK_ENABLE           (1u << 1)
++#define Q6_L2DATA_STBY_N        (1u << 18)
++#define Q6_SLP_RET_N            (1u << 19)
++#define Q6_CLAMP_IO             (1u << 20)
++#define Q6_CLAMP_WL             (1u << 21)
++#define Q6_CLAMP_QMC_MEM        (1u << 22)
++#define Q6_BHS_ON               (1u << 24)
++#define Q6_LDO_BYP              (1u << 25)
++/* AXI halt (TCSR) */
++#define AXI_HALTREQ             0x0
++#define AXI_HALTACK             0x4
++#define AXI_IDLE                0x8
++
++/* RPM (rpmpd.c, clk-smd-rpm.c) */
++#define RPM_RWCX                0x78637772u     /* "rwcx" */
++#define RPM_RWMX                0x786d7772u     /* "rwmx" */
++#define RPM_KEY_LEVEL           0x6c766c76u     /* "vlvl" */
++#define RPM_LEVEL_TURBO         384u            /* phone DT: vdd_cx/vdd_mx 0x180 */
++#define RPM_MISC_CLK            0x306b6c63u     /* "clk0" */
++#define RPM_KEY_STATE           0x54415453u     /* "STAT" */
++#define RPM_QDSS_ID             1u
++
++/* SCM */
++#define SCM_SVC_PIL             0x02
++#define SCM_PAS_IS_SUPPORTED    0x07
++#define SCM_SVC_INFO            0x06
++#define SCM_IS_CALL_AVAIL       0x01
++#define SCM_SVC_MP              0x0c
++#define SCM_MP_ASSIGN           0x16
++#define SCM_VAL                 0
++#define SCM_RO                  1
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++#define PERM_RW                 0x6
++#define PERM_RWX                0x7
++
++static LCK_GRP_DECLARE(sweet_mss_grp, "sweet_mss");
++static LCK_MTX_DECLARE(sweet_mss_lock, &sweet_mss_grp);
++
++static vm_offset_t gcc, halt, q6, rmb, mba_win, smem;
++static int probe_result, step_result, mss_keep, mba_status;
++static bool mss_dirty;          /* a teardown left something unreclaimed: no more runs */
++
++/* What this run changed, for the teardown. */
++struct mss_state {
++	bool voted, gcc_on[4], rom_voted, gpll0_voted, reset_released;
++	bool mpss_assigned, mba_assigned, booted, alive;
++};
++
++/* ---- MMIO helpers ---- */
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want; true on success. */
++static bool
++poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i <= us; ++i) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++map_regs(void)
++{
++	if (!gcc) {
++		gcc = ml_io_map(GCC_PA, GCC_SIZE);
++		halt = ml_io_map(HALT_PA, 0x3000);
++		q6 = ml_io_map(QDSP6_PA, 0x1000);
++		rmb = ml_io_map(RMB_PA, 0x1000);
++	}
++	return gcc && halt && q6 && rmb;
++}
++
++/* Log a step and give the console/log time to flush before it runs. */
++static void
++announce(int step, const char *what)
++{
++	printf("SWEET MSS: step %d: %s\n", step, what);
++	delay(1500 * 1000);
++}
++
++/* ---- TrustZone (SMCCC SIP, 64-bit; same calling convention as the GPU zap loader) ---- */
++
++struct scm_res {
++	uint64_t a0, a1, a2, a3;
++};
++
++static struct scm_res
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4,
++    uint64_t a5)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)(svc & 0xff) << 8) | (cmd & 0xff);
++	uint64_t session = 0;
++	struct scm_res r;
++	do {
++		register uint64_t x0 __asm__("x0") = fn;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a2;
++		register uint64_t x3 __asm__("x3") = a3;
++		register uint64_t x4 __asm__("x4") = a4;
++		register uint64_t x5 __asm__("x5") = a5;
++		register uint64_t x6 __asm__("x6") = session;
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++		    :
++		    : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
++		    "memory");
++		r.a0 = x0;
++		r.a1 = x1;
++		r.a2 = x2;
++		r.a3 = x3;
++		session = x6;
++		fn = 1;         /* QCOM_SCM_INTERRUPTED: resume with the session in x6 */
++	} while (r.a0 == 1);
++	return r;
++}
++
++#define SCM_ARGS1(t0)   (1u | (t0) << 4)
++
++static void
++dcache_clean(vm_offset_t va, size_t len)
++{
++	for (vm_offset_t p = va & ~63ul; p < va + len; p += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * qcom_scm_assign_mem: one region, one source VMID, one destination. The
++ * buffer (src list @0, mem_map @64, dest list @128, extra args @192) must be
++ * physically contiguous; TZ reads it from memory, so it is cleaned to PoC.
++ */
++static int
++scm_assign(uint32_t pa, uint32_t size, uint32_t src_vmid, uint32_t dst_vmid, uint32_t perm)
++{
++	uint8_t *buf = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_ZERO);
++	if (!buf) {
++		return ENOMEM;
++	}
++	vm_offset_t va = (vm_offset_t)buf;
++	uint64_t pa0 = ptoa_64(pmap_find_phys(kernel_pmap, va)) + (va & PAGE_MASK);
++	uint64_t pa1 = ptoa_64(pmap_find_phys(kernel_pmap, va + 255)) + ((va + 255) & PAGE_MASK);
++	int err = 0;
++	if (pa0 == 0 || pa1 != pa0 + 255) {
++		printf("SWEET MSS: SCM buffer not contiguous (%#llx, %#llx)\n", pa0, pa1);
++		err = EFAULT;
++		goto out;
++	}
++	*(uint32_t *)(buf + 0) = src_vmid;
++	*(uint64_t *)(buf + 64) = pa;
++	*(uint64_t *)(buf + 72) = size;
++	*(uint32_t *)(buf + 128) = dst_vmid;    /* vmid, perm, ctx (u64), ctx_size, pad: 24 B */
++	*(uint32_t *)(buf + 132) = perm;
++	uint64_t *ext = (uint64_t *)(void *)(buf + 192);
++	ext[0] = 4;                     /* args[3] src_sz */
++	ext[1] = pa0 + 128;             /* args[4] dest */
++	ext[2] = 24;                    /* args[5] dest_sz */
++	ext[3] = 0;                     /* args[6] */
++	dcache_clean(va, 256);
++	/* QCOM_SCM_ARGS(7, RO, VAL, RO, VAL, RO, VAL, VAL): args 0-2 in x2-x4, 3-6 via x5 */
++	struct scm_res r = scm_call(SCM_SVC_MP, SCM_MP_ASSIGN, 0x1117, pa0 + 64, 16, pa0, pa0 + 192);
++	printf("SWEET MSS: hyp-assign %#x+%#x vmid %u -> %u perm %#x: a0 %lld a1 %lld\n", pa, size,
++	    src_vmid, dst_vmid, perm, (long long)r.a0, (long long)r.a1);
++	err = (r.a0 == 0 && r.a1 == 0) ? 0 : EIO;
++out:
++	kfree_data(buf, PAGE_SIZE);
++	return err;
++}
++
++/* ---- W1: read-only probe ---- */
++
++static void
++probe_smem(void)
++{
++	if (!smem) {
++		smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	}
++	if (!smem) {
++		return;
++	}
++	printf("SWEET MSS: SMEM initialized %u, version[7] %#x\n", rd(smem, 0xc0), rd(smem, 64 + 7 * 4));
++	vm_offset_t pt = smem + SMEM_SIZE - 0x1000;
++	uint32_t magic = rd(pt, 0), n = rd(pt, 8);
++	printf("SWEET MSS: SMEM ptable magic %#x version %u entries %u\n", magic, rd(pt, 4), n);
++	if (magic != 0x434f5424u) {     /* "$TOC" */
++		return;
++	}
++	for (uint32_t i = 0; i < n && i < 32; ++i) {
++		vm_offset_t e = pt + 32 + 48 * i;
++		uint32_t off = rd(e, 0), size = rd(e, 4), hosts = rd(e, 12);
++		uint32_t h0 = hosts & 0xffff, h1 = hosts >> 16;
++		printf("SWEET MSS: ptable %u: off %#x size %#x flags %#x hosts %u<->%u\n", i, off, size,
++		    rd(e, 8), h0, h1);
++		if (((h0 == 0 && h1 == 1) || (h0 == 1 && h1 == 0)) && off && off + 32 <= SMEM_SIZE) {
++			vm_offset_t p = smem + off;
++			printf("SWEET MSS:   apps<->modem partition magic %#x size %#x free_uncached %#x "
++			    "free_cached %#x\n", rd(p, 0), rd(p, 8), rd(p, 12), rd(p, 16));
++		}
++	}
++}
++
++static void
++probe_clocks(void)
++{
++	static const struct { uint32_t off; const char *name; } regs[] = {
++		{ GCC_MSS_CFG_AHB, "mss_cfg_ahb" }, { GCC_BIMC_MSS_Q6_AXI, "bimc_mss_q6_axi" },
++		{ GCC_MSS_MNOC_BIMC_AXI, "mss_mnoc_bimc_axi" }, { GCC_MSS_SNOC_AXI, "mss_snoc_axi" },
++		{ GCC_BOOT_ROM_AHB, "boot_rom_ahb" }, { GCC_VOTE_BOOT_ROM, "vote 0x52004" },
++		{ GCC_VOTE_GPLL0_MSS, "vote 0x5200c" }, { GCC_MSS_RESTART, "mss_restart BCR" },
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		printf("SWEET MSS: GCC %s (+%#x) = %#x\n", regs[i].name, regs[i].off, rd(gcc, regs[i].off));
++	}
++	for (uint32_t i = 0; i < 3; ++i) {
++		static const char *names[] = { "q6", "nc", "modem" };
++		printf("SWEET MSS: AXI halt %s: req %u ack %u idle %u\n", names[i],
++		    rd(halt, 0x1000 * i + AXI_HALTREQ), rd(halt, 0x1000 * i + AXI_HALTACK),
++		    rd(halt, 0x1000 * i + AXI_IDLE));
++	}
++	if (rd(gcc, GCC_MSS_CFG_AHB) & CBCR_OFF) {
++		printf("SWEET MSS: mss_cfg_ahb is off: QDSP6SS/RMB not read\n");
++		return;
++	}
++	printf("SWEET MSS: QDSP6SS reset %#x pwr_ctl %#x; RMB pbl %#x mba %#x\n", rd(q6, Q6_RESET),
++	    rd(q6, Q6_PWR_CTL), rd(rmb, RMB_PBL_STATUS), rd(rmb, RMB_MBA_STATUS));
++}
++
++static void
++probe_scm(void)
++{
++	for (uint64_t id = 4; id <= 5; ++id) {
++		struct scm_res r = scm_call(SCM_SVC_PIL, SCM_PAS_IS_SUPPORTED, SCM_ARGS1(SCM_VAL), id, 0, 0, 0);
++		printf("SWEET MSS: SCM PAS is_supported(%llu): a0 %lld a1 %lld\n", id, (long long)r.a0,
++		    (long long)r.a1);
++	}
++	uint64_t fnid = (2ull << 24) | (SCM_SVC_MP << 8) | SCM_MP_ASSIGN;
++	struct scm_res r = scm_call(SCM_SVC_INFO, SCM_IS_CALL_AVAIL, SCM_ARGS1(SCM_VAL), fnid, 0, 0, 0);
++	printf("SWEET MSS: SCM MP_ASSIGN available: a0 %lld a1 %lld\n", (long long)r.a0, (long long)r.a1);
++}
++
++static int
++mss_probe(void)
++{
++	printf("SWEET MSS: W1 probe (reads + SCM info queries only)\n");
++	if (!map_regs()) {
++		return -1;
++	}
++	probe_clocks();
++	probe_smem();
++	probe_scm();
++	printf("SWEET MSS: W1 probe done\n");
++	return 1;
++}
++
++/* ---- W2 steps ---- */
++
++/* Step 1: mba.mbn from the root (copied there from the modem partition). */
++static uint8_t *
++read_mba(size_t *len_out)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(MSS_FW_PATH, FREAD, 0, 0, &vp, ctx);
++	if (err) {
++		printf("SWEET MSS: %s: open error %d\n", MSS_FW_PATH, err);
++		return NULL;
++	}
++	uint8_t *buf = kalloc_data(MBA_MAX, Z_WAITOK | Z_ZERO);
++	int resid = 0;
++	if (buf) {
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)MBA_MAX, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_close(vp, FREAD, ctx);
++	size_t len = MBA_MAX - (size_t)resid;
++	if (!buf || err || len < 52 || len == MBA_MAX || *(uint32_t *)(void *)buf != 0x464c457fu) {
++		printf("SWEET MSS: mba.mbn unusable (err %d, %zu bytes)\n", err, buf ? len : 0);
++		if (buf) {
++			kfree_data(buf, MBA_MAX);
++		}
++		return NULL;
++	}
++	printf("SWEET MSS: mba.mbn %zu bytes, ELF ok\n", len);
++	*len_out = len;
++	return buf;
++}
++
++/* Step 2: copy with aligned 32-bit stores through a permanent device mapping. */
++static bool
++copy_mba(const uint8_t *src, size_t len)
++{
++	if (!mba_win) {
++		mba_win = ml_io_map(MBA_PA, MBA_SIZE);
++	}
++	if (!mba_win) {
++		return false;
++	}
++	printf("SWEET MSS: MBA window %#lx, word 0 = %#x\n", (unsigned long)mba_win, rd(mba_win, 0));
++	for (size_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (size_t k = 0; k < 4 && i + k < len; ++k) {
++			w |= (uint32_t)src[i + k] << (8 * k);
++		}
++		*(volatile uint32_t *)(mba_win + i) = w;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t w0 = rd(mba_win, 0), wl = rd(mba_win, (uint32_t)((len - 4) & ~3ul));
++	printf("SWEET MSS: MBA copied, word 0 %#x, last word %#x\n", w0, wl);
++	return w0 == 0x464c457fu;
++}
++
++/* Step 3: proxy power domains (q6v5_pds_enable at INT_MAX) and the QDSS proxy clock. */
++static bool
++rpm_votes(struct mss_state *s)
++{
++	int e1 = sweet_rpm_kvp(RPM_RWCX, 0, RPM_KEY_LEVEL, RPM_LEVEL_TURBO);
++	int e2 = sweet_rpm_kvp(RPM_RWMX, 0, RPM_KEY_LEVEL, RPM_LEVEL_TURBO);
++	s->voted = !e1 || !e2;
++	if (sweet_rpm_kvp(RPM_MISC_CLK, RPM_QDSS_ID, RPM_KEY_STATE, 1)) {
++		printf("SWEET MSS: QDSS vote failed (debug clock; continuing)\n");
++	}
++	return !e1 && !e2;
++}
++
++static const uint32_t branch_regs[4] = {
++	GCC_MSS_CFG_AHB, GCC_BIMC_MSS_Q6_AXI, GCC_MSS_MNOC_BIMC_AXI, GCC_MSS_SNOC_AXI,
++};
++
++static bool
++branch_on(struct mss_state *s, unsigned i)
++{
++	uint32_t off = branch_regs[i], v = rd(gcc, off);
++	if (!(v & CBCR_EN)) {
++		wr(gcc, off, v | CBCR_EN);
++		s->gcc_on[i] = true;
++	}
++	bool ok = poll(gcc, off, CBCR_OFF, 0, 200);
++	printf("SWEET MSS: GCC +%#x %#x -> %#x%s\n", off, v, rd(gcc, off), ok ? "" : " (CLK_OFF stuck)");
++	return ok;
++}
++
++/* Step 4: proxy clock mem (boot ROM), restart deassert, active clocks (Linux order). */
++static bool
++clocks_on(struct mss_state *s)
++{
++	uint32_t v = rd(gcc, GCC_VOTE_BOOT_ROM);
++	if (!(v & (1u << 10))) {
++		wr(gcc, GCC_VOTE_BOOT_ROM, v | (1u << 10));
++		s->rom_voted = true;
++	}
++	if (!poll(gcc, GCC_BOOT_ROM_AHB, CBCR_OFF, 0, 200)) {
++		printf("SWEET MSS: boot_rom_ahb stays off (%#x)\n", rd(gcc, GCC_BOOT_ROM_AHB));
++		return false;
++	}
++	wr(gcc, GCC_MSS_RESTART, rd(gcc, GCC_MSS_RESTART) & ~1u);
++	s->reset_released = true;
++	delay(10);
++	if (!branch_on(s, 0) || !branch_on(s, 1)) {
++		return false;
++	}
++	v = rd(gcc, GCC_VOTE_GPLL0_MSS);
++	if (!(v & (1u << 2))) {
++		wr(gcc, GCC_VOTE_GPLL0_MSS, v | (1u << 2));
++		s->gpll0_voted = true;
++	}
++	delay(10);
++	return branch_on(s, 2) && branch_on(s, 3);
++}
++
++/* Step 5: q6v5_xfer_mem_ownership(..., false, true, ...) for MPSS, then MBA. */
++static bool
++assign_to_mss(struct mss_state *s)
++{
++	s->mpss_assigned = scm_assign(MPSS_PA, MPSS_SIZE, VMID_HLOS, VMID_MSS_MSA, PERM_RW) == 0;
++	if (!s->mpss_assigned) {
++		return false;
++	}
++	s->mba_assigned = scm_assign(MBA_PA, MBA_SIZE, VMID_HLOS, VMID_MSS_MSA, PERM_RW) == 0;
++	return s->mba_assigned;
++}
++
++/* q6v5proc_reset, MSS_MSM8998 branch, up to "start core execution". */
++static bool
++q6_power_up(void)
++{
++	wr(q6, Q6_STRAP_ACC, Q6_ACC_OVERRIDE);
++	wr(q6, Q6_RESET, rd(q6, Q6_RESET) | Q6_CORE_ARES | Q6_BUS_ARES_EN | Q6_STOP_CORE);
++	wr(q6, Q6_XO_CBCR, rd(q6, Q6_XO_CBCR) | CBCR_EN);
++	if (!poll(q6, Q6_XO_CBCR, CBCR_OFF, 0, 200)) {
++		printf("SWEET MSS: QDSP6 xo cbcr stays off (%#x)\n", rd(q6, Q6_XO_CBCR));
++		return false;
++	}
++	uint32_t v = rd(q6, Q6_PWR_CTL) | Q6_BHS_ON;
++	wr(q6, Q6_PWR_CTL, v);
++	v |= rd(q6, Q6_PWR_CTL);
++	delay(1);
++	v |= Q6_LDO_BYP;
++	wr(q6, Q6_PWR_CTL, v);
++	v = rd(q6, Q6_PWR_CTL) & ~Q6_CLAMP_QMC_MEM;
++	wr(q6, Q6_PWR_CTL, v);
++	v |= Q6_L2DATA_STBY_N | Q6_SLP_RET_N;
++	wr(q6, Q6_PWR_CTL, v);
++	uint32_t m = rd(q6, Q6V6_MEM_PWR_CTL);
++	for (int i = 28; i >= 0; --i) {
++		m |= 1u << i;
++		wr(q6, Q6V6_MEM_PWR_CTL, m);
++		m |= rd(q6, Q6V6_MEM_PWR_CTL);
++		delay(1);
++	}
++	v = rd(q6, Q6_PWR_CTL) & ~Q6_CLAMP_WL;
++	wr(q6, Q6_PWR_CTL, v);
++	v &= ~Q6_CLAMP_IO;
++	wr(q6, Q6_PWR_CTL, v);
++	wr(q6, Q6_RESET, rd(q6, Q6_RESET) & ~Q6_CORE_ARES);
++	wr(q6, Q6_GFMUX_CTL, rd(q6, Q6_GFMUX_CTL) | Q6_CLK_ENABLE);
++	wr(q6, Q6_RESET, rd(q6, Q6_RESET) & ~Q6_STOP_CORE);
++	printf("SWEET MSS: QDSP6 started: reset %#x pwr_ctl %#x mem_pwr %#x\n", rd(q6, Q6_RESET),
++	    rd(q6, Q6_PWR_CTL), rd(q6, Q6V6_MEM_PWR_CTL));
++	return true;
++}
++
++/* Poll an RMB register until nonzero (PBL) or a final value (MBA); returns the value or 0. */
++static uint32_t
++rmb_wait(uint32_t off, unsigned ms, unsigned *took)
++{
++	for (unsigned i = 0; i <= ms; ++i) {
++		uint32_t v = rd(rmb, off);
++		if (v) {
++			*took = i;
++			return v;
++		}
++		delay(1000);
++	}
++	*took = ms;
++	return 0;
++}
++
++/* Step 6: RMB image address, QDSP6 boot, PBL (1 s) and MBA (5 s) status. */
++static bool
++boot_mba(struct mss_state *s)
++{
++	wr(rmb, RMB_MBA_IMAGE, MBA_PA);
++	if (!q6_power_up()) {
++		return false;
++	}
++	s->booted = true;
++	unsigned ms = 0;
++	uint32_t pbl = rmb_wait(RMB_PBL_STATUS, 1000, &ms);
++	printf("SWEET MSS: PBL status %#x after %u ms\n", pbl, ms);
++	if (pbl != 1) {
++		return false;
++	}
++	uint32_t mba = rmb_wait(RMB_MBA_STATUS, 5000, &ms);
++	mba_status = (int)mba;
++	printf("SWEET MSS: MBA status %#x after %u ms\n", mba, ms);
++	s->alive = mba == 1 || mba == 2;        /* XPU unlocked (scribbled) */
++	if (s->alive) {
++		printf("SWEET MSS: MBA ALIVE\n");
++	}
++	return s->alive;
++}
++
++/* q6v5proc_halt_axi_port */
++static void
++halt_axi(uint32_t base, const char *name)
++{
++	if (rd(halt, base + AXI_IDLE)) {
++		printf("SWEET MSS: AXI %s already idle\n", name);
++		return;
++	}
++	wr(halt, base + AXI_HALTREQ, 1);
++	bool ack = poll(halt, base + AXI_HALTACK, ~0u, 1, 100000);
++	printf("SWEET MSS: AXI %s halt ack %d idle %u\n", name, ack, rd(halt, base + AXI_IDLE));
++	wr(halt, base + AXI_HALTREQ, 0);
++}
++
++/* q6v5_mba_reclaim order: halt ports, reset, clocks off, carve-outs back to HLOS. */
++static void
++teardown(struct mss_state *s)
++{
++	printf("SWEET MSS: teardown\n");
++	if (s->booted) {
++		halt_axi(0x0000, "q6");
++		halt_axi(0x2000, "modem");
++		halt_axi(0x1000, "nc");
++	}
++	if (s->reset_released) {
++		wr(gcc, GCC_MSS_RESTART, rd(gcc, GCC_MSS_RESTART) | 1u);
++		delay(10);
++	}
++	for (int i = 3; i >= 0; --i) {
++		if (s->gcc_on[i]) {
++			wr(gcc, branch_regs[i], rd(gcc, branch_regs[i]) & ~CBCR_EN);
++		}
++	}
++	if (s->gpll0_voted) {
++		wr(gcc, GCC_VOTE_GPLL0_MSS, rd(gcc, GCC_VOTE_GPLL0_MSS) & ~(1u << 2));
++	}
++	if (s->rom_voted) {
++		wr(gcc, GCC_VOTE_BOOT_ROM, rd(gcc, GCC_VOTE_BOOT_ROM) & ~(1u << 10));
++	}
++	if (s->mba_assigned && scm_assign(MBA_PA, MBA_SIZE, VMID_MSS_MSA, VMID_HLOS, PERM_RWX)) {
++		mss_dirty = true;
++	}
++	if (s->mpss_assigned && scm_assign(MPSS_PA, MPSS_SIZE, VMID_MSS_MSA, VMID_HLOS, PERM_RWX)) {
++		mss_dirty = true;
++	}
++	/* CX/MX votes stay: lowering an apps vote below what the boot chain set can reset the SoC. */
++	printf("SWEET MSS: teardown done%s\n", mss_dirty ? " (carve-out NOT reclaimed: no more runs)" : "");
++}
++
++static int
++mss_run(int last)
++{
++	struct mss_state s;
++	size_t len = 0;
++	uint8_t *fw = NULL;
++	int reached = 0;
++	bzero(&s, sizeof(s));
++	if (!map_regs()) {
++		return -1;
++	}
++	announce(1, "read mba.mbn");
++	fw = read_mba(&len);
++	if (!fw) {
++		goto done;
++	}
++	reached = 1;
++	if (last >= 2) {
++		announce(2, "copy MBA into its carve-out (no modem power yet)");
++		if (!copy_mba(fw, len)) {
++			goto done;
++		}
++		reached = 2;
++	}
++	if (last >= 3) {
++		announce(3, "RPM votes: CX/MX level 384, QDSS clock");
++		if (!rpm_votes(&s)) {
++			goto done;
++		}
++		reached = 3;
++	}
++	if (last >= 4) {
++		announce(4, "GCC clocks on, MSS restart deasserted");
++		if (!clocks_on(&s)) {
++			goto done;
++		}
++		reached = 4;
++	}
++	if (last >= 5) {
++		announce(5, "SCM hyp-assign MPSS + MBA to the modem");
++		if (!assign_to_mss(&s)) {
++			goto done;
++		}
++		reached = 5;
++	}
++	if (last >= 6) {
++		announce(6, "QDSP6 power-up and MBA boot");
++		if (boot_mba(&s)) {
++			reached = 6;
++		}
++	}
++done:
++	if (fw) {
++		kfree_data(fw, MBA_MAX);
++	}
++	if (last < 6 || reached < last) {
++		printf("SWEET MSS: stopped after step %d (asked %d)\n", reached, last);
++	}
++	if (mss_keep && s.alive) {
++		printf("SWEET MSS: keep=1: MBA left running, no teardown\n");
++		mss_dirty = true;
++	} else {
++		teardown(&s);
++	}
++	return reached;
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_sweetmss_probe SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = probe_result;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr || value != 1) {
++		return err;
++	}
++	lck_mtx_lock(&sweet_mss_lock);
++	probe_result = mss_probe();
++	lck_mtx_unlock(&sweet_mss_lock);
++	return 0;
++}
++
++static int
++sysctl_sweetmss_step SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = step_result;
++	int err = sysctl_handle_int(oidp, &value, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (value < 1 || value > 6) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_mss_lock);
++	if (mss_dirty) {
++		printf("SWEET MSS: refused: an earlier run left the modem/carve-outs in use\n");
++		err = EBUSY;
++	} else {
++		printf("SWEET MSS: W2 run to step %d requested by pid %d\n", value, proc_selfpid());
++		step_result = mss_run(value);
++	}
++	lck_mtx_unlock(&sweet_mss_lock);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetmss_probe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweetmss_probe, "I", "SWEET MSS W1 read-only probe (write 1)");
++SYSCTL_PROC(_kern, OID_AUTO, sweetmss_step, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweetmss_step, "I", "SWEET MSS W2: run MBA bring-up steps 1..N (1-6)");
++SYSCTL_INT(_kern, OID_AUTO, sweetmss_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &mss_keep, 0,
++    "SWEET MSS: leave a live MBA running (no teardown)");
++SYSCTL_INT(_kern, OID_AUTO, sweetmss_mba_status, CTLFLAG_RD | CTLFLAG_LOCKED, &mba_status, 0,
++    "SWEET MSS: last RMB MBA status");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpm.c b/bsd/dev/sweet_rpm.c
+index 8f2074a..234304f 100644
+--- a/bsd/dev/sweet_rpm.c
++++ b/bsd/dev/sweet_rpm.c
+@@ -18,6 +18,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpm_ldo(uint32_t ldo, uint32_t uv, uint32_t ma);
++int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ 
+ #define RPM_MSGRAM_PA   0x00778000u    /* qcom,rpm-msg-ram */
+ #define RPM_MSGRAM_SZ   0x7000u
+@@ -252,46 +253,87 @@ rpm_start(void)
+  * ma. The load matters: without it the LDO stays in low-power mode and the
+  * touch IC browns out once it starts scanning (touch probe 2).
+  */
+-int
+-sweet_rpm_ldo(uint32_t ldo, uint32_t uv, uint32_t ma)
++/*
++ * Send one request (sweet_rpm_lock held, channel open) and wait up to 1 s for
++ * the RPM's answer; *type_out = its type word ("msg#" = ack).
++ */
++static int
++rpm_request(const uint32_t *w, unsigned nwords, uint32_t *type_out)
+ {
+-	int err = 0;
+-	lck_mtx_lock(&sweet_rpm_lock);
+-	if (!rpm_up && !rpm_failed) {
+-		rpm_up = rpm_start();
+-		rpm_failed = !rpm_up;
+-	}
+-	if (!rpm_up) {
+-		err = ENXIO;
+-		goto out;
+-	}
+-	uint32_t w[20] = {
+-		GLINK_TX_DATA | GLINK_LCID << 16, 0, 64, 0,     /* iid 0 (intentless), chunk, left */
+-		0x00716572u, 20 + 36,                           /* "req", length */
+-		rpm_msg_id++, 0, 0x616f646cu, ldo, 36,          /* id, active set, "ldoa", ldo, len */
+-		0x6e657773u, 4, 1,                              /* swen */
+-		0x00007675u, 4, uv,                             /* uv */
+-		0x0000616du, 4, ma,                             /* ma */
+-	};
+ 	rpm_data_len = 0;
+-	if (!rpm_send(w, 20)) {
+-		err = EBUSY;
+-		goto out;
++	if (!rpm_send(w, nwords)) {
++		return EBUSY;
+ 	}
+ 	for (unsigned i = 0; i < 10000 && !rpm_data_len; ++i) {
+ 		if (!rpm_poll()) {
+-			err = EIO;
+-			goto out;
++			return EIO;
+ 		}
+ 		delay(100);
+ 	}
+ 	uint32_t type = rpm_data_len >= 12 ? (uint32_t)rpm_data[8] | rpm_data[9] << 8 |
+ 	    rpm_data[10] << 16 | (uint32_t)rpm_data[11] << 24 : 0;
++	*type_out = type;
+ 	if (type != 0x2367736du) {      /* "msg#"; "err" carries a text */
+-		err = rpm_data_len ? EINVAL : ETIMEDOUT;
++		return rpm_data_len ? EINVAL : ETIMEDOUT;
++	}
++	return 0;
++}
++
++/* sweet_rpm_lock held: open the channel on first use. */
++static bool
++rpm_ensure_up(void)
++{
++	if (!rpm_up && !rpm_failed) {
++		rpm_up = rpm_start();
++		rpm_failed = !rpm_up;
++	}
++	return rpm_up;
++}
++
++int
++sweet_rpm_ldo(uint32_t ldo, uint32_t uv, uint32_t ma)
++{
++	int err = ENXIO;
++	uint32_t type = 0;
++	lck_mtx_lock(&sweet_rpm_lock);
++	if (rpm_ensure_up()) {
++		uint32_t w[20] = {
++			GLINK_TX_DATA | GLINK_LCID << 16, 0, 64, 0,     /* iid 0 (intentless), chunk, left */
++			0x00716572u, 20 + 36,                           /* "req", length */
++			rpm_msg_id++, 0, 0x616f646cu, ldo, 36,          /* id, active set, "ldoa", ldo, len */
++			0x6e657773u, 4, 1,                              /* swen */
++			0x00007675u, 4, uv,                             /* uv */
++			0x0000616du, 4, ma,                             /* ma */
++		};
++		err = rpm_request(w, 20, &type);
++		printf("SWEET RPM: ldoa%u %u uV %u mA -> %s (%#x)\n", ldo, uv, ma, err ? "failed" : "ok", type);
++	}
++	lck_mtx_unlock(&sweet_rpm_lock);
++	return err;
++}
++
++/*
++ * qcom_rpm_smd_write of one key/value pair to resource (rtype, rid) in the
++ * active set, e.g. rpmpd "rwcx" 0 "vlvl" (Linux rpmpd.c) or the "clk0" 1
++ * "STAT" QDSS clock (clk-smd-rpm.c). Used by sweet_mss.c.
++ */
++int
++sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value)
++{
++	int err = ENXIO;
++	uint32_t type = 0;
++	lck_mtx_lock(&sweet_rpm_lock);
++	if (rpm_ensure_up()) {
++		uint32_t w[14] = {
++			GLINK_TX_DATA | GLINK_LCID << 16, 0, 40, 0,     /* iid 0 (intentless), chunk, left */
++			0x00716572u, 20 + 12,                           /* "req", length */
++			rpm_msg_id++, 0, rtype, rid, 12,                /* id, active set, resource, len */
++			key, 4, value,
++		};
++		err = rpm_request(w, 14, &type);
++		printf("SWEET RPM: %.4s%u %.4s=%u -> %s (%#x)\n", (const char *)&rtype, rid,
++		    (const char *)&key, value, err ? "failed" : "ok", type);
+ 	}
+-	printf("SWEET RPM: ldoa%u %u uV %u mA -> %s (%#x)\n", ldo, uv, ma, err ? "failed" : "ok", type);
+-out:
+ 	lck_mtx_unlock(&sweet_rpm_lock);
+ 	return err;
+ }
+-- 
+2.54.0 (Apple Git-157)
+
