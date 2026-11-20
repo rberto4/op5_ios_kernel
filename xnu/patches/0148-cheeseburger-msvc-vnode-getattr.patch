@@ -1,0 +1,32 @@
+From 47c0fc9f9dab34033ebaa9b8b7eb16540e3e2440 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 20 Nov 2026 10:18:28 +0100
+Subject: [PATCH] cheeseburger: sweet_msvc: file size through vnode_getattr
+
+vnode_size is not declared for bsd/dev (0147 CI: implicit declaration).
+---
+ bsd/dev/sweet_msvc.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_msvc.c b/bsd/dev/sweet_msvc.c
+index 6edddb4..4cbdd11 100644
+--- a/bsd/dev/sweet_msvc.c
++++ b/bsd/dev/sweet_msvc.c
+@@ -34,9 +34,11 @@ file_read(const char *path, uint64_t off, void *dst, uint64_t n, uint64_t *size_
+ 		return err;
+ 	}
+ 	if (size_out != NULL) {
+-		off_t sz = 0;
+-		err = vnode_size(vp, &sz, ctx);
+-		*size_out = (uint64_t)sz;
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		err = vnode_getattr(vp, &va, ctx);
++		*size_out = err ? 0 : (uint64_t)va.va_data_size;
+ 	}
+ 	if (!err && n != 0) {
+ 		err = vn_rdwr(UIO_READ, vp, (caddr_t)dst, (int)n, (off_t)off, UIO_SYSSPACE, 0,
+-- 
+2.54.0 (Apple Git-157)
+
