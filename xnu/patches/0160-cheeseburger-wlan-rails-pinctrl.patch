@@ -1,0 +1,68 @@
+From 3557d9d032c96ae2c4742dbab36c2d0ddd4757a4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 21:35:44 +0100
+Subject: [PATCH] cheeseburger: WCN3990 L7/L17/L25 pin-controlled (EN2) as the
+ stock dtb
+
+0159 with WLAN_MODE OFF at 8.5 s: no fatal, 60 s clean. So a modem task starves only while the WLAN firmware stays in mission (also without CE/WMI, 0150/0151A). Stock votes vdd-1.8-xo, vdd-1.3-rfa and vdd-3.3-ch0 through the *_pin_ctrl regulators (init-pin-ctrl-mode 4, enable-with-pin-ctrl <0 4>): the chip switches them with PMIC pin EN2; we forced them on with swen. Send uv, pcfm 4, pcen 4, swen 0 instead (kern.sweetwlfw_pinctrl, default 1; 0 = old votes). L5 unchanged.
+---
+ bsd/dev/sweet_wlfw.c | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index d779b7a..12345f0 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -55,6 +55,10 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ 
+ #define RPM_CLK_BUF_A       0x616b6c63u         /* "clka" */
+ #define RPM_KEY_SWEN        0x6e657773u         /* "swen" */
++#define RPM_LDOA            0x616f646cu         /* "ldoa" */
++#define RPM_KEY_UV          0x00007675u         /* "uv" */
++#define RPM_KEY_PCEN        0x6e656370u         /* "pcen": pin-control enable mask */
++#define RPM_KEY_PCFM        0x6d666370u         /* "pcfm": pin-control force-HPM mask */
+ #define RPM_RF_CLK2         5
+ 
+ static uint32_t w_node, w_port, w_board = 0xFF, w_bdf_seg;
+@@ -66,7 +70,9 @@ static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms, w_mission_ms;
+ static bool w_off_sent;
+ static const char *w_step = "not started";
+ 
+-int sweet_wlfw_smmu = 1, sweet_wlfw_upto, sweet_wlfw_off_ms;
++int sweet_wlfw_smmu = 1, sweet_wlfw_upto, sweet_wlfw_off_ms, sweet_wlfw_pinctrl = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_pinctrl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_pinctrl, 0,
++    "W5: 1 = L7/L17/L25 pin-controlled by the WCN3990 (EN2) as the stock dtb, 0 = software-enabled");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_off_ms, 0,
+     "W5 test: > 0 = WLAN_MODE OFF that many ms after mission");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_smmu, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_smmu, 0,
+@@ -176,11 +182,25 @@ w_power_on(void)
+ 	}
+ 	w_powered = true;
+ 	for (unsigned i = 0; i < 4; i++) {
+-		err |= sweet_rpm_ldo(rail[i][0], rail[i][1], rail[i][2]);
++		if (i == 0 || !sweet_wlfw_pinctrl) {
++			err |= sweet_rpm_ldo(rail[i][0], rail[i][1], rail[i][2]);
++			continue;
++		}
++		/*
++		 * Stock: vdd-1.8-xo/1.3-rfa/3.3-ch0 are the *_pin_ctrl regulators: init-pin-ctrl-mode 4
++		 * and enable-with-pin-ctrl <0 4>, i.e. the WCN3990 switches them (and their HPM) with
++		 * PMIC pin EN2; software enable stays 0. 0154-0159: with them forced on, a modem task
++		 * starved ~8 s into mission mode, every time, and not once mission was left.
++		 */
++		err |= sweet_rpm_kvp(RPM_LDOA, rail[i][0], RPM_KEY_UV, rail[i][1]);
++		err |= sweet_rpm_kvp(RPM_LDOA, rail[i][0], RPM_KEY_PCFM, 4);
++		err |= sweet_rpm_kvp(RPM_LDOA, rail[i][0], RPM_KEY_PCEN, 4);
++		err |= sweet_rpm_kvp(RPM_LDOA, rail[i][0], RPM_KEY_SWEN, 0);
+ 	}
+ 	err |= sweet_rpm_kvp(RPM_CLK_BUF_A, RPM_RF_CLK2, RPM_KEY_SWEN, 1);
+ 	IOSleep(5);
+-	LOG("t=%u ms: wlfw: WCN3990 rails L5/L7/L17/L25 + RF_CLK2 %s", g_ms, err ? "with ERRORS" : "on");
++	LOG("t=%u ms: wlfw: WCN3990 rails L5/L7/L17/L25 (%s) + RF_CLK2 %s", g_ms,
++	    sweet_wlfw_pinctrl ? "L7/L17/L25 pin-controlled EN2" : "all software-on", err ? "with ERRORS" : "on");
+ }
+ 
+ /*
+-- 
+2.54.0 (Apple Git-157)
+
