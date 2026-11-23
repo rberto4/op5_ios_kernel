@@ -1,0 +1,160 @@
+From b1ff2900e8a6bc7bd720e1252d8afda3c5371e6d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 14:48:32 +0100
+Subject: [PATCH] cheeseburger: WLAN MSA out of HLOS page tables; WLAN_MODE OFF
+ test knob
+
+0152: CE + HTC up (HTC READY, HTT/WMI connected, WMI events) but the SoC still froze ~9 s after mission, as in 0150/0151 (5-12 s), never when stopping at FW_READY. The MSA (last MiB of the modem pool) stayed in our write-combined pool mapping after it was hyp-assigned to MSS/WLAN; Linux keeps such regions no-map. Now the pool mapping stops at 7 MiB and the MSA is zeroed through a temporary window unmapped before MSA_INFO. kern.sweetwlfw_off_ms (test): WLAN_MODE OFF that many ms after mission. WMI event id = header & 0xFFFFFF, raw header logged.
+---
+ bsd/dev/sweet_glink.c |  5 +++--
+ bsd/dev/sweet_wce.c   |  7 +++---
+ bsd/dev/sweet_wlfw.c  | 51 ++++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 50 insertions(+), 13 deletions(-)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index 9bba96e..e71142c 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -49,7 +49,7 @@ pool_alloc(uint64_t size, uint64_t *pa)
+ uint8_t *
+ sweet_mlink_pool_va(uint64_t pa)
+ {
+-	if (pool == NULL || pa < MODEM_POOL_BASE || pa >= MODEM_POOL_BASE + MODEM_POOL_SIZE) {
++	if (pool == NULL || pa < MODEM_POOL_BASE || pa >= MODEM_POOL_BASE + MODEM_POOL_ALLOC) {
+ 		return NULL;
+ 	}
+ 	return pool + (pa - MODEM_POOL_BASE);
+@@ -741,7 +741,8 @@ mlink_map(void)
+ {
+ 	if (smem == NULL) {
+ 		smem = (uint8_t *)ml_io_map_unmappable((vm_offset_t)SMEM_PA, SMEM_SIZE, WIMG_WCOMB);
+-		pool = (uint8_t *)ml_io_map_unmappable((vm_offset_t)MODEM_POOL_BASE, MODEM_POOL_SIZE, WIMG_WCOMB);
++		/* not the MSA: once hyp-assigned away from HLOS it must not stay in our page tables */
++		pool = (uint8_t *)ml_io_map_unmappable((vm_offset_t)MODEM_POOL_BASE, MODEM_POOL_ALLOC, WIMG_WCOMB);
+ 		apcs = (volatile uint8_t *)ml_io_map((vm_offset_t)APCS_PA, 0x1000);
+ 		tcsr_mutex = (volatile uint8_t *)ml_io_map((vm_offset_t)TCSR_MUTEX_PA, (SMEM_HWLOCK + 1) * 0x1000);
+ 	}
+diff --git a/bsd/dev/sweet_wce.c b/bsd/dev/sweet_wce.c
+index 6cfd679..6e12760 100644
+--- a/bsd/dev/sweet_wce.c
++++ b/bsd/dev/sweet_wce.c
+@@ -379,10 +379,11 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 		memcpy(&hdr, d, 4);
+ 	}
+ 	wmi_events++;
+-	wmi_last_id = hdr >> 12;                    /* WMI_CMD_HDR: id in [31:12] */
++	wmi_last_id = hdr & 0xFFFFFF;               /* WMI_CMD_HDR_CMD_ID_MASK */
+ 	if (wmi_events <= 8) {
+-		LOG("t=%u ms: wmi: event %x, %u bytes%s", g_ms, wmi_last_id, len,
+-		    wmi_last_id == 0x1 ? " (SERVICE_READY)" : wmi_last_id == 0x2 ? " (READY)" : "");
++		LOG("t=%u ms: wmi: event %x (hdr %08x), %u bytes%s", g_ms, wmi_last_id, hdr, len,
++		    wmi_last_id == 0x1 ? " (SERVICE_READY)" : wmi_last_id == 0x2 ? " (READY)" :
++		    wmi_last_id == 0x3 ? " (SERVICE_AVAILABLE)" : "");   /* topaz WMI_EV_* */
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index de13dee..4d36ba6 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -23,8 +23,13 @@
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <sys/sysctl.h>
++#include <machine/machine_routines.h>
+ #include "sweet_mlink.h"
+ 
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++#define WIMG_WCOMB          0x6
++
+ int sweet_rpm_ldo(uint32_t ldo, uint32_t uv, uint32_t ma);
+ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ 
+@@ -57,10 +62,13 @@ static uint16_t w_txn = 1;
+ static bool w_msa_ind, w_cap_done, w_bdf_started, w_fw_ready, w_mission, w_powered, w_msa_zeroed;
+ static int w_bdf_fi = -1;
+ static uint32_t w_bdf_len, w_bdf_off;
+-static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;
++static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms, w_mission_ms;
++static bool w_off_sent;
+ static const char *w_step = "not started";
+ 
+-int sweet_wlfw_smmu = 1, sweet_wlfw_upto;
++int sweet_wlfw_smmu = 1, sweet_wlfw_upto, sweet_wlfw_off_ms;
++SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_off_ms, 0,
++    "W5 test: > 0 = WLAN_MODE OFF that many ms after mission");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_smmu, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_smmu, 0,
+     "W4: 1 = WLAN identity bank on the ANOC2 SMMU before step 11");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_upto, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_upto, 0,
+@@ -175,17 +183,30 @@ w_power_on(void)
+ 	LOG("t=%u ms: wlfw: WCN3990 rails L5/L7/L17/L25 + RF_CLK2 %s", g_ms, err ? "with ERRORS" : "on");
+ }
+ 
+-/* the MSA must read as zero when the firmware first sees it (icnss: __GFP_ZERO) */
++/*
++ * The MSA must read as zero when the firmware first sees it (icnss: __GFP_ZERO). It is
++ * mapped only for that and unmapped before MSA_INFO: once hyp-assigned to MSS/WLAN it
++ * must not stay in HLOS page tables (0152 kept it in the pool mapping, Linux uses
++ * no-map), so no CPU access, not even a speculative one, can reach it.
++ */
+ static void
+ w_msa_zero(void)
+ {
+-	uint8_t *va = sweet_mlink_pool_va(WLFW_MSA_PA);
+-	if (w_msa_zeroed || va == NULL) {
++	vm_offset_t va;
++
++	if (w_msa_zeroed) {
++		return;
++	}
++	va = ml_io_map_unmappable((vm_offset_t)WLFW_MSA_PA, WLFW_MSA_SIZE, WIMG_WCOMB);
++	if (va == 0) {
++		LOG("wlfw: MSA map failed, not zeroed");
+ 		return;
+ 	}
+-	bzero(va, WLFW_MSA_SIZE);
+-	mb();
++	bzero((void *)va, WLFW_MSA_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap(va & ~(vm_offset_t)PAGE_MASK, WLFW_MSA_SIZE);
+ 	w_msa_zeroed = true;
++	LOG("wlfw: MSA %llx zeroed and unmapped", (unsigned long long)WLFW_MSA_PA);
+ }
+ 
+ static void
+@@ -494,9 +515,14 @@ w_on_resp(uint16_t msg, const uint8_t *d, uint32_t len)
+ 		}
+ 		break;
+ 	case WLFW_WLAN_MODE:
+-		LOG("t=%u ms: wlfw: wlan_mode mission %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		LOG("t=%u ms: wlfw: wlan_mode %s %s err %u", g_ms, w_off_sent ? "OFF" : "mission", ok ? "ok" : "FAILED", err);
++		if (w_off_sent) {
++			w_step = ok ? "WLAN OFF (test)" : "WLAN OFF FAILED";
++			break;
++		}
+ 		if (ok) {
+ 			w_mission = true;
++			w_mission_ms = g_ms;
+ 			w_step = "WLAN ON (mission)";
+ 			LOG("t=%u ms: *** WLAN ON (mission mode) ***", g_ms);
+ 			/* ath10k_snoc_hif_power_up: copy engines right after wlan_enable (0151: none = SoC freeze) */
+@@ -579,6 +605,15 @@ wlfw_poll(void)
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
+ 	sweet_wce_poll();
++	if (w_mission && !w_off_sent && sweet_wlfw_off_ms > 0 && g_ms >= w_mission_ms + (unsigned)sweet_wlfw_off_ms) {
++		struct wmsg m;
++		w_off_sent = true;
++		if (wm_new(&m, WLFW_WLAN_MODE)) {
++			wm_u32(&m, 0x01, 4);                /* QMI_WLFW_OFF_V01 */
++			wm_send(&m, "wlan_mode OFF sent (test)");
++			LOG("t=%u ms: wlfw: WLAN_MODE OFF after %d ms of mission (kern.sweetwlfw_off_ms)", g_ms, sweet_wlfw_off_ms);
++		}
++	}
+ 	if (g_ms % 10 == 0) {
+ 		sweet_wsmmu_fault_poll(g_ms);
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
