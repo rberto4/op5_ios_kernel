@@ -1,0 +1,127 @@
+From 7ff8786fb1c958121462bd765a2bf030c40ffe6a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 20:36:42 +0100
+Subject: [PATCH] cheeseburger: answer QRTR NEW_LOOKUP, log unhandled QRTR
+ traffic
+
+0157: the MPSS fatal text is 'dog_hb.c:266: DOG_HB detects starvation of task' ~8-10 s after WLAN mission, with or without CE/WMI (0150/0151A froze on the same timer). Idle CE/GLINK, no WLFW indication. Suspect a modem task waiting on the AP side: answer NEW_LOOKUP like the Linux name service (matching servers + empty terminator), log every other control packet and DATA to ports we do not serve. Also fixes the legacy SMEM heap toc offset reading (entry is at +208).
+---
+ bsd/dev/sweet_glink.c | 21 ++++++++++++++++++---
+ bsd/dev/sweet_mlink.h |  4 ++++
+ bsd/dev/sweet_msvc.c  | 30 +++++++++++++++++++++++++-----
+ 3 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index ae253d0..505b352 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -581,15 +581,30 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
+ 			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
+ 		}
+-		if (hlen + size <= len) {
+-			(void)svc_rx(src_node, src_port, dst_port, p + hlen, size);
++		if (hlen + size <= len && !svc_rx(src_node, src_port, dst_port, p + hlen, size)) {
++			static unsigned unk;
++			if (unk++ < 24) {
++				const uint8_t *q = p + hlen;
++				LOG("t=%u ms: qrtr: DATA %u:%x -> port %x, %u B, no handler (qmi type %u txn %u msg %x)", g_ms,
++				    src_node, src_port, dst_port, size, size > 0 ? q[0] : 0xff,
++				    size >= 3 ? (unsigned)(q[1] | q[2] << 8) : 0, size >= 5 ? (unsigned)(q[3] | q[4] << 8) : 0);
++			}
+ 		}
+ 		break;
+ 	case QRTR_TYPE_RESUME_TX:
+ 		q_resumes++;
+ 		break;
+-	default:
++	case QRTR_TYPE_NEW_LOOKUP:
++		svc_lookup(src_node, src_port, c->a, c->b);
+ 		break;
++	default: {
++		static unsigned unk;
++		if (unk++ < 24) {
++			LOG("t=%u ms: qrtr: ctrl type %u from %u:%x to port %x: %x %x %x %x", g_ms, type, src_node, src_port,
++			    dst_port, c->a, c->b, c->c, c->d);
++		}
++		break;
++	}
+ 	}
+ }
+ 
+diff --git a/bsd/dev/sweet_mlink.h b/bsd/dev/sweet_mlink.h
+index 80eb3a3..f52f1ba 100644
+--- a/bsd/dev/sweet_mlink.h
++++ b/bsd/dev/sweet_mlink.h
+@@ -43,6 +43,7 @@ struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, f
+ #define svc_rx              sweet_mlink_svc_rx
+ #define svc_announce        sweet_mlink_svc_announce
+ #define svc_summary         sweet_mlink_svc_summary
++#define svc_lookup          sweet_mlink_svc_lookup
+ #define wlfw_arrive         sweet_mlink_wlfw_arrive
+ #define wlfw_rx             sweet_mlink_wlfw_rx
+ #define wlfw_poll           sweet_mlink_wlfw_poll
+@@ -65,6 +66,8 @@ struct smem_part_hdr { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, f
+ #define QRTR_TYPE_DEL_SERVER 5
+ #define QRTR_TYPE_DEL_CLIENT 6
+ #define QRTR_TYPE_RESUME_TX 7
++#define QRTR_TYPE_NEW_LOOKUP 10
++#define QRTR_TYPE_DEL_LOOKUP 11
+ #define QMI_SVC_WLFW        0x45
+ #define QMI_REQ             0
+ #define QMI_RESP            2
+@@ -81,6 +84,7 @@ void *pool_alloc(uint64_t size, uint64_t *pa);
+ bool svc_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *data, uint32_t len);
+ void svc_announce(void);
+ void svc_summary(void);
++void svc_lookup(uint32_t node, uint32_t port, uint32_t service, uint32_t instance);
+ void wlfw_arrive(uint32_t node, uint32_t port);
+ /* sweet_wlfw.c (W4) */
+ void wlfw_rx(const uint8_t *data, uint32_t len);
+diff --git a/bsd/dev/sweet_msvc.c b/bsd/dev/sweet_msvc.c
+index 5b5b902..6b3fc0f 100644
+--- a/bsd/dev/sweet_msvc.c
++++ b/bsd/dev/sweet_msvc.c
+@@ -764,14 +764,34 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ }
+ 
+ 
++static const uint32_t svc[][3] = {
++	{ 0x40, 0x101, PORT_PDM },              /* servreg-locator, version 0x101 instance 0 */
++	{ 4096, 1,     PORT_TFTP },             /* tftp */
++	{ 14,   1,     PORT_RMTFS },            /* rmtfs */
++};
++
++/* Linux qrtr ns ctrl_cmd_new_lookup: every matching server of ours, then an empty NEW_SERVER
++ * (end of list) to the asking port. instance 0 = any. */
++void
++svc_lookup(uint32_t node, uint32_t port, uint32_t service, uint32_t instance)
++{
++	unsigned n = 0;
++	for (unsigned i = 0; i < 3; i++) {
++		if (svc[i][0] != service || (instance != 0 && svc[i][1] != instance)) {
++			continue;
++		}
++		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, svc[i][0], svc[i][1], QRTR_NODE_APPS, svc[i][2] };
++		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, node, port, &c, sizeof(c));
++		n++;
++	}
++	struct qrtr_ctrl end = { QRTR_TYPE_NEW_SERVER, 0, 0, 0, 0 };
++	qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, node, port, &end, sizeof(end));
++	LOG("t=%u ms: qrtr: LOOKUP svc %x inst %x from %u:%x -> %u of ours + end", g_ms, service, instance, node, port, n);
++}
++
+ void
+ svc_announce(void)
+ {
+-	static const uint32_t svc[][3] = {
+-		{ 0x40, 0x101, PORT_PDM },              /* servreg-locator, version 0x101 instance 0 */
+-		{ 4096, 1,     PORT_TFTP },             /* tftp */
+-		{ 14,   1,     PORT_RMTFS },            /* rmtfs */
+-	};
+ 	for (unsigned i = 0; i < 3; i++) {
+ 		struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, svc[i][0], svc[i][1], QRTR_NODE_APPS, svc[i][2] };
+ 		qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
+-- 
+2.54.0 (Apple Git-157)
+
