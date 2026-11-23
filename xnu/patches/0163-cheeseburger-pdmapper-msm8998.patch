@@ -1,0 +1,75 @@
+From 84e9ad8fd0215360f9e35cac304637f2a1a9a5fa Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 22:49:52 +0100
+Subject: [PATCH] cheeseburger: pd-mapper with the Linux msm8998 table (no PDR)
+
+Stock Android (OxygenOS logcat with kernel messages): the WLAN firmware runs in msm/modem/wlan_pd and the AP service-notifier registers for it and ACKs its state indication before icnss connects; cnss-daemon also connects to WLPS. Our pd-mapper (topaz SM6125 table) answered tms/pdr_enabled and tms/servreg with modem domains, telling the modem the AP takes part in PD restart, while nobody here registers or ACKs. Linux qcom_pd_mapper for msm8998 maps neither (bergamota's sdm845 run: tms/pdr_enabled -> 0 domains, stable 10+ min). Default to that table; kern.sweetmss_pdr=1 restores the old one.
+---
+ bsd/dev/sweet_msvc.c | 29 ++++++++++++++++++++---------
+ 1 file changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/bsd/dev/sweet_msvc.c b/bsd/dev/sweet_msvc.c
+index ce18ff1..100283d 100644
+--- a/bsd/dev/sweet_msvc.c
++++ b/bsd/dev/sweet_msvc.c
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <sys/errno.h>
+ #include <sys/vnode.h>
+ #include <sys/fcntl.h>
+@@ -189,14 +190,25 @@ qm_string(const uint8_t *d, uint32_t len, uint8_t type, char *out, size_t max)
+ }
+ 
+ /* pd-mapper */
+-static const struct { const char *svc, *domain; } pd_map[] = {
+-	{ "tms/servreg",       "msm/modem/root_pd" },
+-	{ "tms/pdr_enabled",   "msm/modem/root_pd" },
+-	{ "gps/gps_service",   "msm/modem/root_pd" },
+-	{ "kernel/elf_loader", "msm/modem/wlan_pd" },
+-	{ "tms/servreg",       "msm/modem/wlan_pd" },
+-	{ "wlan/fw",           "msm/modem/wlan_pd" },
++/*
++ * Default = Linux qcom_pd_mapper msm8998 (mpss_root_pd with no services, mpss_wlan_pd with
++ * kernel/elf_loader + wlan/fw): "tms/pdr_enabled" and "tms/servreg" map to nothing, so the
++ * modem does not expect PD-restart/service-notifier clients on the AP. The topaz (SM6125)
++ * entries said PDR was on, but nobody here registers with servreg-notif or ACKs its
++ * indications (stock Android does: "Indication ACKed ... msm/modem/wlan_pd").
++ * Entries with pdr = 1 only with kern.sweetmss_pdr=1.
++ */
++static const struct { const char *svc, *domain; int pdr; } pd_map[] = {
++	{ "tms/servreg",       "msm/modem/root_pd", 1 },
++	{ "tms/pdr_enabled",   "msm/modem/root_pd", 1 },
++	{ "gps/gps_service",   "msm/modem/root_pd", 1 },
++	{ "kernel/elf_loader", "msm/modem/wlan_pd", 0 },
++	{ "tms/servreg",       "msm/modem/wlan_pd", 1 },
++	{ "wlan/fw",           "msm/modem/wlan_pd", 0 },
+ };
++static int sweet_mss_pdr;
++SYSCTL_INT(_kern, OID_AUTO, sweetmss_pdr, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mss_pdr, 0,
++    "pd-mapper: 0 = Linux msm8998 table (no PDR, default), 1 = topaz table (tms/pdr_enabled, tms/servreg)");
+ static unsigned pd_reqs;
+ 
+ static void
+@@ -217,7 +229,7 @@ pdm_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t *
+ 	}
+ 	qm_string(d, len, 1, name, sizeof(name));
+ 	for (unsigned i = 0; i < sizeof(pd_map) / sizeof(pd_map[0]); i++) {
+-		if (strcmp(pd_map[i].svc, name) == 0) {
++		if (strcmp(pd_map[i].svc, name) == 0 && (!pd_map[i].pdr || sweet_mss_pdr)) {
+ 			uint32_t dl = (uint32_t)strlen(pd_map[i].domain), inst = 180, zero = 0;
+ 			list[n++] = (uint8_t)dl;
+ 			memcpy(list + n, pd_map[i].domain, dl);
+@@ -796,7 +808,6 @@ svc_lookup(uint32_t node, uint32_t port, uint32_t service, uint32_t instance)
+  * mission mode on the same Q6, the modem's DOG_HB saw a starved task ~4 s later (0154-0158).
+  * QMI DMS SET_OPERATING_MODE (0x2E) TLV 1 = 1 (LOW_POWER) as soon as DMS appears.
+  */
+-#include <sys/sysctl.h>
+ static int sweet_mss_lpm = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweetmss_lpm, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_mss_lpm, 0,
+     "put the modem in QMI DMS low power mode once DMS is up (1, default) or leave it online (0)");
+-- 
+2.54.0 (Apple Git-157)
+
