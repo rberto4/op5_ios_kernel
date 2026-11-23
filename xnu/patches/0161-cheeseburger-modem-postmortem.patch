@@ -1,0 +1,197 @@
+From 093ac5e28130cce8f399dc5acf5ab5d325e73ef2 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 22:02:06 +0100
+Subject: [PATCH] cheeseburger: modem post-mortem, find the starved task in
+ MPSS
+
+0154-0160: 'DOG_HB detects starvation of task 0x...' ~8 s into WLAN mission mode, every time, only while mission lasts; CE/WMI, IPA, QRTR, LPM and the rail mode are ruled out. As Linux q6v5_dump_segment: after the fatal, tear down, reload the MBA (its XPU must be running to release MPSS), hyp-assign MPSS back to HLOS and search all 112 MiB for the task value from the crash text, hexdumping 128 bytes around the first 10 hits (thread object, DOG_HB client table, names). kern.sweetmss_postmortem (default 1).
+---
+ bsd/dev/sweet_glink.c |  18 ++++++++
+ bsd/dev/sweet_mss.c   | 100 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index 287940e..48396ce 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -153,6 +153,9 @@ smem_scan_errors(void)
+ 	LOG("smem scan: %u error-like strings", hits);
+ }
+ 
++bool sweet_mlink_fatal;
++uint32_t sweet_mlink_fatal_task;
++
+ static void
+ smem_log_crash_reason(void)
+ {
+@@ -186,6 +189,20 @@ smem_log_crash_reason(void)
+ 	}
+ 	buf[n] = 0;
+ 	LOG("modem crash reason (smem v%u, %u B): '%s'", ver, size, buf);
++	const char *t = NULL;
++	for (uint32_t i = 0; i + 7 <= n; i++) {
++		if (memcmp(buf + i, "task 0x", 7) == 0) {
++			t = buf + i;
++			break;
++		}
++	}
++	if (t != NULL) {
++		uint32_t v = 0;
++		for (t += 7; (*t >= '0' && *t <= '9') || (*t >= 'a' && *t <= 'f') || (*t >= 'A' && *t <= 'F'); t++) {
++			v = v << 4 | (uint32_t)(*t <= '9' ? *t - '0' : (*t | 0x20) - 'a' + 10);
++		}
++		sweet_mlink_fatal_task = v;
++	}
+ }
+ 
+ static bool
+@@ -879,6 +896,7 @@ sweet_mlink_watch(unsigned seconds, uint32_t (*slave_kernel)(void))
+ 		}
+ 		if (ms % 10 == 0 && slave_kernel != NULL && (slave_kernel() & 1)) {
+ 			LOG("t=%u ms: modem fatal (slave-kernel bit 0): stopping the watch", ms);
++			sweet_mlink_fatal = true;
+ 			smem_log_crash_reason();
+ 			break;
+ 		}
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+index 2e7618c..2004507 100644
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -44,6 +44,10 @@
+ #include "sweet_mss.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++extern bool sweet_mlink_fatal;
++extern uint32_t sweet_mlink_fatal_task;
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ 
+@@ -701,6 +705,93 @@ teardown(struct mss_state *s)
+ 	printf("SWEET MSS: teardown done%s\n", mss_dirty ? " (carve-out NOT reclaimed: no more runs)" : "");
+ }
+ 
++/* ---- post-mortem (Linux q6v5_dump_segment: reload the MBA, then MPSS back to HLOS) ---- */
++
++static int mss_postmortem_on = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweetmss_postmortem, CTLFLAG_RW | CTLFLAG_LOCKED, &mss_postmortem_on, 0,
++    "after a modem fatal: reload the MBA, reclaim MPSS and search it for the starved task (1, default)");
++
++#define PM_WIN          0x100000u
++#define PM_WIMG_WCOMB   0x6             /* VM_WIMG_WCOMB: normal non-cacheable */
++#define PM_MAX_HITS     10
++
++static void
++pm_hexdump(uint64_t pa, const uint8_t *p, uint32_t n)
++{
++	for (uint32_t o = 0; o < n; o += 16) {
++		char a[17];
++		uint32_t w[4];
++		memcpy(w, p + o, 16);
++		for (uint32_t k = 0; k < 16; k++) {
++			a[k] = (p[o + k] >= 0x20 && p[o + k] < 0x7f) ? (char)p[o + k] : '.';
++		}
++		a[16] = 0;
++		printf("SWEET PM: %09llx: %08x %08x %08x %08x |%s|\n", pa + o, w[0], w[1], w[2], w[3], a);
++	}
++}
++
++/* every 32-bit occurrence of `task` in MPSS, with 128 bytes before and after */
++static void
++pm_scan(uint32_t task)
++{
++	static uint8_t ctx[256];
++	unsigned hits = 0, total = 0;
++
++	for (uint64_t pa = MPSS_PA; pa < (uint64_t)MPSS_PA + MPSS_SIZE; pa += PM_WIN) {
++		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, PM_WIN, PM_WIMG_WCOMB);
++		if (va == 0) {
++			printf("SWEET PM: cannot map %llx\n", pa);
++			return;
++		}
++		for (uint32_t o = 0; o < PM_WIN; o += 4) {
++			if (*(volatile uint32_t *)(va + o) != task) {
++				continue;
++			}
++			total++;
++			if (hits >= PM_MAX_HITS) {
++				continue;
++			}
++			hits++;
++			uint32_t lo = o >= 128 ? o - 128 : 0, hi = MIN(o + 128, PM_WIN);
++			for (uint32_t k = lo; k < hi; k += 4) {
++				*(uint32_t *)(ctx + (k - lo)) = *(volatile uint32_t *)(va + k);
++			}
++			printf("SWEET PM: hit %u at %09llx\n", hits, pa + o);
++			pm_hexdump(pa + lo, ctx, hi - lo);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(va, PM_WIN);
++	}
++	printf("SWEET PM: task %#x: %u occurrence(s) in MPSS, %u dumped\n", task, total, hits);
++}
++
++static void
++mss_postmortem(struct mss_state *s, const uint8_t *fw, size_t len)
++{
++	struct mss_state r;
++
++	printf("SWEET PM: modem fatal, starved task %#x: post-mortem\n", sweet_mlink_fatal_task);
++	teardown(s);
++	bzero(&r, sizeof(r));
++	r.mpss_perm = s->mpss_perm;
++	r.mba_perm = s->mba_perm;
++	if (!copy_mba(fw, len) || !clocks_on(&r) || !assign_to_mss(&r) || !boot_mba(&r)) {
++		printf("SWEET PM: MBA reload failed\n");
++		teardown(&r);
++		return;
++	}
++	if (sweet_mss_xfer(MPSS_PA, MPSS_SIZE, &r.mpss_perm, true, false)) {
++		printf("SWEET PM: MPSS reclaim refused\n");
++		teardown(&r);
++		return;
++	}
++	printf("SWEET PM: MPSS back to HLOS, searching\n");
++	if (sweet_mlink_fatal_task != 0) {
++		pm_scan(sweet_mlink_fatal_task);
++	}
++	teardown(&r);
++}
++
+ static int
+ mss_run(int last)
+ {
+@@ -708,6 +799,7 @@ mss_run(int last)
+ 	size_t len = 0;
+ 	uint8_t *fw = NULL;
+ 	int reached = 0;
++	bool torn = false;
+ 	bzero(&s, sizeof(s));
+ 	s.mpss_perm = s.mba_perm = 1ull << VMID_HLOS;
+ 	if (!map_regs()) {
+@@ -755,6 +847,10 @@ mss_run(int last)
+ 	}
+ 	if (last >= 7 && reached == 6) {
+ 		reached = sweet_mpss_run(&s, last, mss_hold);
++		if (sweet_mlink_fatal && mss_postmortem_on) {
++			mss_postmortem(&s, fw, len);
++			torn = true;
++		}
+ 	}
+ done:
+ 	if (fw) {
+@@ -763,7 +859,9 @@ done:
+ 	if (reached < last || last < 6) {
+ 		printf("SWEET MSS: stopped after step %d (asked %d)\n", reached, last);
+ 	}
+-	if (mss_keep && s.alive) {
++	if (torn) {
++		printf("SWEET MSS: torn down by the post-mortem\n");
++	} else if (mss_keep && s.alive) {
+ 		printf("SWEET MSS: keep=1: MBA left running, no teardown\n");
+ 		mss_dirty = true;
+ 	} else {
+-- 
+2.54.0 (Apple Git-157)
+
