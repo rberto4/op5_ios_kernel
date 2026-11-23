@@ -1,0 +1,570 @@
+From bfacb0f7effeb54f797b3c33b87a480b10f3e5bc Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 13:56:56 +0100
+Subject: [PATCH] cheeseburger: WLAN copy engines + HTC after mission mode (W5
+ part 1)
+
+0151 test A froze the SoC 12 s after WLAN_MODE mission, test B (stop at FW_READY) ran 60 s clean: the firmware wants the host copy engines that ath10k_snoc_hif_power_up programs right after wlan_enable. sweet_wce.c ports topaz 0123 CE + HTC (TopazModem.cpp, APSL 2.0): CE regs at membase 0x18800000 + 0x240000, shadow write indices at +0x32000, RRI in DDR, rings and 32 x 2 KiB rx buffers per pipe from the modem pool (physical addresses through the ANOC2 identity bank). Started 100 ms after WLAN_MODE ok (kern.sweetwlfw_upto 0 with the SMMU bank), polled from the watch loop; HTC READY -> connect HTT then WMI -> SETUP_COMPLETE_EX; WMI events only logged (INIT/scan are part 2). upto 3 = mission without CE (0151 behaviour). CE/HTC summary every 5 s.
+---
+ bsd/conf/files        |   1 +
+ bsd/dev/sweet_mlink.h |   6 +-
+ bsd/dev/sweet_wce.c   | 466 ++++++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_wlfw.c  |  14 +-
+ 4 files changed, 485 insertions(+), 2 deletions(-)
+ create mode 100644 bsd/dev/sweet_wce.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 49c4772..50a92e0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_glink.c			standard
+ bsd/dev/sweet_msvc.c			standard
+ bsd/dev/sweet_wlfw.c			standard
+ bsd/dev/sweet_wsmmu.c			standard
++bsd/dev/sweet_wce.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_mlink.h b/bsd/dev/sweet_mlink.h
+index 3ff02bb..b46d82e 100644
+--- a/bsd/dev/sweet_mlink.h
++++ b/bsd/dev/sweet_mlink.h
+@@ -97,7 +97,11 @@ uint64_t scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigne
+ void sweet_wsmmu_dump(void);
+ bool sweet_wsmmu_identity(void);
+ void sweet_wsmmu_fault_poll(unsigned ms);
+-/* kern.sweetwlfw_smmu (1: identity bank before step 11), kern.sweetwlfw_upto (0 mission, 1 stop at FW_READY, 2 after WLAN_CFG) */
++/* sweet_wce.c: copy engines + HTC (W5 part 1) */
++bool sweet_wce_start(void);
++void sweet_wce_poll(void);
++void sweet_wce_summary(void);
++/* kern.sweetwlfw_smmu (1: identity bank before step 11), kern.sweetwlfw_upto (0 mission + CE/HTC, 1 stop at FW_READY, 2 after WLAN_CFG, 3 mission without CE) */
+ extern int sweet_wlfw_smmu, sweet_wlfw_upto;
+ /* sweet_glink.c: kernel VA of a pool physical address, NULL outside the pool */
+ uint8_t *sweet_mlink_pool_va(uint64_t pa);
+diff --git a/bsd/dev/sweet_wce.c b/bsd/dev/sweet_wce.c
+new file mode 100644
+index 0000000..6cfd679
+--- /dev/null
++++ b/bsd/dev/sweet_wce.c
+@@ -0,0 +1,466 @@
++/*
++ * WLAN copy engines + HTC for cheeseburger (OnePlus 5, MSM8998 + WCN3990), Wi-Fi W5 part 1.
++ *
++ * 0151 test A/B: WLAN_MODE mission without host copy engines froze the SoC within
++ * 5-12 s; stopping at FW_READY did not. Linux ath10k_snoc_hif_power_up programs the
++ * CEs right after wlan_enable, so this runs as soon as WLAN_MODE answers ok.
++ *
++ * Port of topaz 0123 (TopazModem.cpp, APSL 2.0; itself from topaz-woa ce.c/htc.c,
++ * after Linux ath10k ce.c, snoc.c, htc.c): WCN3990 64-bit descriptors, read indices
++ * (RRI) written by the CE into DDR, source write index through the shadow registers.
++ * Rings and buffers come from the modem pool (low DDR bank); the ANOC2 SMMU bank of
++ * sweet_wsmmu.c does not translate, so device addresses are physical. Polled from
++ * the step-11 watch loop, no interrupts.
++ *
++ * Milestone: HTC READY from the target, HTT + WMI endpoints connected,
++ * SETUP_COMPLETE_EX, then the first WMI events (SERVICE_READY) logged. WMI INIT
++ * and the scan are W5 part 2.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include "sweet_mlink.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define WLAN_MEMBASE        0x18800000ull       /* icnss@18800000 membase */
++#define CE_PA               (WLAN_MEMBASE + 0x240000)
++#define SHADOW_PA           (WLAN_MEMBASE + 0x32000)
++#define CE_COUNT            12
++#define SR_BASE_LO          0x00
++#define SR_BASE_HI          0x04
++#define SR_SIZE             0x08
++#define DR_BASE_LO          0x0C
++#define DR_BASE_HI          0x10
++#define DR_SIZE             0x14
++#define CTRL1               0x18
++#define SR_WR_IDX           0x3C
++#define DR_WR_IDX           0x40
++#define CUR_SRRI            0x44
++#define CUR_DRRI            0x48
++#define SRC_WM              0x4C
++#define DST_WM              0x50
++#define WRAP_RRI_LO         0xC004
++#define WRAP_RRI_HI         0xC008
++#define CTRL1_DMAX          0x0000FFFFu
++#define CTRL1_SRC_SWAP      (1u << 17)
++#define CTRL1_DST_SWAP      (1u << 18)
++#define CTRL1_RRI_UPD       (1u << 19)
++#define ADDR_HI_MASK        0x1Fu
++#define ATTR_DIS_INTR       0x08
++#define RX_BUF_SIZE         2048
++#define RX_POST             32
++#define TX_SLOTS_MAX        64
++
++struct ce_desc { uint64_t addr; uint16_t nbytes, flags; uint32_t toeplitz; } __attribute__((packed));
++struct ce_attr { uint16_t src_n, src_max, dst_n, flags; };
++
++/* host_ce_config_wlan (ath10k snoc.c) */
++static const struct ce_attr ce_attr[CE_COUNT] = {
++	{ 16, 2048, 0, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 64, 0 }, { 32, 2048, 0, 0 },
++	{ 2048, 256, 0, ATTR_DIS_INTR }, { 0, 512, 512, 0 }, { 0, 0, 0, 0 }, { 2, 2048, 2, 0 },
++	{ 0, 2048, 128, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 }, { 0, 2048, 512, 0 },
++};
++
++struct ce_state {
++	volatile struct ce_desc *src, *dst;
++	uint64_t src_pa, dst_pa, rx_pa, tx_pa;
++	uint32_t src_n, dst_n, src_wr, dst_wr, dst_sw;
++	uint8_t *rx_buf, *tx_buf;
++	uint32_t rx, tx, tx_full;
++};
++static struct ce_state ce[CE_COUNT];
++static volatile uint8_t *ce_regs, *ce_shadow;
++static volatile uint32_t *ce_rri;
++static uint64_t ce_rri_pa;
++static bool ce_up;
++
++static inline uint32_t r32(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(b + o) = v; }
++
++static bool ce_host_rx(uint32_t c) { return ce_attr[c].dst_n != 0 && c != 7; }
++static bool ce_host_tx(uint32_t c) { return c == 0 || c == 3 || c == 4; }
++static uint32_t ce_tx_slots(uint32_t c) { return MIN(ce[c].src_n, (uint32_t)TX_SLOTS_MAX); }
++static uint32_t ce_tx_sz(uint32_t c) { return ce_attr[c].src_max; }
++static uint32_t pow2(uint32_t n) { uint32_t p = 1; while (p < n) { p <<= 1; } return p; }
++static uint32_t ce_rd(uint32_t c, uint32_t o) { return r32(ce_regs, c * 0x1000 + o); }
++static void ce_wr(uint32_t c, uint32_t o, uint32_t v) { w32(ce_regs, c * 0x1000 + o, v); }
++static uint64_t pg(uint64_t n) { return (n + 0xfff) & ~0xfffull; }
++
++/* ---------------------------------------------------------------- copy engines */
++
++static void
++ce_post(uint32_t c)
++{
++	struct ce_state *s = &ce[c];
++	uint32_t slot = s->dst_wr;
++	s->dst[slot].addr = s->rx_pa + (uint64_t)(slot % RX_POST) * RX_BUF_SIZE;
++	s->dst[slot].nbytes = 0;
++	s->dst_wr = (slot + 1) & (s->dst_n - 1);
++}
++
++static uint64_t
++ce_layout_size(void)
++{
++	uint64_t off = 0x1000;                      /* RRI in the first page */
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		ce[c].src_n = ce_attr[c].src_n ? pow2(ce_attr[c].src_n) : 0;
++		ce[c].dst_n = ce_attr[c].dst_n ? pow2(ce_attr[c].dst_n) : 0;
++		off += pg((uint64_t)ce[c].src_n * sizeof(struct ce_desc));
++		off += pg((uint64_t)ce[c].dst_n * sizeof(struct ce_desc));
++		off += ce_host_rx(c) ? RX_POST * RX_BUF_SIZE : 0;
++		off += ce_host_tx(c) ? ce_tx_slots(c) * ce_tx_sz(c) : 0;
++	}
++	return off;
++}
++
++static void
++ce_layout(uint8_t *va, uint64_t pa)
++{
++	uint64_t off = 0x1000;
++	ce_rri = (volatile uint32_t *)va;
++	ce_rri_pa = pa;
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		struct ce_state *s = &ce[c];
++		if (s->src_n != 0) {
++			s->src = (volatile struct ce_desc *)(va + off);
++			s->src_pa = pa + off;
++			off += pg((uint64_t)s->src_n * sizeof(struct ce_desc));
++		}
++		if (s->dst_n != 0) {
++			s->dst = (volatile struct ce_desc *)(va + off);
++			s->dst_pa = pa + off;
++			off += pg((uint64_t)s->dst_n * sizeof(struct ce_desc));
++		}
++		if (ce_host_rx(c)) {
++			s->rx_buf = va + off;
++			s->rx_pa = pa + off;
++			off += RX_POST * RX_BUF_SIZE;
++		}
++		if (ce_host_tx(c)) {
++			s->tx_buf = va + off;
++			s->tx_pa = pa + off;
++			off += ce_tx_slots(c) * ce_tx_sz(c);
++		}
++	}
++}
++
++/* ath10k_ce_init_src_ring / ath10k_ce_init_dest_ring */
++static void
++ce_program(uint32_t c)
++{
++	struct ce_state *s = &ce[c];
++	if (s->src_n != 0) {
++		s->src_wr = ce_rd(c, SR_WR_IDX) & (s->src_n - 1);
++		ce_wr(c, SR_BASE_LO, (uint32_t)s->src_pa);
++		ce_wr(c, SR_BASE_HI, (uint32_t)(s->src_pa >> 32) & ADDR_HI_MASK);
++		ce_wr(c, SR_SIZE, s->src_n);
++		ce_wr(c, CTRL1, (ce_rd(c, CTRL1) & ~(CTRL1_DMAX | CTRL1_SRC_SWAP)) | ce_attr[c].src_max);
++		ce_wr(c, SRC_WM, s->src_n);
++	}
++	if (s->dst_n != 0) {
++		s->dst_sw = ce_rd(c, CUR_DRRI) & (s->dst_n - 1);
++		s->dst_wr = ce_rd(c, DR_WR_IDX) & (s->dst_n - 1);
++		ce_wr(c, DR_BASE_LO, (uint32_t)s->dst_pa);
++		ce_wr(c, DR_BASE_HI, (ce_rd(c, DR_BASE_HI) & ~ADDR_HI_MASK) | ((uint32_t)(s->dst_pa >> 32) & ADDR_HI_MASK));
++		ce_wr(c, DR_SIZE, s->dst_n);
++		ce_wr(c, CTRL1, ce_rd(c, CTRL1) & ~CTRL1_DST_SWAP);
++		ce_wr(c, DST_WM, s->dst_n);
++	}
++}
++
++/* after WLAN_MODE mission ok: before mission a CE access hangs the bus (topaz) */
++bool
++sweet_wce_start(void)
++{
++	uint64_t size, pa = 0;
++	uint8_t *va;
++
++	if (ce_up) {
++		return true;
++	}
++	size = ce_layout_size();
++	if (ce_regs == NULL) {
++		ce_regs = (volatile uint8_t *)ml_io_map((vm_offset_t)CE_PA, (CE_COUNT + 1) * 0x1000);
++		ce_shadow = (volatile uint8_t *)ml_io_map((vm_offset_t)SHADOW_PA, 0x1000);
++	}
++	va = (uint8_t *)pool_alloc(size, &pa);
++	if (ce_regs == NULL || ce_shadow == NULL || va == NULL) {
++		LOG("ce: map/alloc failed (%llu bytes)", size);
++		return false;
++	}
++	LOG("t=%u ms: ce: host memory %llx + %llx; CE0 CTRL1 %08x SR_WR %x DR_WR %x", g_ms, pa, size,
++	    ce_rd(0, CTRL1), ce_rd(0, SR_WR_IDX), ce_rd(0, DR_WR_IDX));
++	ce_layout(va, pa);
++	/* the CE writes its read indices to ce_rri[ce] (src [15:0], dst [31:16]) */
++	w32(ce_regs, WRAP_RRI_LO, (uint32_t)ce_rri_pa);
++	w32(ce_regs, WRAP_RRI_HI, (uint32_t)(ce_rri_pa >> 32) & ADDR_HI_MASK);
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		ce_wr(c, CTRL1, ce_rd(c, CTRL1) | CTRL1_RRI_UPD);
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		ce_program(c);
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {   /* ath10k_snoc_rx_post */
++		if (!ce_host_rx(c)) {
++			continue;
++		}
++		for (uint32_t i = 0; i < RX_POST; i++) {
++			ce_post(c);
++		}
++		mb();
++		ce_wr(c, DR_WR_IDX, ce[c].dst_wr);
++	}
++	ce_up = true;
++	LOG("t=%u ms: ce: %u rings programmed, rx posted", g_ms, CE_COUNT);
++	return true;
++}
++
++static bool
++ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer_id)
++{
++	if (!ce_up || c >= CE_COUNT || !ce_host_tx(c) || len > ce_tx_sz(c)) {
++		return false;
++	}
++	struct ce_state *s = &ce[c];
++	uint32_t mask = s->src_n - 1, sw = ce_rri[c] & 0xFFFF;
++	if (((sw - 1 - s->src_wr) & mask) == 0 || ((s->src_wr - sw) & mask) >= ce_tx_slots(c) - 1) {
++		s->tx_full++;
++		return false;
++	}
++	uint32_t slot = s->src_wr;
++	memcpy(s->tx_buf + (slot % ce_tx_slots(c)) * ce_tx_sz(c), data, len);
++	volatile struct ce_desc *d = &s->src[slot];
++	d->addr = s->tx_pa + (uint64_t)(slot % ce_tx_slots(c)) * ce_tx_sz(c);
++	d->nbytes = (uint16_t)len;
++	d->flags = (uint16_t)((transfer_id << 4) & 0xFFF0);
++	d->toeplitz = 0;
++	s->src_wr = (slot + 1) & mask;
++	s->tx++;
++	mb();
++	*(volatile uint32_t *)(ce_shadow + 4 * c) = s->src_wr;
++	mb();
++	return true;
++}
++
++/* ---------------------------------------------------------------- HTC (ath10k htc.c) */
++
++#define HTC_MSG_READY       1
++#define HTC_MSG_CONNECT     2
++#define HTC_MSG_CONNECT_RESP 3
++#define HTC_MSG_SETUP_COMPLETE_EX 5
++#define HTC_FLAG_NEED_CREDIT_UPDATE 0x01
++#define HTC_FLAG_TRAILER    0x02
++#define HTC_CONN_NO_CREDIT_FLOW 0x0008
++#define SVC_RSVD_CTRL       0x0001
++#define SVC_WMI_CONTROL     0x0100
++#define SVC_HTT_DATA        0x0300
++#define EP_MAX              8
++
++struct htc_hdr { uint8_t eid, flags; uint16_t len; uint8_t trailer, seq; uint16_t pad; } __attribute__((packed));
++struct htc_ep { uint16_t svc, max_msg; uint8_t ul, dl, seq, credits; bool up, credit_flow; uint32_t rx; };
++static struct htc_ep ep[EP_MAX];
++static uint8_t wmi_eid = 0xFF, htt_eid = 0xFF;
++static bool htc_ready, htc_setup;
++static uint32_t wmi_events, wmi_last_id;
++
++static bool
++htc_send(uint8_t eid, const void *payload, uint32_t len)
++{
++	static uint8_t buf[2048];
++	struct htc_hdr *h = (struct htc_hdr *)buf;
++	if (eid >= EP_MAX || len + sizeof(*h) > sizeof(buf)) {
++		return false;
++	}
++	struct htc_ep *e = &ep[eid];
++	if (e->credit_flow) {
++		if (e->credits == 0) {
++			return false;
++		}
++		e->credits--;
++	}
++	bzero(h, sizeof(*h));
++	h->eid = eid;
++	h->len = (uint16_t)len;
++	h->flags = e->credit_flow ? HTC_FLAG_NEED_CREDIT_UPDATE : 0;
++	h->seq = e->seq++;
++	memcpy(buf + sizeof(*h), payload, len);
++	if (!ce_send(e->ul, buf, (uint32_t)sizeof(*h) + len, eid)) {
++		LOG("htc: send on ep %u (ce%u) FAILED", eid, e->ul);
++		return false;
++	}
++	return true;
++}
++
++static void
++htc_connect(uint16_t svc)
++{
++	uint8_t m[8] = { 0 };
++	uint16_t id = HTC_MSG_CONNECT, flags = svc == SVC_WMI_CONTROL ? (uint16_t)(1u << 8) : HTC_CONN_NO_CREDIT_FLOW;
++	memcpy(m, &id, 2);
++	memcpy(m + 2, &svc, 2);
++	memcpy(m + 4, &flags, 2);
++	(void)htc_send(0, m, sizeof(m));
++}
++
++static void
++htc_credits(const uint8_t *t, uint32_t tlen)
++{
++	/* trailer records {id, len, data}; id 1 = credit reports {eid, credits} */
++	for (uint32_t o = 0; o + 2 <= tlen && o + 2 + t[o + 1] <= tlen; o += 2 + t[o + 1]) {
++		if (t[o] != 1) {
++			continue;
++		}
++		for (uint32_t i = 0; i + 1 < t[o + 1]; i += 2) {
++			uint8_t e = t[o + 2 + i];
++			if (e < EP_MAX) {
++				ep[e].credits = (uint8_t)(ep[e].credits + t[o + 3 + i]);
++			}
++		}
++	}
++}
++
++static void
++htc_on_ready(const uint8_t *p)
++{
++	uint16_t cc, cs;
++	memcpy(&cc, p + 2, 2);
++	memcpy(&cs, p + 4, 2);
++	htc_ready = true;
++	ep[0].svc = SVC_RSVD_CTRL;
++	ep[0].ul = 0;
++	ep[0].dl = 2;
++	ep[0].up = true;
++	LOG("t=%u ms: *** HTC READY: credits %u x %u, %u endpoints ***", g_ms, cc, cs, p[6]);
++	htc_connect(SVC_HTT_DATA);                  /* ath10k_core_start: htt, then wmi */
++}
++
++static void
++htc_on_connect_resp(const uint8_t *p)
++{
++	uint16_t svc, max;
++	memcpy(&svc, p + 2, 2);
++	memcpy(&max, p + 6, 2);
++	uint8_t status = p[4], eid = p[5];
++	LOG("t=%u ms: htc: connect resp svc %x status %u eid %u max_msg %u", g_ms, svc, status, eid, max);
++	if (status != 0 || eid >= EP_MAX) {
++		return;
++	}
++	ep[eid].svc = svc;
++	ep[eid].max_msg = max;
++	ep[eid].ul = svc == SVC_WMI_CONTROL ? 3 : 4;
++	ep[eid].dl = svc == SVC_WMI_CONTROL ? 2 : 1;
++	ep[eid].up = true;
++	ep[eid].credit_flow = svc == SVC_WMI_CONTROL;
++	ep[eid].credits = ep[eid].credit_flow ? 1 : 0;
++	if (svc == SVC_HTT_DATA) {
++		htt_eid = eid;
++		htc_connect(SVC_WMI_CONTROL);
++	} else if (svc == SVC_WMI_CONTROL) {
++		uint8_t m[12] = { 0 };
++		uint16_t id = HTC_MSG_SETUP_COMPLETE_EX;
++		wmi_eid = eid;
++		memcpy(m, &id, 2);
++		htc_setup = htc_send(0, m, sizeof(m));
++		LOG("t=%u ms: htc: SETUP_COMPLETE_EX %s", g_ms, htc_setup ? "sent" : "FAILED");
++	}
++}
++
++/* W5 part 1 stops at logging WMI events: INIT and the scan are part 2 */
++static void
++wmi_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t hdr = 0;
++	if (len >= 4) {
++		memcpy(&hdr, d, 4);
++	}
++	wmi_events++;
++	wmi_last_id = hdr >> 12;                    /* WMI_CMD_HDR: id in [31:12] */
++	if (wmi_events <= 8) {
++		LOG("t=%u ms: wmi: event %x, %u bytes%s", g_ms, wmi_last_id, len,
++		    wmi_last_id == 0x1 ? " (SERVICE_READY)" : wmi_last_id == 0x2 ? " (READY)" : "");
++	}
++}
++
++static void
++htc_rx(uint32_t c, const uint8_t *d, uint32_t len)
++{
++	const struct htc_hdr *h = (const struct htc_hdr *)d;
++	const uint8_t *p = d + sizeof(*h);
++	(void)c;
++	if (len < sizeof(*h)) {
++		return;
++	}
++	uint32_t plen = MIN((uint32_t)h->len, len - (uint32_t)sizeof(*h));
++	if ((h->flags & HTC_FLAG_TRAILER) != 0 && h->trailer <= plen) {
++		htc_credits(p + plen - h->trailer, h->trailer);
++		plen -= h->trailer;
++	}
++	if (h->eid < EP_MAX) {
++		ep[h->eid].rx++;
++	}
++	if (h->eid == 0) {
++		uint16_t msg = 0;
++		if (plen >= 2) {
++			memcpy(&msg, p, 2);
++		}
++		if (msg == HTC_MSG_READY && plen >= 8) {
++			htc_on_ready(p);
++		} else if (msg == HTC_MSG_CONNECT_RESP && plen >= 8) {
++			htc_on_connect_resp(p);
++		}
++	} else if (h->eid == wmi_eid) {
++		wmi_rx(p, plen);
++	}
++	/* HTT (data path) comes later */
++}
++
++/* ---------------------------------------------------------------- poll, summary */
++
++void
++sweet_wce_poll(void)
++{
++	if (!ce_up) {
++		return;
++	}
++	for (uint32_t c = 0; c < CE_COUNT; c++) {
++		struct ce_state *s = &ce[c];
++		if (!ce_host_rx(c)) {
++			continue;
++		}
++		for (int k = 0; k < 16; k++) {
++			uint32_t slot = s->dst_sw, n = s->dst[slot].nbytes;
++			if (n == 0) {
++				break;
++			}
++			mb();                               /* payload after the descriptor */
++			s->dst[slot].nbytes = 0;
++			s->dst_sw = (slot + 1) & (s->dst_n - 1);
++			s->rx++;
++			htc_rx(c, s->rx_buf + (slot % RX_POST) * RX_BUF_SIZE, n);
++			ce_post(c);
++			mb();
++			ce_wr(c, DR_WR_IDX, s->dst_wr);
++		}
++	}
++}
++
++void
++sweet_wce_summary(void)
++{
++	if (!ce_up) {
++		LOG("ce: not started");
++		return;
++	}
++	LOG("ce: rx ce1 %u ce2 %u ce5 %u ce8 %u ce9 %u; tx ce0 %u ce3 %u ce4 %u (full %u/%u); RRI ce0 %08x ce2 %08x",
++	    ce[1].rx, ce[2].rx, ce[5].rx, ce[8].rx, ce[9].rx, ce[0].tx, ce[3].tx, ce[4].tx,
++	    ce[0].tx_full, ce[3].tx_full, ce_rri[0], ce_rri[2]);
++	LOG("htc: ready %u setup %u; htt eid %d wmi eid %d (credits %u); wmi events %u last %x",
++	    htc_ready, htc_setup, htt_eid == 0xFF ? -1 : htt_eid, wmi_eid == 0xFF ? -1 : wmi_eid,
++	    wmi_eid < EP_MAX ? ep[wmi_eid].credits : 0, wmi_events, wmi_last_id);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index 67708b1..de13dee 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -64,7 +64,7 @@ int sweet_wlfw_smmu = 1, sweet_wlfw_upto;
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_smmu, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_smmu, 0,
+     "W4: 1 = WLAN identity bank on the ANOC2 SMMU before step 11");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_upto, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_upto, 0,
+-    "W4: 0 = up to mission mode, 1 = stop at FW_READY, 2 = stop after WLAN_CFG");
++    "W4/W5: 0 = mission + copy engines/HTC, 1 = stop at FW_READY, 2 = stop after WLAN_CFG, 3 = mission without CE");
+ 
+ struct wmsg { uint8_t *b; uint32_t n; };
+ 
+@@ -499,6 +499,11 @@ w_on_resp(uint16_t msg, const uint8_t *d, uint32_t len)
+ 			w_mission = true;
+ 			w_step = "WLAN ON (mission)";
+ 			LOG("t=%u ms: *** WLAN ON (mission mode) ***", g_ms);
++			/* ath10k_snoc_hif_power_up: copy engines right after wlan_enable (0151: none = SoC freeze) */
++			if (sweet_wlfw_upto == 0 && sweet_wlfw_smmu) {
++				IOSleep(100);
++				w_step = sweet_wce_start() ? "WLAN ON, copy engines up" : "WLAN ON, copy engines FAILED";
++			}
+ 		}
+ 		break;
+ 	default:
+@@ -573,18 +578,25 @@ wlfw_poll(void)
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
++	sweet_wce_poll();
+ 	if (g_ms % 10 == 0) {
+ 		sweet_wsmmu_fault_poll(g_ms);
+ 	}
+ 	if (w_fw_ready && g_ms % 500 == 0) {           /* where a freeze happens */
+ 		LOG("t=%u ms: wlfw: alive, %s", g_ms, w_step);
+ 	}
++	if (w_mission && g_ms % 5000 == 0) {
++		sweet_wce_summary();
++	}
+ }
+ 
+ void
+ wlfw_summary(void)
+ {
+ 	LOG("WLFW: %s%s%s", w_step, w_fw_ready ? " (firmware ready)" : "", w_mission ? " [mission]" : "");
++	if (w_mission) {
++		sweet_wce_summary();
++	}
+ }
+ 
+ bool
+-- 
+2.54.0 (Apple Git-157)
+
