@@ -1,0 +1,110 @@
+From 49b7c0952d8dab2a2bbc76ba1e015fbcdbf0773c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 20:16:04 +0100
+Subject: [PATCH] cheeseburger: find the MPSS err_fatal text in SMEM; log new
+ WMI event ids
+
+0155: modem fatal again at 10.75 s (8.3 s after mission, same as 0154); SMEM 421 not in the v11 legacy heap. Log the raw toc entry and heap header, scan all of SMEM for error-like strings, and log the first occurrence of every unhandled WMI event.
+---
+ bsd/dev/sweet_glink.c | 50 ++++++++++++++++++++++++++++++++++++++++++-
+ bsd/dev/sweet_wmi.c   | 14 +++++++++++-
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index d38d41a..ae253d0 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -109,6 +109,50 @@ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ #define SMEM_GLOBAL_HOST    0xFFFE
+ #define SMEM_HEAP_TOC       204                 /* proc_comm[4] + version[32] + 3 words */
+ 
++/* Fallback: printable runs in all of SMEM that look like a Qualcomm err_fatal text. */
++static bool
++smem_err_like(const char *b, uint32_t n)
++{
++	static const char *const keys[] = { ".c:", ".cpp:", "ssert", "rror", "atal", "xcept", "rash" };
++	for (uint32_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
++		uint32_t kl = (uint32_t)strlen(keys[k]);
++		for (uint32_t i = 0; i + kl <= n; i++) {
++			if (memcmp(b + i, keys[k], kl) == 0) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++static void
++smem_scan_errors(void)
++{
++	char buf[128];
++	uint32_t run = 0, hits = 0;
++
++	for (uint32_t o = 0; o < SMEM_SIZE && hits < 12; o++) {
++		char c = (char)smem[o];
++		if (c >= 0x20 && c < 0x7f) {
++			if (run < sizeof(buf) - 1) {
++				buf[run] = c;
++			}
++			run++;
++			continue;
++		}
++		if (run >= 16) {
++			uint32_t n = MIN(run, (uint32_t)sizeof(buf) - 1);
++			buf[n] = 0;
++			if (smem_err_like(buf, n)) {
++				LOG("smem +%06x: '%s'%s", o - run, buf, run > n ? "..." : "");
++				hits++;
++			}
++		}
++		run = 0;
++	}
++	LOG("smem scan: %u error-like strings", hits);
++}
++
+ static void
+ smem_log_crash_reason(void)
+ {
+@@ -123,7 +167,11 @@ smem_log_crash_reason(void)
+ 		}
+ 	}
+ 	if (r == NULL || size == 0) {
+-		LOG("modem crash reason: SMEM item %u not found (smem version %u)", SMEM_CRASH_REASON, ver);
++		const volatile uint32_t *h = (const volatile uint32_t *)(smem + 192);
++		const volatile uint32_t *e = (const volatile uint32_t *)(smem + SMEM_HEAP_TOC + SMEM_CRASH_REASON * 16);
++		LOG("modem crash reason: SMEM item %u not found (smem version %u, heap init %x avail %x free %x; "
++		    "toc[421] %x %x %x %x)", SMEM_CRASH_REASON, ver, h[0], h[1], h[2], e[0], e[1], e[2], e[3]);
++		smem_scan_errors();
+ 		return;
+ 	}
+ 	char buf[160];
+diff --git a/bsd/dev/sweet_wmi.c b/bsd/dev/sweet_wmi.c
+index b9a29f4..ac862e5 100644
+--- a/bsd/dev/sweet_wmi.c
++++ b/bsd/dev/sweet_wmi.c
+@@ -698,9 +698,21 @@ sweet_wmi_rx(const uint8_t *d, uint32_t len)
+ 	case WMI_EV_MGMT_RX:
+ 		scan_mgmt_rx(d + 4, len - 4);
+ 		break;
+-	default:
++	default: {
++		static uint32_t seen[32], nseen, counts[32];
++		uint32_t i;
++		for (i = 0; i < nseen && seen[i] != id; i++) {
++		}
++		if (i == nseen && nseen < 32) {
++			seen[nseen++] = id;
++			LOG("t=%u ms: wmi: event %#x first seen, %u bytes", g_ms, id, len);
++		}
++		if (i < 32 && ++counts[i] % 50 == 0) {
++			LOG("t=%u ms: wmi: event %#x x%u", g_ms, id, counts[i]);
++		}
+ 		break;
+ 	}
++	}
+ }
+ 
+ void
+-- 
+2.54.0 (Apple Git-157)
+
