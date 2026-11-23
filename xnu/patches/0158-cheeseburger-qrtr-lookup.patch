@@ -1,4 +1,4 @@
-From 7ff8786fb1c958121462bd765a2bf030c40ffe6a Mon Sep 17 00:00:00 2001
+From 1667bbb38aae77bbb42f91e703b4f8b410e795bf Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Mon, 23 Nov 2026 20:36:42 +0100
 Subject: [PATCH] cheeseburger: answer QRTR NEW_LOOKUP, log unhandled QRTR
@@ -6,15 +6,24 @@ Subject: [PATCH] cheeseburger: answer QRTR NEW_LOOKUP, log unhandled QRTR
 
 0157: the MPSS fatal text is 'dog_hb.c:266: DOG_HB detects starvation of task' ~8-10 s after WLAN mission, with or without CE/WMI (0150/0151A froze on the same timer). Idle CE/GLINK, no WLFW indication. Suspect a modem task waiting on the AP side: answer NEW_LOOKUP like the Linux name service (matching servers + empty terminator), log every other control packet and DATA to ports we do not serve. Also fixes the legacy SMEM heap toc offset reading (entry is at +208).
 ---
- bsd/dev/sweet_glink.c | 21 ++++++++++++++++++---
+ bsd/dev/sweet_glink.c | 23 +++++++++++++++++++----
  bsd/dev/sweet_mlink.h |  4 ++++
  bsd/dev/sweet_msvc.c  | 30 +++++++++++++++++++++++++-----
- 3 files changed, 47 insertions(+), 8 deletions(-)
+ 3 files changed, 48 insertions(+), 9 deletions(-)
 
 diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
-index ae253d0..505b352 100644
+index ae253d0..8122827 100644
 --- a/bsd/dev/sweet_glink.c
 +++ b/bsd/dev/sweet_glink.c
+@@ -107,7 +107,7 @@ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+  * partition ($TOC entry 0xfffe/0xfffe) on SMEM v12, else the legacy global heap. */
+ #define SMEM_CRASH_REASON   421
+ #define SMEM_GLOBAL_HOST    0xFFFE
+-#define SMEM_HEAP_TOC       204                 /* proc_comm[4] + version[32] + 3 words */
++#define SMEM_HEAP_TOC       208                 /* proc_comm[4] + version[32] + 4 words (0155 dump) */
+ 
+ /* Fallback: printable runs in all of SMEM that look like a Qualcomm err_fatal text. */
+ static bool
 @@ -581,15 +581,30 @@ qrtr_rx(const uint8_t *p, uint32_t len)
  			struct qrtr_ctrl r = { QRTR_TYPE_RESUME_TX, QRTR_NODE_APPS, dst_port, 0, 0 };
  			qrtr_send(QRTR_TYPE_RESUME_TX, dst_port, src_node, src_port, &r, sizeof(r));
