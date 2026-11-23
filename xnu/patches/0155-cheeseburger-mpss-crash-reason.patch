@@ -1,0 +1,70 @@
+From dd8cfbfaf57deb4102f32ab8161211a560cbba00 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 19:39:18 +0100
+Subject: [PATCH] cheeseburger: log the MPSS crash reason (SMEM 421) on modem
+ fatal
+
+0154: WMI INIT + passive scan work (4 networks), SoC no longer freezes, but the modem raises fatal ~8 s after WLAN mission mode. The WLAN firmware runs on the MSS Q6, so this is most likely a WLAN assert. Read SMEM item 421 (global partition or legacy heap, as qcom_q6v5) and log it when slave-kernel bit 0 is seen.
+---
+ bsd/dev/sweet_glink.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index e71142c..d38d41a 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -103,6 +103,43 @@ smem_get(struct smem_part_hdr *p, uint16_t item, uint32_t *size)
+ 	return NULL;
+ }
+ 
++/* MPSS crash reason, SMEM item 421 (Linux qcom_q6v5 MPSS_CRASH_REASON_SMEM): global
++ * partition ($TOC entry 0xfffe/0xfffe) on SMEM v12, else the legacy global heap. */
++#define SMEM_CRASH_REASON   421
++#define SMEM_GLOBAL_HOST    0xFFFE
++#define SMEM_HEAP_TOC       204                 /* proc_comm[4] + version[32] + 3 words */
++
++static void
++smem_log_crash_reason(void)
++{
++	uint32_t size = 0, ver = *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16;
++	const char *r = smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), SMEM_CRASH_REASON, &size);
++
++	if (r == NULL) {
++		const volatile uint32_t *e = (const volatile uint32_t *)(smem + SMEM_HEAP_TOC + SMEM_CRASH_REASON * 16);
++		if (e[0] != 0 && (e[3] & ~3u) == 0 && e[1] < SMEM_SIZE && e[2] <= SMEM_SIZE - e[1]) {
++			r = (const char *)(smem + e[1]);
++			size = e[2];
++		}
++	}
++	if (r == NULL || size == 0) {
++		LOG("modem crash reason: SMEM item %u not found (smem version %u)", SMEM_CRASH_REASON, ver);
++		return;
++	}
++	char buf[160];
++	uint32_t n = MIN(size, (uint32_t)sizeof(buf) - 1);
++	for (uint32_t i = 0; i < n; i++) {
++		char c = r[i];
++		buf[i] = (c >= 0x20 && c < 0x7f) ? c : (c == 0 ? 0 : '.');
++		if (c == 0) {
++			n = i;
++			break;
++		}
++	}
++	buf[n] = 0;
++	LOG("modem crash reason (smem v%u, %u B): '%s'", ver, size, buf);
++}
++
+ static bool
+ smem_lock(void)
+ {
+@@ -776,6 +813,7 @@ sweet_mlink_watch(unsigned seconds, uint32_t (*slave_kernel)(void))
+ 		}
+ 		if (ms % 10 == 0 && slave_kernel != NULL && (slave_kernel() & 1)) {
+ 			LOG("t=%u ms: modem fatal (slave-kernel bit 0): stopping the watch", ms);
++			smem_log_crash_reason();
+ 			break;
+ 		}
+ 		IOSleep(1);
+-- 
+2.54.0 (Apple Git-157)
+
