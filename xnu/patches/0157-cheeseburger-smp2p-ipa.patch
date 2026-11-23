@@ -1,0 +1,47 @@
+From 2ada58868bfa45cb47e1d0bf36723fe0f346dfce Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 20:17:33 +0100
+Subject: [PATCH] cheeseburger: SMP2P "ipa" entry, answer the modem IPA power
+ query
+
+0154/0155: modem fatal 8.3 s after WLAN mission mode, every time. The modem only published smp2p/slave-kernel; topaz (0113) adds an outbound "ipa" entry and answers the modem's IPA power query with valid/power off, noting that unanswered the modem watchdog fires once data services come up. Do the same.
+---
+ bsd/dev/sweet_mpss.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+index a5a7956..1f339d7 100644
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -229,7 +229,15 @@ smp2p_alloc_out(struct mss_state *s)
+ 		    (uint32_t)(uint8_t)name[o + 2] << 16 | (uint32_t)(uint8_t)name[o + 3] << 24);
+ 	}
+ 	wr(smp2p_out, 36, 0);
+-	wr(smp2p_out, 12, 16 | 1u << 16);       /* valid 1 */
++	/* "ipa" (topaz 0113): the modem asks for the AP IPA power state; left unanswered its
++	 * watchdog fires once data services come up (here ~8 s after WLAN mission mode). */
++	static const char ipa[16] = "ipa";
++	for (uint32_t o = 0; o < 16; o += 4) {
++		wr(smp2p_out, 40 + o, (uint32_t)(uint8_t)ipa[o] | (uint32_t)(uint8_t)ipa[o + 1] << 8 |
++		    (uint32_t)(uint8_t)ipa[o + 2] << 16 | (uint32_t)(uint8_t)ipa[o + 3] << 24);
++	}
++	wr(smp2p_out, 56, 0);
++	wr(smp2p_out, 12, 16 | 2u << 16);       /* valid 2 */
+ 	kick();
+ 	negotiated = ssr_ack_enabled = ssr_ack = false;
+ 	s->smp2p_out = true;
+@@ -283,6 +291,11 @@ smp2p_poll(uint32_t *last, unsigned nlast, bool *seen_hdr)
+ 		if (strncmp(name, "slave-kernel", 16) == 0) {
+ 			slave = v;
+ 		}
++		if (strncmp(name, "ipa", 16) == 0 && (v & 1) && rd(smp2p_out, 56) != 1) {
++			wr(smp2p_out, 56, 1);           /* valid, AP IPA power off */
++			kick();
++			printf("SWEET MPSS: answered IPA power query (%#x)\n", v);
++		}
+ 	}
+ 	return slave;
+ }
+-- 
+2.54.0 (Apple Git-157)
+
