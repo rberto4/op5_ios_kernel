@@ -1,0 +1,43 @@
+From 26d5bacaaf031aa15adb80aae6be12747ee400d9 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 12:22:42 +0100
+Subject: [PATCH] cheeseburger: WLFW: last board data segment MALFORMED = CRC
+ check, fine
+
+As in ath10k qmi.c ath10k_qmi_bdf_dnld_send_sync: with end = 1 the firmware checks the board data CRC and answers QMI_ERR_MALFORMED_MSG (1) while staying fine. 0149 stopped there (segments 0-2 ok, segment 3 err 1).
+---
+ bsd/dev/sweet_wlfw.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index 5018bfa..392e653 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -39,7 +39,8 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+-#define WLFW_FW_READY_BIT   0x1ull              /* QMI_WLFW_FW_READY_V01 in ind_register fw_status */
++#define QMI_ERR_MALFORMED   1                   /* QMI_ERR_MALFORMED_MSG_V01 */
++#define WLFW_FW_READY_BIT   0x1ull             /* QMI_WLFW_FW_READY_V01 in ind_register fw_status */
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define WLFW_BUF            (WLFW_SEG + 128)
+@@ -399,6 +400,14 @@ w_on_bdf_resp(bool ok, uint16_t err)
+ {
+ 	struct wmsg m;
+ 
++	/*
++	 * ath10k qmi.c: end = 1 triggers a CRC check on the board data; when it fails the
++	 * firmware answers QMI_ERR_MALFORMED_MSG but is still fine: treat it as success.
++	 */
++	if (!ok && w_bdf_off >= w_bdf_len && err == QMI_ERR_MALFORMED) {
++		LOG("wlfw: last bdf segment: MALFORMED (board data CRC), fine as in ath10k");
++		ok = true;
++	}
+ 	if (!ok) {
+ 		LOG("wlfw: bdf segment %u FAILED err %u", w_bdf_seg - 1, err);
+ 		w_step = "bdf FAILED";
+-- 
+2.54.0 (Apple Git-157)
+
