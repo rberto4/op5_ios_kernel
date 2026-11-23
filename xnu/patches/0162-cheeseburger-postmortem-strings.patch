@@ -1,0 +1,85 @@
+From 2f520fde465537d7c543e9a1ae614dee7771a6d6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 22:30:15 +0100
+Subject: [PATCH] cheeseburger: post-mortem sanity and string search
+
+0161: MBA reload and MPSS reclaim worked (MBA ALIVE again, phone fine) but the task value occurs nowhere in MPSS. Check that the reads see real data (first words and density per 16 MiB, the 0x93200000 segment) and dump the context of DOG_HB/dog_hb/starv strings (and a few wlan_/WLAN ones).
+---
+ bsd/dev/sweet_mss.c | 54 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+index 2004507..c2d0714 100644
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -765,6 +765,59 @@ pm_scan(uint32_t task)
+ 	printf("SWEET PM: task %#x: %u occurrence(s) in MPSS, %u dumped\n", task, total, hits);
+ }
+ 
++/* sanity (are we reading real data?) and every "dog"/"starv"/"DOG_HB" string with context */
++static void
++pm_strings(void)
++{
++	static const char *const keys[] = { "DOG_HB", "dog_hb", "starv", "wlan_", "WLAN" };
++	static uint8_t ctx[192];
++	unsigned hits[5] = { 0 };
++
++	for (uint64_t pa = MPSS_PA; pa < (uint64_t)MPSS_PA + MPSS_SIZE; pa += PM_WIN) {
++		vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, PM_WIN, PM_WIMG_WCOMB);
++		if (va == 0) {
++			return;
++		}
++		uint32_t nz = 0;
++		for (uint32_t o = 0; o < PM_WIN; o += 64) {
++			nz += *(volatile uint32_t *)(va + o) != 0;
++		}
++		if (((pa - MPSS_PA) & 0xFFFFFF) == 0 || pa == 0x93200000ull) {
++			printf("SWEET PM: %09llx: %08x %08x %08x %08x, nonzero %u/16384\n", pa, *(volatile uint32_t *)va,
++			    *(volatile uint32_t *)(va + 4), *(volatile uint32_t *)(va + 8), *(volatile uint32_t *)(va + 12), nz);
++		}
++		for (uint32_t o = 0; o + 8 < PM_WIN; o++) {
++			uint8_t c0 = *(volatile uint8_t *)(va + o);
++			if (c0 != 'D' && c0 != 'd' && c0 != 's' && c0 != 'w' && c0 != 'W') {
++				continue;
++			}
++			for (unsigned k = 0; k < 5; k++) {
++				size_t kl = strlen(keys[k]);
++				if (hits[k] >= (k < 3 ? 12u : 4u) || o + kl > PM_WIN) {
++					continue;
++				}
++				bool m = true;
++				for (size_t j = 0; j < kl && m; j++) {
++					m = *(volatile uint8_t *)(va + o + j) == (uint8_t)keys[k][j];
++				}
++				if (!m) {
++					continue;
++				}
++				hits[k]++;
++				uint32_t lo = (o >= 64 ? o - 64 : 0) & ~15u, hi = MIN(lo + (uint32_t)sizeof(ctx), PM_WIN);
++				for (uint32_t i = lo; i < hi; i++) {
++					ctx[i - lo] = *(volatile uint8_t *)(va + i);
++				}
++				printf("SWEET PM: \"%s\" at %09llx\n", keys[k], pa + o);
++				pm_hexdump(pa + lo, ctx, hi - lo);
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap(va, PM_WIN);
++	}
++	printf("SWEET PM: strings DOG_HB %u dog_hb %u starv %u wlan_ %u WLAN %u\n", hits[0], hits[1], hits[2], hits[3], hits[4]);
++}
++
+ static void
+ mss_postmortem(struct mss_state *s, const uint8_t *fw, size_t len)
+ {
+@@ -789,6 +842,7 @@ mss_postmortem(struct mss_state *s, const uint8_t *fw, size_t len)
+ 	if (sweet_mlink_fatal_task != 0) {
+ 		pm_scan(sweet_mlink_fatal_task);
+ 	}
++	pm_strings();
+ 	teardown(&r);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
