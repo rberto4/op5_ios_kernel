@@ -1,0 +1,343 @@
+From 9ea0c09985c9150477a1358c7abfc7a7926fe1fb Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 13:25:19 +0100
+Subject: [PATCH] cheeseburger: WLAN streams on the ANOC2 SMMU, WLFW freeze
+ bisect knobs
+
+0150 reached WLAN ON (mission) and the SoC froze ~5 s later with no panic and no USB: the WCN3990 firmware DMAs through the ANOC2 SMMU (0x16c0000, SIDs 0x1900/0x1901) that nobody set up. sweet_wsmmu.c ports topaz 0123 smmu_identity(): read-only dump of the valid SMRs, then an untranslated context bank (SCTLR.M=0, from CB4) for the WLAN streams before step 11, read back and logged (the boot chain owns this SMMU: qcom,skip-init). sGFSR and the bank FSR/FAR are logged when they change, plus a heartbeat every 500 ms after FW_READY. sysctl kern.sweetwlfw_smmu (default 1) and kern.sweetwlfw_upto (0 mission, 1 stop at FW_READY, 2 stop after WLAN_CFG).
+---
+ bsd/conf/files        |   1 +
+ bsd/dev/sweet_glink.c |   4 +
+ bsd/dev/sweet_mlink.h |   6 ++
+ bsd/dev/sweet_wlfw.c  |  24 +++++
+ bsd/dev/sweet_wsmmu.c | 211 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 246 insertions(+)
+ create mode 100644 bsd/dev/sweet_wsmmu.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8bf374c..49c4772 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_mpss.c			standard
+ bsd/dev/sweet_glink.c			standard
+ bsd/dev/sweet_msvc.c			standard
+ bsd/dev/sweet_wlfw.c			standard
++bsd/dev/sweet_wsmmu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index 12b1def..9bba96e 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -760,6 +760,10 @@ sweet_mlink_watch(unsigned seconds, uint32_t (*slave_kernel)(void))
+ 		LOG("no SMEM apps<->modem partition");
+ 		return false;
+ 	}
++	sweet_wsmmu_dump();
++	if (sweet_wlfw_smmu) {
++		(void)sweet_wsmmu_identity();
++	}
+ 	if (!glink_start(part)) {
+ 		return false;
+ 	}
+diff --git a/bsd/dev/sweet_mlink.h b/bsd/dev/sweet_mlink.h
+index 8f20e82..3ff02bb 100644
+--- a/bsd/dev/sweet_mlink.h
++++ b/bsd/dev/sweet_mlink.h
+@@ -93,6 +93,12 @@ int fw_all_find(const char *path);
+ bool fw_all_read(int i, uint64_t off, void *dst, uint64_t n);
+ uint64_t fw_all_size(int i);
+ uint64_t scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count);
++/* sweet_wsmmu.c: WLAN streams on the ANOC2 SMMU */
++void sweet_wsmmu_dump(void);
++bool sweet_wsmmu_identity(void);
++void sweet_wsmmu_fault_poll(unsigned ms);
++/* kern.sweetwlfw_smmu (1: identity bank before step 11), kern.sweetwlfw_upto (0 mission, 1 stop at FW_READY, 2 after WLAN_CFG) */
++extern int sweet_wlfw_smmu, sweet_wlfw_upto;
+ /* sweet_glink.c: kernel VA of a pool physical address, NULL outside the pool */
+ uint8_t *sweet_mlink_pool_va(uint64_t pa);
+ 
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index 392e653..67708b1 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -22,6 +22,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <sys/sysctl.h>
+ #include "sweet_mlink.h"
+ 
+ int sweet_rpm_ldo(uint32_t ldo, uint32_t uv, uint32_t ma);
+@@ -59,6 +60,12 @@ static uint32_t w_bdf_len, w_bdf_off;
+ static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;
+ static const char *w_step = "not started";
+ 
++int sweet_wlfw_smmu = 1, sweet_wlfw_upto;
++SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_smmu, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_smmu, 0,
++    "W4: 1 = WLAN identity bank on the ANOC2 SMMU before step 11");
++SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_upto, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_upto, 0,
++    "W4: 0 = up to mission mode, 1 = stop at FW_READY, 2 = stop after WLAN_CFG");
++
+ struct wmsg { uint8_t *b; uint32_t n; };
+ 
+ /* ---------------------------------------------------------------- QMI requests */
+@@ -319,6 +326,12 @@ w_on_fw_ready(void)
+ 	}
+ 	w_fw_ready = true;
+ 	LOG("t=%u ms: *** WLAN FIRMWARE READY ***", g_ms);
++	sweet_wsmmu_dump();
++	if (sweet_wlfw_upto == 1) {
++		w_step = "stopped at FW_READY (upto 1)";
++		LOG("wlfw: kern.sweetwlfw_upto 1: no WLAN_CFG / mission");
++		return;
++	}
+ 	w_send_cfg();
+ }
+ 
+@@ -469,6 +482,11 @@ w_on_resp(uint16_t msg, const uint8_t *d, uint32_t len)
+ 		break;
+ 	case WLFW_WLAN_CFG:
+ 		LOG("t=%u ms: wlfw: wlan_cfg %s err %u", g_ms, ok ? "ok" : "FAILED", err);
++		if (ok && sweet_wlfw_upto == 2) {
++			w_step = "stopped after WLAN_CFG (upto 2)";
++			LOG("wlfw: kern.sweetwlfw_upto 2: no mission");
++			break;
++		}
+ 		if (ok && wm_new(&m, WLFW_WLAN_MODE)) {
+ 			wm_u32(&m, 0x01, 0);                /* mission */
+ 			wm_u8(&m, 0x10, 0);                 /* hw_debug */
+@@ -555,6 +573,12 @@ wlfw_poll(void)
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
++	if (g_ms % 10 == 0) {
++		sweet_wsmmu_fault_poll(g_ms);
++	}
++	if (w_fw_ready && g_ms % 500 == 0) {           /* where a freeze happens */
++		LOG("t=%u ms: wlfw: alive, %s", g_ms, w_step);
++	}
+ }
+ 
+ void
+diff --git a/bsd/dev/sweet_wsmmu.c b/bsd/dev/sweet_wsmmu.c
+new file mode 100644
+index 0000000..f6a0465
+--- /dev/null
++++ b/bsd/dev/sweet_wsmmu.c
+@@ -0,0 +1,211 @@
++/*
++ * WLAN stream on the ANOC2 SMMU for cheeseburger (OnePlus 5, MSM8998), Wi-Fi W4/W5.
++ *
++ * 0150 reached "WLAN ON (mission mode)" and the whole SoC froze ~5 s later (no
++ * panic, no USB): the WCN3990 firmware starts DMA through the ANOC2 SMMU
++ * (msm8998.dtsi anoc2_smmu 0x16c0000, iommus <0x1900>, <0x1901>), which nobody
++ * set up for it. Port of topaz 0123 smmu_identity() (TopazModem.cpp, APSL 2.0):
++ * the WLAN streams get their own context bank with SCTLR.M = 0 (no translation:
++ * device addresses are physical, as our pool buffers will be in W5).
++ *
++ * The stock dtb marks this SMMU qcom,skip-init (set up by the boot chain) and
++ * the GPU SMMU taught us the hypervisor may filter global-space writes, so
++ * everything is read back and logged. sweet_wsmmu_fault_poll() reports
++ * sGFSR and the bank's FSR/FAR while the WLAN runs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include "sweet_mlink.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define ANOC2_SMMU_PA       0x016c0000ull
++#define ANOC2_SMMU_SIZE     0x00040000u
++#define WLAN_SID            0x1900
++#define WLAN_SID_MASK       0x1                 /* 0x1900 and 0x1901 */
++#define CB_FIRST_FREE       4                   /* keep clear of banks the boot chain may use */
++#define CB_CBAR             0x0001f000u         /* S1_TRANS_S2_FAULT type, S1 memattr WB */
++#define CB_CBA2R            0x00000001u         /* VA64 */
++#define CB_SCTLR            0x000000e0u         /* CFCFG|CFIE|CFRE, M = 0: no translation */
++
++#define SCR0                0x000
++#define SIDR0               0x020
++#define SIDR1               0x024
++#define SGFAR               0x040
++#define SGFSR               0x048
++#define SGFSYNR0            0x050
++#define STLBGSYNC           0x070
++#define STLBGSTATUS         0x074
++#define SMR(n)              (0x800 + 4 * (n))
++#define S2CR(n)             (0xC00 + 4 * (n))
++#define CBAR(n)             (0x000 + 4 * (n))   /* in GR1 */
++#define CBA2R(n)            (0x800 + 4 * (n))   /* in GR1 */
++#define CB_SCTLR_OFF        0x00
++#define CB_TCR2             0x10
++#define CB_TTBR0            0x20
++#define CB_TCR              0x30
++#define CB_MAIR0            0x38
++#define CB_FSR              0x58
++#define CB_FAR              0x60
++
++static volatile uint8_t *s_base;
++static uint32_t s_psize, s_npage, s_nsmr, s_ncb;
++static int s_cb = -1;
++static uint32_t s_last_gfsr, s_last_fsr;
++
++static inline uint32_t r32(uint32_t o) { return *(volatile uint32_t *)(s_base + o); }
++static inline void w32(uint32_t o, uint32_t v) { mb(); *(volatile uint32_t *)(s_base + o) = v; }
++
++static uint32_t gr1(uint32_t o) { return s_psize + o; }
++static uint32_t cbo(int cb, uint32_t o) { return s_npage * s_psize + (uint32_t)cb * s_psize + o; }
++
++static bool
++smmu_map(void)
++{
++	if (s_base != NULL) {
++		return true;
++	}
++	s_base = (volatile uint8_t *)ml_io_map((vm_offset_t)ANOC2_SMMU_PA, ANOC2_SMMU_SIZE);
++	if (s_base == NULL) {
++		LOG("wsmmu: map failed");
++		return false;
++	}
++	uint32_t id0 = r32(SIDR0), id1 = r32(SIDR1);
++	s_nsmr = id0 & 0xFF;
++	s_ncb = id1 & 0xFF;
++	s_psize = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	s_npage = 1u << (((id1 >> 28) & 7) + 1);
++	LOG("wsmmu: ANOC2 sCR0 %08x ID0 %08x ID1 %08x: %u SMRs, %u CBs, page %x x%u, sGFSR %08x",
++	    r32(SCR0), id0, id1, s_nsmr, s_ncb, s_psize, s_npage, r32(SGFSR));
++	if ((uint64_t)s_npage * s_psize * 2 > ANOC2_SMMU_SIZE) {
++		LOG("wsmmu: layout bigger than the mapping, not touching it");
++		s_base = NULL;
++		return false;
++	}
++	return true;
++}
++
++static bool
++sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
++{
++	uint32_t id = smr & 0xFFFF, m = (smr >> 16) & 0x7FFF;
++	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
++}
++
++/* read-only: every valid stream match and what it points at */
++void
++sweet_wsmmu_dump(void)
++{
++	unsigned valid = 0;
++
++	if (!smmu_map()) {
++		return;
++	}
++	for (uint32_t i = 0; i < s_nsmr && i < 128; i++) {
++		uint32_t smr = r32(SMR(i)), s2cr = r32(S2CR(i));
++		if ((smr >> 31) == 0) {
++			continue;
++		}
++		valid++;
++		uint32_t cb = s2cr & 0xFF;
++		bool tr = ((s2cr >> 16) & 3) == 0 && cb < s_ncb;
++		LOG("wsmmu:  SMR%u %08x S2CR %08x%s%s", i, smr, s2cr,
++		    sid_match(smr, WLAN_SID, WLAN_SID_MASK) ? " [WLAN]" : "", tr ? "" : " (bypass/fault)");
++		if (tr) {
++			LOG("wsmmu:   CB%u CBAR %08x SCTLR %08x FSR %08x", cb, r32(gr1(CBAR(cb))),
++			    r32(cbo((int)cb, CB_SCTLR_OFF)), r32(cbo((int)cb, CB_FSR)));
++		}
++	}
++	LOG("wsmmu: %u valid SMR(s) of %u; sCR0 %08x (CLIENTPD %u USFCFG %u)", valid, s_nsmr, r32(SCR0),
++	    r32(SCR0) & 1, (r32(SCR0) >> 10) & 1);
++}
++
++static int
++pick_slot(uint64_t *used)
++{
++	int slot = -1;
++	for (uint32_t i = 0; i < s_nsmr && i < 128; i++) {
++		uint32_t smr = r32(SMR(i)), s2cr = r32(S2CR(i));
++		if ((smr >> 31) != 0 && sid_match(smr, WLAN_SID, WLAN_SID_MASK)) {
++			slot = (int)i;                      /* already there: reuse */
++		} else if ((smr >> 31) == 0 && slot < 0) {
++			slot = (int)i;
++		}
++		if ((smr >> 31) != 0 && ((s2cr >> 16) & 3) == 0) {
++			*used |= 1ull << (s2cr & 0x3F);
++		}
++	}
++	return slot;
++}
++
++/* topaz smmu_identity(): an untranslated bank for the WLAN streams; true if it reads back */
++bool
++sweet_wsmmu_identity(void)
++{
++	uint64_t used = 0;
++	int slot, cb = -1;
++
++	if (!smmu_map()) {
++		return false;
++	}
++	slot = pick_slot(&used);
++	for (uint32_t i = CB_FIRST_FREE; i < s_ncb && i < 64; i++) {
++		if ((used & (1ull << i)) == 0) {
++			cb = (int)i;
++			break;
++		}
++	}
++	if (slot < 0 || cb < 0 || cbo(cb, s_psize) > ANOC2_SMMU_SIZE) {
++		LOG("wsmmu: no free SMR/CB (slot %d cb %d)", slot, cb);
++		return false;
++	}
++	w32(cbo(cb, CB_FSR), 0xFFFFFFFF);           /* clear */
++	w32(cbo(cb, CB_TTBR0), 0);
++	w32(cbo(cb, CB_TTBR0 + 4), 0);
++	w32(cbo(cb, CB_TCR), 0);
++	w32(cbo(cb, CB_TCR2), 0);
++	w32(cbo(cb, CB_MAIR0), 0);
++	w32(cbo(cb, CB_MAIR0 + 4), 0);
++	w32(gr1(CBA2R(cb)), CB_CBA2R);
++	w32(gr1(CBAR(cb)), CB_CBAR);
++	w32(cbo(cb, CB_SCTLR_OFF), CB_SCTLR);       /* SCTLR last */
++	w32(S2CR(slot), (uint32_t)cb);              /* type 0 (translate), this bank */
++	w32(SMR(slot), (1u << 31) | (WLAN_SID_MASK << 16) | WLAN_SID);  /* valid last */
++	w32(STLBGSYNC, 0);
++	for (unsigned n = 0; n < 100000 && (r32(STLBGSTATUS) & 1) != 0; n++) {
++		IODelay(1);
++	}
++	uint32_t smr = r32(SMR(slot)), s2cr = r32(S2CR(slot)), sctlr = r32(cbo(cb, CB_SCTLR_OFF));
++	bool ok = (smr >> 31) != 0 && sid_match(smr, WLAN_SID, WLAN_SID_MASK) &&
++	    ((s2cr >> 16) & 3) == 0 && (s2cr & 0x3F) == (uint32_t)cb && sctlr == CB_SCTLR;
++	LOG("wsmmu: WLAN identity (sid %x mask %x) CB%d SMR%d: SMR %08x S2CR %08x CBAR %08x SCTLR %08x -> %s",
++	    WLAN_SID, WLAN_SID_MASK, cb, slot, smr, s2cr, r32(gr1(CBAR(cb))), sctlr, ok ? "OK" : "NOT as written");
++	if (ok) {
++		s_cb = cb;
++	}
++	return ok;
++}
++
++/* while the WLAN runs: log global and bank faults when they change */
++void
++sweet_wsmmu_fault_poll(unsigned ms)
++{
++	if (s_base == NULL) {
++		return;
++	}
++	uint32_t gfsr = r32(SGFSR), fsr = s_cb >= 0 ? r32(cbo(s_cb, CB_FSR)) : 0;
++	if (gfsr == s_last_gfsr && fsr == s_last_fsr) {
++		return;
++	}
++	s_last_gfsr = gfsr;
++	s_last_fsr = fsr;
++	LOG("t=%u ms: wsmmu: sGFSR %08x sGFSYNR0 %08x sGFAR %08x%08x; CB%d FSR %08x FAR %08x%08x", ms, gfsr,
++	    r32(SGFSYNR0), r32(SGFAR + 4), r32(SGFAR), s_cb, fsr,
++	    s_cb >= 0 ? r32(cbo(s_cb, CB_FAR + 4)) : 0, s_cb >= 0 ? r32(cbo(s_cb, CB_FAR)) : 0);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
