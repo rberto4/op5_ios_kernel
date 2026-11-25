@@ -1,0 +1,139 @@
+From d0c8911fb884d6a02b2711510795180b1998365f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 15:19:22 +0100
+Subject: [PATCH] cheeseburger: icnss WLFW extras (pin connect, rejuvenate, feature mask)
+
+As stock icnss and hackios raphael: ind_register also enables pin_connect_result (0x14) and rejuvenate (0x19, u32), DYNAMIC_FEATURE_MASK (0x3B) = rejuvenate after CAP, REJUVENATE_IND (0x39) logged with its TLVs and answered with REJUVENATE_ACK (0x3A). A refused ind_register is sent again without the extras (kern.sweetwlfw_icnss, default 1).
+
+---
+ bsd/dev/sweet_wlfw.c | 61 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/sweet_wlfw.c b/bsd/dev/sweet_wlfw.c
+index ab52522..a152aef 100644
+--- a/bsd/dev/sweet_wlfw.c
++++ b/bsd/dev/sweet_wlfw.c
+@@ -46,6 +46,11 @@ int sweet_rpm_kvp(uint32_t rtype, uint32_t rid, uint32_t key, uint32_t value);
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+ #define WLFW_MAC_ADDR       0x33
++#define WLFW_PIN_RESULT_IND 0x2C
++#define WLFW_REJUV_IND      0x39
++#define WLFW_REJUV_ACK      0x3A
++#define WLFW_FEATURE_MASK   0x3B                /* DYNAMIC_FEATURE_MASK */
++#define WLFW_FEAT_REJUV     0x1ull              /* QMI_WLFW_FW_REJUVENATE_V01 */
+ #define QMI_ERR_MALFORMED   1                   /* QMI_ERR_MALFORMED_MSG_V01 */
+ #define WLFW_FW_READY_BIT   0x1ull             /* QMI_WLFW_FW_READY_V01 in ind_register fw_status */
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+@@ -72,6 +77,16 @@ static bool w_off_sent;
+ static const char *w_step = "not started";
+ 
+ int sweet_wlfw_smmu = 1, sweet_wlfw_upto, sweet_wlfw_off_ms, sweet_wlfw_pinctrl = 1, sweet_wlfw_mac = 1;
++/*
++ * 0167: stock icnss / hackios raphael (WCN3998): ind_register also asks for pin_connect_result
++ * (0x14) and rejuvenate (0x19, u32), DYNAMIC_FEATURE_MASK 0x3B = rejuvenate after CAP, and
++ * REJUVENATE_IND 0x39 is answered with REJUVENATE_ACK 0x3A. If the firmware refuses the
++ * longer ind_register, it is sent again as before.
++ */
++static int sweet_wlfw_icnss = 1;
++static bool w_ind_extra;
++SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_icnss, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_icnss, 0,
++    "W5: 1 = icnss extras (pin_connect + rejuvenate indications, feature mask, rejuvenate ACK), 0 = ath10k only");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_mac, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_mac, 0,
+     "W5: 1 = give the firmware a MAC (QMI WLFW MAC_ADDR, as stock cnss-daemon) before WLAN_CFG");
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlfw_pinctrl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlfw_pinctrl, 0,
+@@ -427,6 +442,8 @@ w_on_cap(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++static void w_send_ind_register(bool extra);
++
+ static void
+ w_on_ind_register(const uint8_t *d, uint32_t len, bool ok, uint16_t err)
+ {
+@@ -438,7 +455,13 @@ w_on_ind_register(const uint8_t *d, uint32_t len, bool ok, uint16_t err)
+ 	if (v != NULL && l >= 8) {
+ 		memcpy(&st, v, 8);
+ 	}
+-	LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx", g_ms, ok ? "ok" : "FAILED", err, st);
++	LOG("t=%u ms: wlfw: ind_register %s err %u, fw_status %llx%s", g_ms, ok ? "ok" : "FAILED", err, st,
++	    w_ind_extra ? " (icnss extras)" : "");
++	if (!ok && w_ind_extra) {
++		LOG("wlfw: ind_register with icnss extras refused: again without them");
++		w_send_ind_register(false);
++		return;
++	}
+ 	if (st & WLFW_FW_READY_BIT) {               /* ath10k: firmware already up, straight to wlan_cfg */
+ 		w_on_fw_ready();
+ 		return;
+@@ -459,6 +482,14 @@ w_on_cap_resp(const uint8_t *d, uint32_t len, bool ok, uint16_t err)
+ 	}
+ 	if (ok) {
+ 		w_on_cap(d, len);
++		if (sweet_wlfw_icnss) {
++			struct wmsg m;
++			uint64_t mask = WLFW_FEAT_REJUV;
++			if (wm_new(&m, WLFW_FEATURE_MASK)) {
++				wm_tlv(&m, 0x10, &mask, 8);
++				wm_send(&m, "feature mask sent");
++			}
++		}
+ 	}
+ 	w_cap_done = true;
+ 	w_msa_ind = true;                           /* qcom,no-msa-ready-indicator */
+@@ -586,8 +617,6 @@ extern bool sweet_mlink_wlfw_seen;
+ void
+ wlfw_arrive(uint32_t node, uint32_t port)
+ {
+-	struct wmsg m;
+-
+ 	sweet_mlink_wlfw_seen = true;
+ 	if ((w_node != 0 || w_port != 0) && w_node == node && w_port == port) {
+ 		return;                                 /* the same announcement again */
+@@ -603,10 +632,25 @@ wlfw_arrive(uint32_t node, uint32_t port)
+ 	w_node = node;
+ 	w_port = port;
+ 	w_power_on();
++	w_send_ind_register(sweet_wlfw_icnss != 0);
++}
++
++static void
++w_send_ind_register(bool extra)
++{
++	struct wmsg m;
++
++	w_ind_extra = extra;
+ 	if (wm_new(&m, WLFW_IND_REGISTER)) {
+ 		wm_u8(&m, 0x10, 1);                     /* fw_ready_enable */
+ 		wm_u8(&m, 0x13, 1);                     /* msa_ready_enable */
++		if (extra) {
++			wm_u8(&m, 0x14, 1);                 /* pin_connect_result_enable */
++		}
+ 		wm_u32(&m, 0x15, WLFW_CLIENT_ID);       /* client_id */
++		if (extra) {
++			wm_u32(&m, 0x19, 1);                /* rejuvenate_enable (u32, as raphael) */
++		}
+ 		wm_send(&m, "ind_register sent");
+ 	}
+ }
+@@ -627,6 +671,17 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			w_start_bdf();
+ 		} else if (msg == WLFW_FW_READY_IND) {
+ 			w_on_fw_ready();
++		} else if (msg == WLFW_REJUV_IND) {
++			char hex[3 * 48 + 1] = "";
++			for (uint32_t i = 7; i < len && i < 7 + 48; i++) {
++				snprintf(hex + 3 * (i - 7), 4, " %02x", d[i]);
++			}
++			LOG("t=%u ms: wlfw: *** REJUVENATE indication ***%s", g_ms, hex);
++			if (sweet_wlfw_icnss) {
++				w_simple(WLFW_REJUV_ACK, "rejuvenate ack sent");
++			}
++		} else if (msg == WLFW_PIN_RESULT_IND) {
++			LOG("t=%u ms: wlfw: pin connect result indication, %u bytes", g_ms, len);
+ 		} else {
+ 			LOG("t=%u ms: wlfw: indication %x", g_ms, msg);
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+

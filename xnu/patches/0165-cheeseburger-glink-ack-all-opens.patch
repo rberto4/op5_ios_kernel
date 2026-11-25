@@ -1,0 +1,68 @@
+From 46aa3723061a82d9f21ad65013b3ad9b6f82fbc3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 25 Nov 2026 15:17:37 +0100
+Subject: [PATCH] cheeseburger: OPEN_ACK every GLINK channel the modem opens
+
+The modem opens glink_ssr, SSM_RTR_MODEM_APPS, apr_voice_svc, apr_apps2, LOOPBACK_CTL_MPSS, DS and DATA1-11 besides IPCRTR; we acked IPCRTR only and left the rest half-open for good. Linux qcom_glink_rx_open acks every remote open, and so does ios-flame's wland (Pixel 4, WCN3990), whose modem stays up in WLAN mission. Ack them all (kern.sweetglink_ackall, default 1); intent requests and data on channels other than IPCRTR are logged and ignored.
+
+---
+ bsd/dev/sweet_glink.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/bsd/dev/sweet_glink.c b/bsd/dev/sweet_glink.c
+index 48396ce..226908a 100644
+--- a/bsd/dev/sweet_glink.c
++++ b/bsd/dev/sweet_glink.c
+@@ -16,8 +16,18 @@
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
++#include <sys/sysctl.h>
+ #include "sweet_mlink.h"
+ 
++/*
++ * 0165: Linux qcom_glink_rx_open (and ios-flame's wland, whose modem stays up
++ * in mission) OPEN_ACKs every channel the remote opens, driver or not; we
++ * acked IPCRTR only, leaving glink_ssr, apr_*, DS, DATA1-11 half-open.
++ */
++static int sweet_glink_ackall = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweetglink_ackall, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_glink_ackall, 0,
++    "W5: 1 = OPEN_ACK every channel the modem opens (Linux), 0 = IPCRTR only");
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 
+@@ -674,6 +684,9 @@ rx_one(void)
+ 			if (!g_open_sent) {
+ 				send_open();
+ 			}
++		} else if (sweet_glink_ackall) {
++			send_cmd(CMD_OPEN_ACK, (uint16_t)m.p1, 0);
++			LOG("t=%u ms: glink OPEN_ACK sent for \"%s\" rcid %u (not opened by us)", g_ms, name, m.p1);
+ 		}
+ 		break;
+ 	}
+@@ -726,6 +739,10 @@ rx_one(void)
+ 		break;
+ 	case CMD_RX_INTENT_REQ:
+ 		rx_advance(8);
++		if (m.p1 != g_rcid) {
++			LOG("t=%u ms: glink RX_INTENT_REQ rcid %u size %u on a channel we did not open: ignored", g_ms, m.p1, m.p2);
++			break;
++		}
+ 		advertise_intents(1, MAX(m.p2, OUR_INTENT_SIZE));
+ 		send_cmd(CMD_RX_INTENT_REQ_ACK, CHAN_LCID, 1);
+ 		break;
+@@ -766,6 +783,9 @@ rx_one(void)
+ 		if (hdr[1] == 0) {
+ 			if (m.p1 == g_rcid) {
+ 				qrtr_rx(g_asm, g_asm_len);
++			} else {
++				LOG("t=%u ms: glink %u bytes on rcid %u (not IPCRTR): dropped", g_ms, g_asm_len, m.p1);
++				break;
+ 			}
+ 			if (g_features & 1) {
+ 				send_cmd(CMD_RX_DONE_W_REUSE, CHAN_LCID, m.p2);
+-- 
+2.54.0 (Apple Git-157)
+
