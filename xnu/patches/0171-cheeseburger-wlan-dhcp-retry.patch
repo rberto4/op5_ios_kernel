@@ -1,0 +1,86 @@
+From cf838a98a73988b9f03f1e06d19212c4bcc34add Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 00:19:36 +0100
+Subject: [PATCH] cheeseburger: Wi-Fi station: retry the DHCP DISCOVER
+
+0170 joined with WPA2 and received data, but the one DISCOVER sent right after the keys
+went in came back with TX completion status 5 (dropped) and no OFFER followed (ios-flame
+saw the same: "the first DISCOVER is lost, the retry 2 s later works"). First DISCOVER
+500 ms after the join, then every 1.5 s up to 6 times until an OFFER arrives.
+---
+ bsd/dev/sweet_wsta.c | 26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/sweet_wsta.c b/bsd/dev/sweet_wsta.c
+index f2df483..4468ec7 100644
+--- a/bsd/dev/sweet_wsta.c
++++ b/bsd/dev/sweet_wsta.c
+@@ -82,8 +82,11 @@ static uint8_t s_ptk[48], s_anonce[32], s_snonce[32], s_group_cipher;
+ static uint64_t s_replay;
+ static uint8_t *s_mgmt_va;
+ static uint64_t s_mgmt_pa;
+-static uint32_t rx_data, rx_eapol, dhcp_xid;
++static uint32_t rx_data, rx_eapol, dhcp_xid, dhcp_tries, dhcp_next_ms;
+ static bool dhcp_sent, dhcp_offer;
++#define DHCP_FIRST_MS   500                     /* 0170: a DISCOVER right after the keys was dropped (status 5) */
++#define DHCP_RETRY_MS   1500
++#define DHCP_MAX_TRIES  6
+ 
+ static uint8_t *w_p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); return p + 4; }
+ static uint8_t *w_p64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); return p + 8; }
+@@ -529,14 +532,17 @@ dhcp_discover(void)
+ 	b[0] = 1;                                   /* BOOTREQUEST */
+ 	b[1] = 1;
+ 	b[2] = 6;
+-	read_random(&dhcp_xid, 4);
++	if (dhcp_xid == 0) {
++		read_random(&dhcp_xid, 4);
++	}
+ 	memcpy(b + 4, &dhcp_xid, 4);
+ 	b[10] = 0x80;                               /* broadcast reply */
+ 	memcpy(b + 28, mac, 6);
+ 	static const uint8_t opt[] = { 0x63, 0x82, 0x53, 0x63, 53, 1, 1, 55, 4, 1, 3, 6, 15, 255 };
+ 	memcpy(b + 236, opt, sizeof(opt));
+-	dhcp_sent = w_tx_ether(e, sizeof(e), false);
+-	LOG("t=%u ms: dhcp: DISCOVER %s", g_ms, dhcp_sent ? "sent" : "FAILED");
++	bool ok = w_tx_ether(e, sizeof(e), false);
++	dhcp_sent = dhcp_sent || ok;
++	LOG("t=%u ms: dhcp: DISCOVER %u %s", g_ms, dhcp_tries, ok ? "sent" : "FAILED");
+ }
+ 
+ static void
+@@ -586,7 +592,8 @@ w_join_end(int result)
+ 	} else {
+ 		s_state = S_UP;
+ 		LOG("t=%u ms: *** JOINED %.*s ***", g_ms, (int)s_ssid_len, s_ssid);
+-		dhcp_discover();
++		dhcp_tries = 0;
++		dhcp_next_ms = g_ms + DHCP_FIRST_MS;
+ 	}
+ 	bzero(s_pmk, sizeof(s_pmk));
+ 	bzero(s_ptk, 32);                           /* KCK/KEK no longer needed; the TK is in the firmware */
+@@ -857,6 +864,11 @@ sweet_wsta_poll(void)
+ 		w_teardown();
+ 		w_ask_join();
+ 	}
++	if (s_state == S_UP && !dhcp_offer && dhcp_tries < DHCP_MAX_TRIES && g_ms >= dhcp_next_ms) {
++		dhcp_tries++;
++		dhcp_next_ms = g_ms + DHCP_RETRY_MS;
++		dhcp_discover();
++	}
+ 	if (s_join_asked && !sweet_wlan_scanning()) {
+ 		s_join_asked = false;
+ 		w_teardown();
+@@ -888,7 +900,7 @@ sweet_wsta_poll(void)
+ void
+ sweet_wsta_summary(void)
+ {
+-	LOG("sta: state %u joins %u; rx data %u eapol %u; dhcp sent %u offer %u", s_state, s_joins, rx_data, rx_eapol,
+-	    dhcp_sent, dhcp_offer);
++	LOG("sta: state %u joins %u; rx data %u eapol %u; dhcp tries %u offer %u", s_state, s_joins, rx_data, rx_eapol,
++	    dhcp_tries, dhcp_offer);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
