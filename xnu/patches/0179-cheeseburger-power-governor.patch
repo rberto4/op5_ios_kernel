@@ -1,0 +1,451 @@
+From da62a9e539a4a2e6fa7d14533433dc4fb7f1b0f0 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 17:26:23 +0100
+Subject: [PATCH] cheeseburger: CPU/GPU governor with a heat limit (boot-arg
+ sweetpower=1)
+
+Every 50 ms: CPU level from HOST_CPU_LOAD_INFO (1132.8/1728/1958.4 MHz),
+GPU level from frames presented and submits (288/412.8 MHz at GX 700 mV,
+508.8 MHz at 916 mV). TSENS0 gold sensors 7-10 cap the CPU at 75/85 C, GPU
+sensors 12-13 cap the GPU at 85/95 C, 5 C hysteresis, unreadable = hot.
+kern.sweetpower_gov turns it off and on, kern.sweetpower_temp reads heat.
+Runtime GPU switches no longer measure (2 ms under the ring lock).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/sweet_a540_b.c |  24 +++-
+ bsd/dev/sweet_mss.c    |   4 +
+ bsd/dev/sweet_power.c  | 291 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 307 insertions(+), 12 deletions(-)
+
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+index 7e9d789..9705ec8 100644
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -2764,8 +2764,16 @@ SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_val, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
+  * gfx3d back on the PLL even output / 2. GPU MHz = 9.6 * l. One I/O mapping for good.
+  */
+ #define GPU_L_RUNTIME_MAX       69u     /* 662.4 MHz: the 670 MHz corner */
+-int sweet_gpu_clock_runtime(uint32_t l);
++int sweet_gpu_clock_runtime(uint32_t l, bool measure);
+ int sweet_gpu_clock_l(void);
++uint32_t sweet_gpu_activity(void);
++
++/* 0179: frames presented plus user submits, for the governor (bsd/dev/sweet_power.c) */
++uint32_t
++sweet_gpu_activity(void)
++{
++	return (uint32_t)present_frames + (uint32_t)gpu_submits;
++}
+ 
+ int
+ sweet_gpu_clock_l(void)
+@@ -2774,7 +2782,7 @@ sweet_gpu_clock_l(void)
+ }
+ 
+ int
+-sweet_gpu_clock_runtime(uint32_t l)
++sweet_gpu_clock_runtime(uint32_t l, bool measure)
+ {
+ 	static vm_offset_t cc;
+ 	int error = 0;
+@@ -2816,10 +2824,16 @@ sweet_gpu_clock_runtime(uint32_t l)
+ 	for (int i = 0; i < 100 && (*cmd & 1u); i++) {
+ 		delay(1);
+ 	}
+-	gpu_clock_measure("runtime");
++	if (measure) {
++		gpu_clock_measure("runtime");   /* 2 ms with the ring held: only when asked by hand */
++	} else if (locked) {
++		last_khz = (int)(9600u * l);
++	}
+ 	lck_mtx_unlock(gpu_mtx);
+-	printf("SWEET GPU: runtime clock L %u (%u.%u MHz asked): latch %s, lock %s, measured %d kHz\n", l,
+-	    96u * l / 10u, 96u * l % 10u, latched ? "ok" : "TIMEOUT", locked ? "ok" : "NO", last_khz);
++	if (measure || !locked) {
++		printf("SWEET GPU: runtime clock L %u (%u.%u MHz asked): latch %s, lock %s, measured %d kHz\n", l,
++		    96u * l / 10u, 96u * l % 10u, latched ? "ok" : "TIMEOUT", locked ? "ok" : "NO", last_khz);
++	}
+ 	return error;
+ }
+ 
+diff --git a/bsd/dev/sweet_mss.c b/bsd/dev/sweet_mss.c
+index dd10726..19dad2b 100644
+--- a/bsd/dev/sweet_mss.c
++++ b/bsd/dev/sweet_mss.c
+@@ -977,6 +977,8 @@ sweet_sleep_ms(unsigned ms)
+ }
+ 
+ /* from AppleCLCD::start (iokit/Kernel/arm/SweetFramebuffer.cpp) */
++void sweet_power_boot_init(void);       /* sweet_power.c (0179) */
++
+ void
+ sweet_mss_boot_init(void)
+ {
+@@ -984,6 +986,8 @@ sweet_mss_boot_init(void)
+ 	int on = 0;
+ 	thread_t thread;
+ 
++	sweet_power_boot_init();               /* boot-arg sweetpower: on its own, with or without Wi-Fi */
++
+ 	if (started || !PE_parse_boot_argn("sweetwifi", &on, sizeof(on)) || on <= 0) {
+ 		return;
+ 	}
+diff --git a/bsd/dev/sweet_power.c b/bsd/dev/sweet_power.c
+index 5a46651..757d925 100644
+--- a/bsd/dev/sweet_power.c
++++ b/bsd/dev/sweet_power.c
+@@ -22,6 +22,19 @@
+  *         412.8 MHz has run at 700 mV since 0121. Corners 4..8 want the GFX mem-acc at 0
+  *         (0x01fcf004 bit 0, msm8998-regulator.dtsi gfx_mem_acc_vreg).
+  * Raising: rail first, then clock. Lowering: clock first, then rail.
++ *
++ * 0179, boot-arg sweetpower=1: a governor thread picks the levels itself, every 50 ms.
++ *   CPU  load from HOST_CPU_LOAD_INFO (all four cores' idle ticks): over 60% busy -> high at once;
++ *        under 25% for 0.5 s -> mid, for 2 s -> low. low 1132.8 MHz, mid 1728, high 1958.4 MHz.
++ *   GPU  activity = frames presented + user submits: any in the last 100 ms -> high; none for
++ *        0.3 s -> mid, for 1.5 s -> low. low 288 MHz and mid 412.8 MHz at GX 700 mV, high 508.8
++ *        MHz at 916 mV (595 MHz was not felt to be smoother: the bus, not the GPU).
++ *   heat TSENS0 (TM 0x010ab000, Sn_STATUS +0xa0 + 4n: bits 11:0 deci-degC, bit 21 valid), gold
++ *        sensors 7-10, GPU 12-13 (msm8998.dtsi thermal zones). Gold >= 75 C (Linux's passive trip):
++ *        no higher than mid; >= 85 C: low. GPU >= 85 C: no higher than mid; >= 95 C: low.
++ *        5 C of hysteresis. An unreadable sensor counts as hot.
++ *   kern.sweetpower_gov 0/1 stops/starts it (the knobs above stay usable by hand when 0);
++ *   kern.sweetpower_temp reads the hottest gold and GPU sensor (deci-degC, gold * 10000 + GPU).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -34,8 +47,18 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* (BSD has no prototype for it) */
+-int sweet_gpu_clock_runtime(uint32_t l);        /* sweet_a540_b.c */
++#include <kern/thread.h>
++#include <mach/mach_types.h>
++#include <mach/host_info.h>
++
++extern host_t host_self(void);
++extern kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
++
++int sweet_gpu_clock_runtime(uint32_t l, bool measure);  /* sweet_a540_b.c */
+ int sweet_gpu_clock_l(void);
++uint32_t sweet_gpu_activity(void);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_power_boot_init(void);
+ 
+ #define SPMI_CORE_PA    0x0800f000u
+ #define SPMI_CFG_PA     0x0800a000u
+@@ -238,7 +261,7 @@ gold_measure_khz(void)
+ static int cpu_l, cpu_khz, cpu_stress_errors;
+ 
+ static int
+-cpu_set(uint32_t l)
++cpu_set(uint32_t l, bool quiet)
+ {
+ 	int cur_mv = rail_mv(&gold_rail);
+ 	uint32_t want = gold_mv_for(l);
+@@ -265,6 +288,9 @@ cpu_set(uint32_t l)
+ 		(void)rail_set_mv(&gold_rail, want);
+ 	}
+ 	cpu_l = (int)l;
++	if (quiet) {
++		return 0;
++	}
+ 	cpu_khz = gold_measure_khz();
+ 	printf("SWEET POWER: gold L 0x%x -> 0x%x (%u.%u MHz asked), rail %d -> %d mV, measured %d kHz\n", was, l,
+ 	    192u * l / 10u, 192u * l % 10u, cur_mv, rail_mv(&gold_rail), cpu_khz);
+@@ -325,7 +351,7 @@ gfx_mem_acc(int want)                           /* -1: read only */
+ }
+ 
+ static int
+-gpu_set(uint32_t l)
++gpu_set(uint32_t l, bool quiet)
+ {
+ 	int gx = rail_mv(&gx_rail), need = (int)gx_mv_for(l);
+ 	if (gx < need) {
+@@ -337,8 +363,10 @@ gpu_set(uint32_t l)
+ 	if (96u * l / 10u > 413u && acc != 0) {
+ 		acc = gfx_mem_acc(0);                   /* corners 4..8 */
+ 	}
+-	int e = sweet_gpu_clock_runtime(l);
+-	printf("SWEET POWER: GPU L %u at GX %d mV, mem-acc %d: %d\n", l, gx, acc, e);
++	int e = sweet_gpu_clock_runtime(l, !quiet);
++	if (!quiet) {
++		printf("SWEET POWER: GPU L %u at GX %d mV, mem-acc %d: %d\n", l, gx, acc, e);
++	}
+ 	return e;
+ }
+ 
+@@ -356,7 +384,7 @@ sysctl_cpu_l SYSCTL_HANDLER_ARGS
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sweet_power_lock);
+-	error = cpu_set((uint32_t)v);
++	error = cpu_set((uint32_t)v, false);
+ 	lck_mtx_unlock(&sweet_power_lock);
+ 	return error;
+ }
+@@ -438,10 +466,259 @@ sysctl_gpu_l SYSCTL_HANDLER_ARGS
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&sweet_power_lock);
+-	error = gpu_set((uint32_t)v);
++	error = gpu_set((uint32_t)v, false);
+ 	lck_mtx_unlock(&sweet_power_lock);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_clock_l, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_gpu_l, "I",
+     "SWEET POWER: GPU PLL L while presenting (MHz = 9.6 * L), 13..69; needs kern.sweetgpu_gx_mv");
++
++/* ---- 0179: the governor ---- */
++
++#define GOV_PERIOD_MS           50
++#define TSENS_TM_PA             0x010ab000u
++#define TSENS_STATUS(n)         (0xa0u + 4u * (n))
++#define TSENS_VALID             (1u << 21)
++#define TEMP_HOT_UNKNOWN        2000            /* deci-degC: an unreadable sensor is hot */
++
++enum { LV_LOW, LV_MID, LV_HIGH, LV_N };
++static const uint32_t cpu_level_l[LV_N] = { 0x3b, 0x5a, 0x66 };        /* 1132.8, 1728, 1958.4 MHz */
++static const uint32_t gpu_level_l[LV_N] = { 30, 43, 53 };              /* 288, 412.8, 508.8 MHz */
++static const char *const level_name[LV_N] = { "low", "mid", "high" };
++
++static int gov_on;
++static int gov_cpu_level = -1, gov_gpu_level = -1;
++static int temp_gold, temp_gpu;                 /* deci-degC */
++static uint64_t gov_cpu_ms[LV_N], gov_gpu_ms[LV_N];
++static unsigned gov_cpu_changes, gov_gpu_changes;
++
++/* the hottest valid sensor of [first, last] in deci-degC; TEMP_HOT_UNKNOWN when none reads */
++static int
++tsens_hottest(unsigned first, unsigned last)
++{
++	static vm_offset_t tm;
++	int hottest = -1000;
++	bool any = false;
++	if (tm == 0 && (tm = ml_io_map(TSENS_TM_PA, 0x1000)) == 0) {
++		return TEMP_HOT_UNKNOWN;
++	}
++	for (unsigned n = first; n <= last; n++) {
++		uint32_t v = rd(tm, TSENS_STATUS(n));
++		if (!(v & TSENS_VALID)) {
++			continue;
++		}
++		int t = (int)(v & 0xfffu);
++		if (t & 0x800) {
++			t -= 0x1000;                    /* 12-bit two's complement */
++		}
++		any = true;
++		hottest = t > hottest ? t : hottest;
++	}
++	return any ? hottest : TEMP_HOT_UNKNOWN;
++}
++
++/* the highest level the heat allows: limits at mid_c and low_c, back up 5 C under them */
++static int
++heat_cap(int t, int mid_c, int low_c, int *cap)
++{
++	int c = *cap;
++	if (t >= low_c * 10) {
++		c = LV_LOW;
++	} else if (t >= mid_c * 10) {
++		c = c < LV_MID ? c : LV_MID;
++		if (c == LV_LOW && t < (low_c - 5) * 10) {
++			c = LV_MID;
++		}
++	} else if (t < (mid_c - 5) * 10) {
++		c = LV_HIGH;
++	} else if (c == LV_LOW) {
++		c = LV_MID;
++	}
++	*cap = c;
++	return c;
++}
++
++/* busy share of all cores since the last call, in percent; -1 before there are two samples */
++static int
++cpu_busy_percent(void)
++{
++	static uint32_t last_busy, last_total;
++	static bool have;
++	host_cpu_load_info_data_t info;
++	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
++	if (host_statistics(host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&info, &count) != KERN_SUCCESS) {
++		return -1;
++	}
++	uint32_t busy = info.cpu_ticks[CPU_STATE_USER] + info.cpu_ticks[CPU_STATE_SYSTEM] + info.cpu_ticks[CPU_STATE_NICE];
++	uint32_t total = busy + info.cpu_ticks[CPU_STATE_IDLE];
++	uint32_t db = busy - last_busy, dt = total - last_total;
++	bool had = have;
++	last_busy = busy;
++	last_total = total;
++	have = true;
++	if (!had || dt == 0) {
++		return -1;
++	}
++	return (int)(db * 100u / dt);
++}
++
++static unsigned gov_cpu_fails, gov_gpu_fails;
++#define GOV_FAILS_MAX   3               /* then that side is left alone */
++
++static void
++gov_cpu_apply(int level)
++{
++	if (level == gov_cpu_level || gov_cpu_fails >= GOV_FAILS_MAX) {
++		return;
++	}
++	if (cpu_set(cpu_level_l[level], true) != 0) {
++		if (++gov_cpu_fails == GOV_FAILS_MAX) {
++			printf("SWEET POWER: gov: the CPU clock cannot be changed; the governor leaves it\\n");
++		}
++	} else {
++		if (gov_cpu_changes++ < 12) {
++			printf("SWEET POWER: gov: CPU %s -> %s (gold %d.%d C)\n", gov_cpu_level < 0 ? "-" : level_name[gov_cpu_level],
++			    level_name[level], temp_gold / 10, temp_gold % 10);
++		}
++		gov_cpu_level = level;
++	}
++}
++
++static void
++gov_gpu_apply(int level)
++{
++	if (level == gov_gpu_level || gov_gpu_fails >= GOV_FAILS_MAX) {
++		return;
++	}
++	uint32_t l = gpu_level_l[level];
++	int gx = rail_mv(&gx_rail), need = (int)gx_mv_for(l);
++	if (gx < need && rail_set_mv(&gx_rail, (uint32_t)need) != 0) {
++		return;
++	}
++	int e = gpu_set(l, true);
++	if (e == ENXIO) {
++		return;                                 /* not presenting yet: try again later */
++	}
++	if (e != 0) {
++		if (++gov_gpu_fails == GOV_FAILS_MAX) {
++			printf("SWEET POWER: gov: the GPU clock cannot be changed (%d); the governor leaves it\\n", e);
++		}
++		return;
++	}
++	if (gx > need) {
++		(void)rail_set_mv(&gx_rail, (uint32_t)need);   /* the clock is down: the rail may follow */
++	}
++	if (gov_gpu_changes++ < 12) {
++		printf("SWEET POWER: gov: GPU %s -> %s (GPU %d.%d C)\n", gov_gpu_level < 0 ? "-" : level_name[gov_gpu_level],
++		    level_name[level], temp_gpu / 10, temp_gpu % 10);
++	}
++	gov_gpu_level = level;
++}
++
++static void
++gov_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	extern void IOSleep(unsigned int milliseconds);
++	int cpu_cap = LV_HIGH, gpu_cap = LV_HIGH;
++	unsigned cpu_quiet_ms = 0, gpu_quiet_ms = 0, ticks = 0;
++	uint32_t last_activity = sweet_gpu_activity();
++	int busy_avg = 0;
++
++	printf("SWEET POWER: governor on (CPU %u/%u/%u MHz, GPU %u/%u/%u MHz)\n", 192u * cpu_level_l[0] / 10u,
++	    192u * cpu_level_l[1] / 10u, 192u * cpu_level_l[2] / 10u, 96u * gpu_level_l[0] / 10u,
++	    96u * gpu_level_l[1] / 10u, 96u * gpu_level_l[2] / 10u);
++	for (;; ticks++) {
++		IOSleep(GOV_PERIOD_MS);
++		if (!gov_on) {
++			gov_cpu_level = gov_gpu_level = -1;     /* by hand now; start from scratch when back */
++			continue;
++		}
++		if (ticks % 5 == 0) {                   /* heat every 250 ms */
++			temp_gold = tsens_hottest(7, 10);
++			temp_gpu = tsens_hottest(12, 13);
++			(void)heat_cap(temp_gold, 75, 85, &cpu_cap);
++			(void)heat_cap(temp_gpu, 85, 95, &gpu_cap);
++		}
++		int busy = cpu_busy_percent();
++		if (busy >= 0) {
++			busy_avg = (busy_avg + busy) / 2;
++		}
++		/* CPU: up at once, down after a while */
++		int want = gov_cpu_level < 0 ? LV_HIGH : gov_cpu_level;
++		if (busy_avg >= 60) {
++			want = LV_HIGH;
++			cpu_quiet_ms = 0;
++		} else if (busy_avg < 25) {
++			cpu_quiet_ms += GOV_PERIOD_MS;
++			want = cpu_quiet_ms >= 2000 ? LV_LOW : cpu_quiet_ms >= 500 ? (want < LV_MID ? want : LV_MID) : want;
++		} else {
++			cpu_quiet_ms = 0;
++			want = want < LV_MID ? LV_MID : want;
++		}
++		/* GPU: frames or submits in this period -> high */
++		uint32_t act = sweet_gpu_activity();
++		int gwant = gov_gpu_level < 0 ? LV_HIGH : gov_gpu_level;
++		if (act != last_activity) {
++			gwant = LV_HIGH;
++			gpu_quiet_ms = 0;
++		} else {
++			gpu_quiet_ms += GOV_PERIOD_MS;
++			gwant = gpu_quiet_ms >= 1500 ? LV_LOW : gpu_quiet_ms >= 300 ? (gwant < LV_MID ? gwant : LV_MID) : gwant;
++		}
++		last_activity = act;
++		want = want < cpu_cap ? want : cpu_cap;
++		gwant = gwant < gpu_cap ? gwant : gpu_cap;
++
++		lck_mtx_lock(&sweet_power_lock);
++		gov_cpu_apply(want);
++		if (sweet_gpu_clock_l() > 0) {
++			gov_gpu_apply(gwant);
++		}
++		lck_mtx_unlock(&sweet_power_lock);
++		if (gov_cpu_level >= 0) {
++			gov_cpu_ms[gov_cpu_level] += GOV_PERIOD_MS;
++		}
++		if (gov_gpu_level >= 0) {
++			gov_gpu_ms[gov_gpu_level] += GOV_PERIOD_MS;
++		}
++		if (ticks % (300000 / GOV_PERIOD_MS) == 0 && ticks != 0) {      /* every 5 minutes */
++			printf("SWEET POWER: gov: gold %d.%d C GPU %d.%d C; CPU s low/mid/high %llu/%llu/%llu (%u changes), "
++			    "GPU %llu/%llu/%llu (%u changes)\n", temp_gold / 10, temp_gold % 10, temp_gpu / 10, temp_gpu % 10,
++			    gov_cpu_ms[0] / 1000, gov_cpu_ms[1] / 1000, gov_cpu_ms[2] / 1000, gov_cpu_changes,
++			    gov_gpu_ms[0] / 1000, gov_gpu_ms[1] / 1000, gov_gpu_ms[2] / 1000, gov_gpu_changes);
++		}
++	}
++}
++
++/* from sweet_mss_boot_init (AppleCLCD::start): boot-arg sweetpower=1 */
++void
++sweet_power_boot_init(void)
++{
++	static bool started;
++	int on = 0;
++	thread_t thread;
++	if (started || !PE_parse_boot_argn("sweetpower", &on, sizeof(on)) || on <= 0) {
++		return;
++	}
++	started = true;
++	gov_on = 1;
++	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		gov_on = 0;
++	}
++}
++
++SYSCTL_INT(_kern, OID_AUTO, sweetpower_gov, CTLFLAG_RW | CTLFLAG_LOCKED, &gov_on, 0,
++    "SWEET POWER: the governor picks CPU and GPU levels (1) or leaves them to the knobs (0)");
++
++static int
++sysctl_power_temp SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int g = tsens_hottest(7, 10), p = tsens_hottest(12, 13), v = g * 10000 + p;
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetpower_temp, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_power_temp,
++    "I", "SWEET POWER: hottest gold and GPU sensor, deci-degC (gold * 10000 + GPU)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
