@@ -1,0 +1,105 @@
+From 6a8d61e5b953e70768fbc5212bdd507b5e3e45c2 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 15:41:28 +0100
+Subject: [PATCH] cheeseburger: Wi-Fi station: tear down in mac80211's order
+
+Keys cleared (cipher NONE), PEER_DELETE and its answer, and only then
+VDEV_DOWN and VDEV_STOP, as ieee80211_set_disassoc + ath10k do. VDEV_DOWN
+first asserted in wlan_vdev.c (0174, 0175).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/sweet_wsta.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/sweet_wsta.c b/bsd/dev/sweet_wsta.c
+index 13badda..b9434cd 100644
+--- a/bsd/dev/sweet_wsta.c
++++ b/bsd/dev/sweet_wsta.c
+@@ -64,6 +64,7 @@ bool sweet_wlan_bss_by_bssid(const uint8_t *bssid, struct sweet_wlan_bss *out);
+ #define PEER_FLAG_AUTH          0x1
+ #define PEER_FLAG_NEED_PTK_4WAY 0x4
+ #define PEER_PARAM_AUTHORIZE    3
++#define WMI_CIPHER_NONE         0
+ #define WMI_CIPHER_TKIP         2
+ #define WMI_CIPHER_CCMP         4
+ #define FC_ASSOC_REQ            0x00
+@@ -81,9 +82,12 @@ SYSCTL_INT(_kern, OID_AUTO, sweetwlan_mgmt, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_
+ 
+ /*
+  * 0175: S_TD_PEER and S_TD_STOP are the teardown, one firmware answer at a time. The WCN3990 firmware
+- * deletes a peer asynchronously (WMI_SERVICE_SYNC_DELETE_CMDS): a VDEV_STOP sent while the peer is
+- * still there asserts in wlan_vdev.c and takes the modem down (seen in 0174 on wifid's DISASSOCIATE).
+- * ath10k waits for PEER_DELETE_RESP before the stop, and for VDEV_STOPPED after it; so do we.
++ * deletes a peer asynchronously (WMI_SERVICE_SYNC_DELETE_CMDS): ath10k waits for PEER_DELETE_RESP,
++ * and for VDEV_STOPPED after the stop; so do we.
++ * 0176: and in mac80211's order (ieee80211_set_disassoc: the AP's station is flushed before
++ * BSS_CHANGED_ASSOC): the keys cleared (ath10k_clear_peer_keys, cipher NONE), the peer deleted, and
++ * only then VDEV_DOWN and VDEV_STOP. VDEV_DOWN first, with the peer and its keys still in, asserted in
++ * wlan_vdev.c and took the modem down (0174 and 0175, on wifid's DISASSOCIATE).
+  */
+ enum sta_state { S_IDLE, S_START, S_AUTH, S_ASSOC, S_4WAY, S_UP, S_TD_PEER, S_TD_STOP };
+ static enum sta_state s_state;
+@@ -94,6 +98,8 @@ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s,
+ static int32_t s_start_status;
+ static volatile bool s_peer_deleted, s_vdev_stopped;
+ static uint32_t s_td_deadline;
++static int s_gtk_idx = -1;              /* the group key's index in the firmware, -1: none */
++static bool s_td_vdev_up;               /* the teardown owes a VDEV_DOWN */
+ static uint8_t s_assoc_req[512];
+ static uint32_t s_assoc_req_len;
+ static uint8_t s_rsn_ie[22];
+@@ -478,6 +484,7 @@ w_eapol_msg3(uint8_t *frame, size_t len, const uint8_t *k, uint16_t info, uint16
+ 	w_install_key(false, 0, WMI_CIPHER_CCMP, s_ptk + 32, 16);
+ 	if (gtk_len != 0) {
+ 		w_install_key(true, gtk_idx, s_group_cipher == 2 ? WMI_CIPHER_TKIP : WMI_CIPHER_CCMP, gtk, gtk_len);
++		s_gtk_idx = gtk_idx;
+ 	}
+ 	w_peer_param(PEER_PARAM_AUTHORIZE, 1);
+ 	s_ptk_set = true;
+@@ -598,6 +605,10 @@ dhcp_rx(const uint8_t *e, size_t len)
+ static void
+ w_td_stop(void)
+ {
++	if (s_td_vdev_up) {
++		s_td_vdev_up = false;
++		w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++	}
+ 	s_vdev_stopped = false;
+ 	w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
+ 	s_state = S_TD_STOP;
+@@ -612,13 +623,20 @@ w_teardown(void)
+ 	if (was == S_IDLE || was == S_TD_PEER || was == S_TD_STOP) {
+ 		return;                                 /* nothing up, or under way already */
+ 	}
++	static const uint8_t no_key[4];
++	bool keys = s_ptk_set;
+ 	s_ptk_set = false;
+ 	if (was == S_UP && sweet_wlan_link_hook != NULL) {
+ 		sweet_wlan_link_hook(false);
+ 	}
+-	if (was >= S_4WAY) {
+-		w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++	s_td_vdev_up = was >= S_4WAY;               /* VDEV_UP went out with the move to S_4WAY */
++	if (keys) {
++		w_install_key(false, 0, WMI_CIPHER_NONE, no_key, 0);
++		if (s_gtk_idx >= 0) {
++			w_install_key(true, (uint32_t)s_gtk_idx, WMI_CIPHER_NONE, no_key, 0);
++		}
+ 	}
++	s_gtk_idx = -1;
+ 	if (was >= S_AUTH) {
+ 		s_peer_deleted = false;
+ 		w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
+@@ -627,7 +645,7 @@ w_teardown(void)
+ 	} else {
+ 		w_td_stop();
+ 	}
+-	LOG("t=%u ms: join: teardown from state %u", g_ms, was);
++	LOG("t=%u ms: join: teardown from state %u (keys %s)", g_ms, was, keys ? "cleared" : "none");
+ }
+ 
+ /* true when the station is idle (no teardown left) */
+-- 
+2.54.0 (Apple Git-157)
+
