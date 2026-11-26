@@ -1,4 +1,4 @@
-From c8a70f039bc62650fa6f213869afc37ed808d2c1 Mon Sep 17 00:00:00 2001
+From c075bc3dd75c451db4aa631f24e3ed2899a5964a Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Thu, 26 Nov 2026 16:54:49 +0100
 Subject: [PATCH] cheeseburger: CPU and GPU clocks and rails at run time
@@ -14,8 +14,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  bsd/conf/files         |   1 +
  bsd/dev/sweet_a540_b.c |  66 ++++++
- bsd/dev/sweet_power.c  | 446 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 513 insertions(+)
+ bsd/dev/sweet_power.c  | 447 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 514 insertions(+)
  create mode 100644 bsd/dev/sweet_power.c
 
 diff --git a/bsd/conf/files b/bsd/conf/files
@@ -107,10 +107,10 @@ index f92f56c..7e9d789 100644
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_power.c b/bsd/dev/sweet_power.c
 new file mode 100644
-index 0000000..61c1a1b
+index 0000000..5a46651
 --- /dev/null
 +++ b/bsd/dev/sweet_power.c
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,447 @@
 +/*
 + * cheeseburger (OnePlus 5, MSM8998): CPU and GPU clocks and rails at run time (0178).
 + *
@@ -146,6 +146,7 @@ index 0000000..61c1a1b
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* (BSD has no prototype for it) */
 +int sweet_gpu_clock_runtime(uint32_t l);        /* sweet_a540_b.c */
 +int sweet_gpu_clock_l(void);
 +
