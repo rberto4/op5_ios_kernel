@@ -1,0 +1,189 @@
+From f0c3eca1e234de253e2ef73c670bbbd5b24f154a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 09:21:38 +0100
+Subject: [PATCH] cheeseburger: Wi-Fi station: tear down one firmware answer at
+ a time
+
+PEER_DELETE, wait PEER_DELETE_RESP (0x6007), VDEV_STOP, wait VDEV_STOPPED
+(0x5002), 1 s each at most. A VDEV_STOP sent with the peer not yet deleted
+asserted in wlan_vdev.c on wifid's DISASSOCIATE (0174) and took the modem down.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/sweet_wmi.c  |  2 +
+ bsd/dev/sweet_wsta.c | 89 ++++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 76 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/dev/sweet_wmi.c b/bsd/dev/sweet_wmi.c
+index a757f0b..b5e8b28 100644
+--- a/bsd/dev/sweet_wmi.c
++++ b/bsd/dev/sweet_wmi.c
+@@ -975,7 +975,9 @@ sweet_wmi_rx(const uint8_t *d, uint32_t len)
+ 		scan_mgmt_rx(d + 4, len - 4);
+ 		break;
+ 	case 0x5001:                                /* VDEV_START_RESP */
++	case 0x5002:                                /* VDEV_STOPPED (0175) */
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
++	case 0x6007:                                /* PEER_DELETE_RESP (0175) */
+ 		sweet_wsta_event(id, d + 4, len - 4);
+ 		break;
+ 	default: {
+diff --git a/bsd/dev/sweet_wsta.c b/bsd/dev/sweet_wsta.c
+index 1dbba04..13badda 100644
+--- a/bsd/dev/sweet_wsta.c
++++ b/bsd/dev/sweet_wsta.c
+@@ -41,7 +41,10 @@ bool sweet_wlan_bss_by_bssid(const uint8_t *bssid, struct sweet_wlan_bss *out);
+ #define CMD_MGMT_TX_SEND        0x7008
+ #define CMD_STA_PS_MODE         0x9001
+ #define EV_VDEV_START_RESP      0x5001
++#define EV_VDEV_STOPPED         0x5002
+ #define EV_PEER_STA_KICKOUT     0x6001
++#define EV_PEER_DELETE_RESP     0x6007
++#define TEARDOWN_STEP_MS        1000    /* a firmware answer not heard by then: go on anyway */
+ #define TAG_ARRAY_BYTE          0x11
+ #define TAG_ARRAY_STRUCT        0x12
+ #define TAG_CHANNEL             0x50
+@@ -76,13 +79,21 @@ static int sweet_wlan_mgmt;
+ SYSCTL_INT(_kern, OID_AUTO, sweetwlan_mgmt, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wlan_mgmt, 0,
+     "W6 management frames: 0 = WMI if the firmware offers it (service 76) else HTT, 1 = WMI, 2 = HTT");
+ 
+-enum sta_state { S_IDLE, S_START, S_AUTH, S_ASSOC, S_4WAY, S_UP };
++/*
++ * 0175: S_TD_PEER and S_TD_STOP are the teardown, one firmware answer at a time. The WCN3990 firmware
++ * deletes a peer asynchronously (WMI_SERVICE_SYNC_DELETE_CMDS): a VDEV_STOP sent while the peer is
++ * still there asserts in wlan_vdev.c and takes the modem down (seen in 0174 on wifid's DISASSOCIATE).
++ * ath10k waits for PEER_DELETE_RESP before the stop, and for VDEV_STOPPED after it; so do we.
++ */
++enum sta_state { S_IDLE, S_START, S_AUTH, S_ASSOC, S_4WAY, S_UP, S_TD_PEER, S_TD_STOP };
+ static enum sta_state s_state;
+ static bool s_join_asked, s_conf_tried, s_rsn, s_start_resp, s_ptk_set, s_mgmt_htt, s_crypto_ok, s_tested;
+ static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
+ static uint8_t s_body[768];                     /* the AP's beacon IEs */
+ static uint32_t s_body_len, s_freq, s_aid, s_tries, s_deadline, s_desc, s_msg1s, s_joins;
+ static int32_t s_start_status;
++static volatile bool s_peer_deleted, s_vdev_stopped;
++static uint32_t s_td_deadline;
+ static uint8_t s_assoc_req[512];
+ static uint32_t s_assoc_req_len;
+ static uint8_t s_rsn_ie[22];
+@@ -584,23 +595,53 @@ dhcp_rx(const uint8_t *e, size_t len)
+ 
+ /* ---------------------------------------------------------------- the join, from the watch loop */
+ 
++static void
++w_td_stop(void)
++{
++	s_vdev_stopped = false;
++	w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++	s_state = S_TD_STOP;
++	s_td_deadline = g_ms + TEARDOWN_STEP_MS;
++}
++
++/* starts the teardown; it is over when s_state is S_IDLE again (w_teardown_poll) */
+ static void
+ w_teardown(void)
+ {
+-	if (s_state >= S_START) {
+-		if (s_state >= S_4WAY) {
+-			w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+-		}
+-		if (s_state >= S_AUTH) {
+-			w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
+-		}
+-		w_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
++	enum sta_state was = s_state;
++	if (was == S_IDLE || was == S_TD_PEER || was == S_TD_STOP) {
++		return;                                 /* nothing up, or under way already */
+ 	}
+-	if (s_state == S_UP && sweet_wlan_link_hook != NULL) {
++	s_ptk_set = false;
++	if (was == S_UP && sweet_wlan_link_hook != NULL) {
+ 		sweet_wlan_link_hook(false);
+ 	}
+-	s_state = S_IDLE;
+-	s_ptk_set = false;
++	if (was >= S_4WAY) {
++		w_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++	}
++	if (was >= S_AUTH) {
++		s_peer_deleted = false;
++		w_peer(CMD_PEER_DELETE, TAG_PEER_DELETE, false);
++		s_state = S_TD_PEER;
++		s_td_deadline = g_ms + TEARDOWN_STEP_MS;
++	} else {
++		w_td_stop();
++	}
++	LOG("t=%u ms: join: teardown from state %u", g_ms, was);
++}
++
++/* true when the station is idle (no teardown left) */
++static bool
++w_teardown_poll(void)
++{
++	if (s_state == S_TD_PEER && (s_peer_deleted || g_ms > s_td_deadline)) {
++		LOG("t=%u ms: join: peer %s", g_ms, s_peer_deleted ? "deleted" : "delete not answered");
++		w_td_stop();
++	} else if (s_state == S_TD_STOP && (s_vdev_stopped || g_ms > s_td_deadline)) {
++		LOG("t=%u ms: join: vdev %s", g_ms, s_vdev_stopped ? "stopped" : "stop not answered");
++		s_state = S_IDLE;
++	}
++	return s_state == S_IDLE;
+ }
+ 
+ static void
+@@ -752,6 +793,10 @@ sweet_wsta_event(uint32_t id, const uint8_t *t, uint32_t len)
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = true;
+ 		LOG("t=%u ms: join: VDEV_START_RESP status %d", g_ms, s_start_status);
++	} else if (id == EV_PEER_DELETE_RESP) {
++		s_peer_deleted = true;
++	} else if (id == EV_VDEV_STOPPED) {
++		s_vdev_stopped = true;
+ 	} else if (id == EV_PEER_STA_KICKOUT && s_state == S_UP) {
+ 		LOG("t=%u ms: join: peer kickout", g_ms);
+ 		w_teardown();
+@@ -897,15 +942,26 @@ static void w_tx_pump(void);
+ void
+ sweet_wsta_poll(void)
+ {
++	if (s_state == S_TD_PEER || s_state == S_TD_STOP) {
++		if (!w_teardown_poll()) {
++			return;                             /* one firmware answer at a time */
++		}
++	}
+ 	if (s_api_leave) {
+-		s_api_leave = false;
+ 		w_teardown();
++		if (s_state != S_IDLE) {
++			return;
++		}
++		s_api_leave = false;
+ 		s_result = 0;
+ 		s_join_done++;
+ 	}
+ 	if (s_api_join && !sweet_wlan_scanning()) {
+-		s_api_join = false;
+ 		w_teardown();
++		if (s_state != S_IDLE) {
++			return;
++		}
++		s_api_join = false;
+ 		w_join_begin();
+ 		return;
+ 	}
+@@ -923,8 +979,11 @@ sweet_wsta_poll(void)
+ 		dhcp_discover();
+ 	}
+ 	if (s_join_asked && !sweet_wlan_scanning()) {
+-		s_join_asked = false;
+ 		w_teardown();
++		if (s_state != S_IDLE) {
++			return;
++		}
++		s_join_asked = false;
+ 		w_join_begin();
+ 		return;
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
