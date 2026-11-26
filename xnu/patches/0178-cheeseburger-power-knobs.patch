@@ -1,0 +1,562 @@
+From c8a70f039bc62650fa6f213869afc37ed808d2c1 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 16:54:49 +0100
+Subject: [PATCH] cheeseburger: CPU and GPU clocks and rails at run time
+
+kern.sweetcpu_l moves the gold PLL with the S13 rail from the MSM8998 v2 CPR
+ceilings (912 mV to 1728 MHz, 960 mV to 1958.4 MHz); kern.sweetcpu_khz
+measures it, kern.sweetcpu_stress runs known-answer work.
+kern.sweetgpu_gx_mv sets PM8005 S1; kern.sweetgpu_clock_l changes GPUPLL0
+while presenting (under gpu_mtx), up to 662.4 MHz, only with the GX ceiling
+of that corner. SPMI and clock blocks mapped once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/conf/files         |   1 +
+ bsd/dev/sweet_a540_b.c |  66 ++++++
+ bsd/dev/sweet_power.c  | 446 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 513 insertions(+)
+ create mode 100644 bsd/dev/sweet_power.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8f5d672..f2a8b3f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@ bsd/dev/sweet_wmi.c			standard
+ bsd/dev/sweet_wcrypto.c			standard
+ bsd/dev/sweet_wsta.c			standard
+ bsd/dev/sweet_wifi_ios.c			standard
++bsd/dev/sweet_power.c			standard
+ bsd/dev/redwood_net.c			standard
+ bsd/dev/redwood_sta.c			standard
+ bsd/dev/redwood_apple80211.c		standard
+diff --git a/bsd/dev/sweet_a540_b.c b/bsd/dev/sweet_a540_b.c
+index f92f56c..7e9d789 100644
+--- a/bsd/dev/sweet_a540_b.c
++++ b/bsd/dev/sweet_a540_b.c
+@@ -2757,4 +2757,70 @@ SYSCTL_INT(_kern, OID_AUTO, sweetgpu_addr, CTLFLAG_RW | CTLFLAG_LOCKED, &dbg_add
+     "SWEET GPU debug: register offset from 0x05000000");
+ SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_val, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweetgpu_val, "I", "SWEET GPU debug: register at kern.sweetgpu_addr");
++/*
++ * 0178: the GPU clock changed while the GPU runs (bsd/dev/sweet_power.c: kern.sweetgpu_clock_l, which
++ * first checks the GX rail for the new clock). Under gpu_mtx, so no ring work is in flight: gfx3d on XO,
++ * GPUPLL0's L changed and latched as alpha_pll_fabia_set_rate does on a running PLL, the lock awaited,
++ * gfx3d back on the PLL even output / 2. GPU MHz = 9.6 * l. One I/O mapping for good.
++ */
++#define GPU_L_RUNTIME_MAX       69u     /* 662.4 MHz: the 670 MHz corner */
++int sweet_gpu_clock_runtime(uint32_t l);
++int sweet_gpu_clock_l(void);
++
++int
++sweet_gpu_clock_l(void)
++{
++	return pll_l;
++}
++
++int
++sweet_gpu_clock_runtime(uint32_t l)
++{
++	static vm_offset_t cc;
++	int error = 0;
++
++	if (__atomic_load_n(&present_state, __ATOMIC_ACQUIRE) != PRESENT_READY || gpu_mtx == NULL) {
++		return ENXIO;
++	}
++	if (l < 13 || l > GPU_L_RUNTIME_MAX) {
++		return EINVAL;
++	}
++	if (cc == 0 && (cc = ml_io_map(GPUCC_PA, 0x2000)) == 0) {
++		return ENOMEM;
++	}
++	volatile uint32_t *mode = (volatile uint32_t *)(cc + FABIA_MODE);
++	volatile uint32_t *cmd = (volatile uint32_t *)(cc + GPUCC_GFX3D_CMD);
++	volatile uint32_t *cfg = (volatile uint32_t *)(cc + GPUCC_GFX3D_CFG);
++	lck_mtx_lock(gpu_mtx);
++	if ((*mode & (PLL_LOCK_DET | PLL_OUTCTRL | PLL_RESET_N)) != (PLL_LOCK_DET | PLL_OUTCTRL | PLL_RESET_N)) {
++		lck_mtx_unlock(gpu_mtx);
++		printf("SWEET GPU: runtime clock: GPUPLL0 not running (MODE 0x%08x)\n", *mode);
++		return ENXIO;
++	}
++	*cfg = 0;                                       /* XO while the PLL moves */
++	*cmd |= 1u;
++	for (int i = 0; i < 100 && (*cmd & 1u); i++) {
++		delay(1);
++	}
++	*(volatile uint32_t *)(cc + FABIA_L_VAL) = l;
++	*(volatile uint32_t *)(cc + FABIA_FRAC) = 0;
++	bool latched = fabia_update_latch(mode);
++	bool locked = latched && fabia_wait_lock(mode);
++	if (locked) {
++		pll_l = (int)l;
++	} else {
++		error = EIO;                            /* the GPU stays on XO: slow but correct */
++	}
++	*cfg = locked ? ((1u << 8) | 3u) : 0;
++	*cmd |= 1u;
++	for (int i = 0; i < 100 && (*cmd & 1u); i++) {
++		delay(1);
++	}
++	gpu_clock_measure("runtime");
++	lck_mtx_unlock(gpu_mtx);
++	printf("SWEET GPU: runtime clock L %u (%u.%u MHz asked): latch %s, lock %s, measured %d kHz\n", l,
++	    96u * l / 10u, 96u * l % 10u, latched ? "ok" : "TIMEOUT", locked ? "ok" : "NO", last_khz);
++	return error;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_power.c b/bsd/dev/sweet_power.c
+new file mode 100644
+index 0000000..61c1a1b
+--- /dev/null
++++ b/bsd/dev/sweet_power.c
+@@ -0,0 +1,446 @@
++/*
++ * cheeseburger (OnePlus 5, MSM8998): CPU and GPU clocks and rails at run time (0178).
++ *
++ * The gold cluster (the four cores XNU runs on) and the A540 come up at fixed points: gold at
++ * 1728 MHz on PM8998 S13 912 mV (the shim, GOLD_L/GOLD_MV), the GPU at 412.8 MHz on PM8005 S1
++ * 700 mV (stage B). Here the same knobs move while iOS runs, so each step can be measured and
++ * stressed before anything picks them on its own:
++ *
++ *   kern.sweetcpu_l        gold PLL L (MHz = 19.2 * L), 0x20..0x66; the rail follows the table
++ *   kern.sweetcpu_mv       (read) S13 set point
++ *   kern.sweetcpu_khz      (read) gold clock measured against the timebase
++ *   kern.sweetcpu_stress   write N: N seconds of known-answer work here; reads back the errors
++ *   kern.sweetgpu_gx_mv    PM8005 S1 set point, 700..1032 mV
++ *   kern.sweetgpu_clock_l  GPU PLL L (MHz = 9.6 * L) while presenting, 13..69; needs the rail
++ *
++ * Voltages are the MSM8998 v2 CPR ceilings (downstream msm8998-v2.dtsi, the worst case of each
++ * corner, so no closed loop is needed), never below what is known to work now:
++ *   gold  apc1_perfcl: 900 mV up to 1728 MHz, 952 mV up to 1958.4 MHz (+8 mV, as the shim's 912);
++ *         never under 912 mV: the APM (800 mV) and mem-acc (852 mV) crossings are not handled.
++ *         2035.2 MHz and up (1136 mV) are left out.
++ *   GPU   gfx_vreg: 414 MHz 880 mV, 515 MHz 916, 596 MHz 968, 670 MHz 1024 (the highest fuse row).
++ *         412.8 MHz has run at 700 mV since 0121. Corners 4..8 want the GFX mem-acc at 0
++ *         (0x01fcf004 bit 0, msm8998-regulator.dtsi gfx_mem_acc_vreg).
++ * Raising: rail first, then clock. Lowering: clock first, then rail.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++int sweet_gpu_clock_runtime(uint32_t l);        /* sweet_a540_b.c */
++int sweet_gpu_clock_l(void);
++
++#define SPMI_CORE_PA    0x0800f000u
++#define SPMI_CFG_PA     0x0800a000u
++#define SPMI_OBS_PA     0x09400000u
++#define SPMI_CHNLS_PA   0x08400000u
++#define SPMI_STRIDE     0x8000u
++#define PPID_GOLD       0x138u                  /* PM8998 S13: APC1 */
++#define PPID_GX         0x514u                  /* PM8005 S1: vdd_gfx */
++
++#define GOLD_RCG_PA     0x17811000u             /* CMD +0x50, CFG +0x54 */
++#define GOLD_PLL_PA     0x17816000u             /* MODE +0, L +4 */
++#define GOLD_SEL_PLL    0x300u
++#define GOLD_SEL_GPLL0  0x400u
++#define GOLD_L_MIN      0x20u                   /* 614.4 MHz */
++#define GOLD_L_MAX      0x66u                   /* 1958.4 MHz */
++#define GOLD_MV_FLOOR   912u
++#define GOLD_MV_HIGH    960u                    /* 952 + 8 */
++#define GX_MV_MIN       700u
++#define GX_MV_MAX       1032u
++#define GFX_MEM_ACC_PA  0x01fcf000u             /* +4: acc-sel-l1 */
++
++static LCK_GRP_DECLARE(sweet_power_grp, "sweet-power");
++static LCK_MTX_DECLARE(sweet_power_lock, &sweet_power_grp);
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++
++/* ---- SPMI v3, two regulators, every mapping made once ---- */
++
++struct rail {
++	uint32_t ppid;
++	int apid;                       /* -1: not looked up, -2: not found or not ours */
++	vm_offset_t obs, chn;
++};
++static struct rail gold_rail = { PPID_GOLD, -1, 0, 0 }, gx_rail = { PPID_GX, -1, 0, 0 };
++
++static bool
++rail_ready(struct rail *r)
++{
++	static vm_offset_t core, cfg;
++	if (r->apid >= 0) {
++		return true;
++	}
++	if (r->apid == -2) {
++		return false;
++	}
++	if ((core == 0 && (core = ml_io_map(SPMI_CORE_PA, 0x1000)) == 0) ||
++	    (cfg == 0 && (cfg = ml_io_map(SPMI_CFG_PA, 0x1000)) == 0)) {
++		return false;
++	}
++	r->apid = -2;
++	for (unsigned i = 0; i < 512; i++) {
++		uint32_t map = rd(core, 0x800u + 4u * i);
++		if (map != 0 && ((map >> 8) & 0xfffu) == r->ppid && (rd(cfg, 0x700u + 4u * i) & 7u) == 0) {
++			r->apid = (int)i;
++			break;
++		}
++	}
++	if (r->apid < 0) {
++		printf("SWEET POWER: PPID 0x%x has no channel of ours\n", r->ppid);
++		return false;
++	}
++	r->obs = ml_io_map(SPMI_OBS_PA + SPMI_STRIDE * (uint32_t)r->apid, 0x1000);
++	r->chn = ml_io_map(SPMI_CHNLS_PA + SPMI_STRIDE * (uint32_t)r->apid, 0x1000);
++	if (r->obs == 0 || r->chn == 0) {
++		r->apid = -2;
++		return false;
++	}
++	return true;
++}
++
++static int
++rail_read8(struct rail *r, uint8_t reg)
++{
++	wr(r->obs, 0, (1u << 27) | ((uint32_t)reg << 4));      /* EXT_READL, 1 byte */
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = rd(r->obs, 0x08);
++		if (s & 1u) {
++			return (s & 0x0eu) ? -1 : (int)(rd(r->obs, 0x18) & 0xffu);
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* the set point in mV (FTS: 0x40 LSB, 0x41 MSB), or -1 */
++static int
++rail_mv(struct rail *r)
++{
++	if (!rail_ready(r)) {
++		return -1;
++	}
++	int lo = rail_read8(r, 0x40), hi = rail_read8(r, 0x41);
++	return (lo < 0 || hi < 0) ? -1 : (lo | hi << 8);
++}
++
++static int
++rail_set_mv(struct rail *r, uint32_t mv)
++{
++	if (!rail_ready(r)) {
++		return ENXIO;
++	}
++	wr(r->chn, 0x10, mv & 0xffffu);                  /* WDATA0: LSB, MSB */
++	wr(r->chn, 0, (0x40u << 4) | 1u);                /* EXT_WRITEL, 2 bytes */
++	for (int i = 0; i < 1000; i++) {
++		uint32_t s = rd(r->chn, 0x08);
++		if (s & 1u) {
++			if (s & 0x0eu) {
++				return EIO;
++			}
++			delay(200);                     /* FTS slew is mV per us; settle */
++			return rail_mv(r) == (int)mv ? 0 : EIO;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* ---- gold cluster clock ---- */
++
++static vm_offset_t gold_rcg, gold_pll;
++
++static bool
++gold_mapped(void)
++{
++	if (gold_rcg == 0) {
++		gold_rcg = ml_io_map(GOLD_RCG_PA, 0x1000);
++	}
++	if (gold_pll == 0) {
++		gold_pll = ml_io_map(GOLD_PLL_PA, 0x1000);
++	}
++	return gold_rcg != 0 && gold_pll != 0;
++}
++
++/* the shim's gold_rcg_select: CFG source bits 10:8, CMD UPDATE|ROOT_EN; the old CFG back on a timeout */
++static bool
++gold_select(uint32_t sel)
++{
++	uint32_t old = rd(gold_rcg, 0x54);
++	wr(gold_rcg, 0x54, (old & ~0x71fu) | sel);
++	wr(gold_rcg, 0x50, 0x3);
++	for (int i = 0; i < 1000; i++) {
++		if (!(rd(gold_rcg, 0x50) & 1u)) {
++			return true;
++		}
++		delay(1);
++	}
++	wr(gold_rcg, 0x54, old);
++	wr(gold_rcg, 0x50, 0x3);
++	return false;
++}
++
++/*
++ * The shim's gold_pll_set (clock-osm.c clk_osm_setup_cluster_pll order), with the stock waits
++ * instead of the shim's milliseconds: gold on GPLL0 meanwhile (300 MHz). Interrupts off: the
++ * cluster clock is shared by the four cores, and this one must not be preempted half way.
++ */
++static bool
++gold_pll_set(uint32_t l)
++{
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	bool ok = gold_select(GOLD_SEL_GPLL0);
++	if (ok) {
++		wr(gold_pll, 0x0, 0);                   /* off */
++		wr(gold_pll, 0x4, l);
++		delay(10);
++		wr(gold_pll, 0x0, 0x2);                 /* BYPASSNL */
++		delay(10);
++		wr(gold_pll, 0x0, 0x6);                 /* + RESET_N */
++		delay(100);                             /* stock 50-75 us */
++		wr(gold_pll, 0x0, 0x7);                 /* + OUTCTRL */
++		delay(10);
++		ok = gold_select(GOLD_SEL_PLL);         /* an update to a dead source never completes */
++	}
++	ml_set_interrupts_enabled(istate);
++	return ok;
++}
++
++static uint32_t
++gold_mv_for(uint32_t l)
++{
++	return l <= 0x5au ? GOLD_MV_FLOOR : GOLD_MV_HIGH;
++}
++
++/* cycles of a one-cycle loop against the timebase, interrupts off: the clock of this core */
++static int
++gold_measure_khz(void)
++{
++	const uint64_t n = 20000000ull;
++	uint64_t t0, t1, ns;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	t0 = mach_absolute_time();
++	__asm__ volatile ("mov x9, %0\n1: subs x9, x9, #1\n b.ne 1b" :: "r"(n) : "x9", "cc");
++	t1 = mach_absolute_time();
++	ml_set_interrupts_enabled(istate);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	return ns ? (int)(n * 1000000ull / ns) : 0;
++}
++
++static int cpu_l, cpu_khz, cpu_stress_errors;
++
++static int
++cpu_set(uint32_t l)
++{
++	int cur_mv = rail_mv(&gold_rail);
++	uint32_t want = gold_mv_for(l);
++	if (cur_mv < 850 || cur_mv > 980) {
++		printf("SWEET POWER: gold rail at %d mV: not touching it\n", cur_mv);
++		return ENXIO;
++	}
++	if (!gold_mapped()) {
++		return ENOMEM;
++	}
++	uint32_t was = rd(gold_pll, 0x4) & 0xffu;
++	if (want > (uint32_t)cur_mv) {
++		int e = rail_set_mv(&gold_rail, want);
++		if (e != 0) {
++			printf("SWEET POWER: gold rail %u mV failed (%d)\n", want, e);
++			return e;
++		}
++	}
++	if (!gold_pll_set(l)) {
++		printf("SWEET POWER: gold PLL L 0x%x failed: on GPLL0 or the old clock\n", l);
++		return EIO;
++	}
++	if (want < (uint32_t)cur_mv) {
++		(void)rail_set_mv(&gold_rail, want);
++	}
++	cpu_l = (int)l;
++	cpu_khz = gold_measure_khz();
++	printf("SWEET POWER: gold L 0x%x -> 0x%x (%u.%u MHz asked), rail %d -> %d mV, measured %d kHz\n", was, l,
++	    192u * l / 10u, 192u * l % 10u, cur_mv, rail_mv(&gold_rail), cpu_khz);
++	return 0;
++}
++
++/* the shim's known-answer work: xorshift into a buffer, summed; any difference is an error */
++static uint64_t
++stress_pass(uint64_t *buf, unsigned n)
++{
++	uint64_t a = 0x9e3779b97f4a7c15ull, sum = 0;
++	for (unsigned i = 0; i < n; i++) {
++		a ^= a << 13;
++		a ^= a >> 7;
++		a ^= a << 17;
++		buf[i] = a;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		sum = sum * 31u + buf[(i * 2654435761u) % n];
++	}
++	return sum;
++}
++
++static int
++cpu_stress(int seconds)
++{
++	static uint64_t buf[8192];
++	uint64_t ref = stress_pass(buf, 8192), end, now;
++	int errors = 0;
++	clock_interval_to_deadline((uint32_t)seconds, NSEC_PER_SEC, &end);
++	do {
++		errors += stress_pass(buf, 8192) != ref;
++		now = mach_absolute_time();
++	} while (now < end);
++	return errors;
++}
++
++/* ---- GPU rail ---- */
++
++static uint32_t
++gx_mv_for(uint32_t l)
++{
++	uint32_t mhz = 96u * l / 10u;
++	return mhz <= 413u ? GX_MV_MIN : mhz <= 515u ? 916u : mhz <= 596u ? 968u : 1024u;
++}
++
++static int
++gfx_mem_acc(int want)                           /* -1: read only */
++{
++	static vm_offset_t m;
++	if (m == 0 && (m = ml_io_map(GFX_MEM_ACC_PA, 0x1000)) == 0) {
++		return -1;
++	}
++	if (want >= 0) {
++		wr(m, 4, (rd(m, 4) & ~1u) | (uint32_t)(want & 1));
++	}
++	return (int)(rd(m, 4) & 1u);
++}
++
++static int
++gpu_set(uint32_t l)
++{
++	int gx = rail_mv(&gx_rail), need = (int)gx_mv_for(l);
++	if (gx < need) {
++		printf("SWEET POWER: GPU L %u (%u MHz) needs GX %d mV, it is at %d: set kern.sweetgpu_gx_mv first\n", l,
++		    96u * l / 10u, need, gx);
++		return EPERM;
++	}
++	int acc = gfx_mem_acc(-1);
++	if (96u * l / 10u > 413u && acc != 0) {
++		acc = gfx_mem_acc(0);                   /* corners 4..8 */
++	}
++	int e = sweet_gpu_clock_runtime(l);
++	printf("SWEET POWER: GPU L %u at GX %d mV, mem-acc %d: %d\n", l, gx, acc, e);
++	return e;
++}
++
++/* ---- sysctls ---- */
++
++static int
++sysctl_cpu_l SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = cpu_l, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || !req->newptr) {
++		return error;
++	}
++	if (v < (int)GOLD_L_MIN || v > (int)GOLD_L_MAX) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_power_lock);
++	error = cpu_set((uint32_t)v);
++	lck_mtx_unlock(&sweet_power_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetcpu_l, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_cpu_l, "I",
++    "SWEET POWER: gold PLL L (MHz = 19.2 * L), 0x20..0x66; the S13 rail follows");
++
++static int
++sysctl_cpu_mv SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = rail_mv(&gold_rail);
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetcpu_mv, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_cpu_mv, "I",
++    "SWEET POWER: PM8998 S13 (gold) set point, mV");
++
++static int
++sysctl_cpu_khz SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = gold_measure_khz();
++	return sysctl_handle_int(oidp, &v, 0, req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetcpu_khz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_cpu_khz, "I",
++    "SWEET POWER: this core's clock, measured (kHz)");
++
++static int
++sysctl_cpu_stress SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = cpu_stress_errors, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || !req->newptr) {
++		return error;
++	}
++	if (v < 1 || v > 600) {
++		return EINVAL;
++	}
++	cpu_stress_errors = cpu_stress(v);
++	printf("SWEET POWER: stress %d s at gold L 0x%x: %d errors\n", v, cpu_l, cpu_stress_errors);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetcpu_stress, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_cpu_stress,
++    "I", "SWEET POWER: write N: N seconds of known-answer work; read: the errors of the last run");
++
++static int
++sysctl_gx_mv SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = rail_mv(&gx_rail), error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || !req->newptr) {
++		return error;
++	}
++	if (v < (int)GX_MV_MIN || v > (int)GX_MV_MAX) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_power_lock);
++	int l = sweet_gpu_clock_l();
++	if (l > 0 && v < (int)gx_mv_for((uint32_t)l)) {
++		error = EPERM;                          /* lower the clock first */
++	} else {
++		error = rail_set_mv(&gx_rail, (uint32_t)v);
++	}
++	lck_mtx_unlock(&sweet_power_lock);
++	printf("SWEET POWER: GX -> %d mV: %d (now %d mV)\n", v, error, rail_mv(&gx_rail));
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_gx_mv, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_gx_mv, "I",
++    "SWEET POWER: PM8005 S1 (GX) set point, mV, 700..1032");
++
++static int
++sysctl_gpu_l SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_gpu_clock_l(), error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error != 0 || !req->newptr) {
++		return error;
++	}
++	if (v < 13 || v > 69) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_power_lock);
++	error = gpu_set((uint32_t)v);
++	lck_mtx_unlock(&sweet_power_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_clock_l, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_gpu_l, "I",
++    "SWEET POWER: GPU PLL L while presenting (MHz = 9.6 * L), 13..69; needs kern.sweetgpu_gx_mv");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
