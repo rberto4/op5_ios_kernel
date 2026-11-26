@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 01:40:00 +0100
+Subject: [PATCH] cheeseburger: IOKit side of Wi-Fi for iOS (wifid)
+
+AppleCLCD::start calls sweet_mss_boot_init() (boot-arg sweetwifi, 0172), as topaz 0113 does.
+From topaz 0900 (APSL 2.0, darwin-redwood / HackiOS): RedwoodWLAN (IO80211Controller +
+an IONetworkInterface with IO80211InterfaceRole Infrastructure for wifid and configd),
+MiniIONetworkStack (configd's interface namer reports the registry quiet), and
+AppleKeyStore kAKSWrapKey / kAKSUnwrapKey so the keychain can store network passwords.
+
+---
+diff --git a/iokit/Kernel/arm/MiniIONetworkStack.cpp b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+new file mode 100644
+index 0000000..081fd35
+--- /dev/null
++++ b/iokit/Kernel/arm/MiniIONetworkStack.cpp
+@@ -0,0 +1,114 @@
++/*
++ * MiniIONetworkStack: a stand-in for IONetworkStack of Apple's IONetworkingFamily, as seen by
++ * configd's interface namer.
++ *
++ * The real one gives the BSD names (en0, en1, ...) to the IONetworkInterface objects of the
++ * drivers, when the interface namer asks. Here interfaces are made with the BSD interface KPI
++ * (bsd/dev/redwood_net.c) and are born with their names, so there is never anything to name.
++ * But the namer wants this object all the same: until it has opened it, it does not say in
++ * configd's store that the registry has gone quiet (the key Plugin:InterfaceNamer, "*QUIET*"),
++ * and gives up only after five minutes ("*TIMEOUT*"). SystemConfiguration's
++ * SCNetworkInterfaceCopyAll() waits for one of the two, and with it whoever asks for the list of
++ * interfaces: wifid as soon as it has a device, and behind wifid SpringBoard.
++ *
++ * So: the service, a user client that can be opened, and a refusal of the naming request.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++extern "C" void MiniIONetworkStackStart(void);
++
++class IONetworkStack : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	setName("IONetworkStack");
++	registerService();
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++bool
++IONetworkStackUserClient::start(IOService * provider)
++{
++	char who[32] = "?";
++
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	/* whether the registry is quiet at this moment is what the namer goes on to ask */
++	proc_selfname(who, sizeof(who));
++	IOLog("MiniIONetworkStack: opened by %s; the registry's busy state is %u\n", who,
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	return true;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++/* "Name this interface" (a dictionary: IONetworkStackUserCommand, IOPathMatch, IOInterfaceUnit). */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject * properties)
++{
++	static unsigned said;
++
++	if (said++ < 4) {
++		IOLog("MiniIONetworkStack: asked to name an interface: there are none of that kind\n");
++	}
++	return kIOReturnUnsupported;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++void
++MiniIONetworkStackStart(void)
++{
++	/* where the real one is: IOService:/IOResources/IONetworkStack */
++	IOService * resources = IOService::getResourceService();
++	IONetworkStack * stack = OSTypeAlloc(IONetworkStack);
++
++	if (resources == NULL || stack == NULL || !stack->init() || !stack->attach(resources)) {
++		OSSafeReleaseNULL(stack);
++		IOLog("MiniIONetworkStack: cannot create the service\n");
++		return;
++	}
++	if (!stack->start(resources)) {
++		stack->detach(resources);
++	}
++	stack->release();
++}
+diff --git a/iokit/Kernel/arm/RedwoodWLAN.cpp b/iokit/Kernel/arm/RedwoodWLAN.cpp
+new file mode 100644
+index 0000000..89d8840
+--- /dev/null
++++ b/iokit/Kernel/arm/RedwoodWLAN.cpp
+@@ -0,0 +1,137 @@
++/*
++ * RedwoodWLAN: the registry entries by which iOS finds the Wi-Fi interface.
++ *
++ * en0 is made with the BSD interface KPI (bsd/dev/redwood_net.c) and has no IOKit object behind
++ * it of its own; iOS looks for two, as IO80211Family would have made them:
++ *
++ *   - wifid's device is whatever service has the property IO80211InterfaceRole =
++ *     "Infrastructure", and IO80211.framework binds to an interface through a service whose
++ *     IOInterfaceName is the interface's name. The service has no user client, on purpose:
++ *     the framework's attempt to open one fails, it says "Falling back to IOCTL path", and
++ *     from then on every request is an ioctl on a socket, which bsd/dev/redwood_apple80211.c
++ *     answers.
++ *   - SystemConfiguration (SCNetworkInterfaceCopyAll) lists the network interfaces it finds as
++ *     objects of the class IONetworkInterface, and calls one a Wi-Fi interface when its parent
++ *     is of the class IO80211Controller; type, unit, name and built-in-ness are properties of
++ *     the interface, the hardware address one of the controller. configd makes a network
++ *     service (DHCP and the rest) for an interface it has listed, and only an interface with a
++ *     service can be the one the system routes through -- which wifid waits for after a join
++ *     ("failed to become routable interface") before Settings ticks the network.
++ *
++ * So: a controller of the class IO80211Controller under the platform, and below it one object
++ * that is both, an IONetworkInterface with wifid's properties. Both classes are ours, named as
++ * IO80211Family and IONetworkingFamily name theirs; neither has anything but properties.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++
++extern "C" void RedwoodWLANStart(const char * interface, const uint8_t * address);
++
++class IO80211Controller : public IOService
++{
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class RedwoodWLAN : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(RedwoodWLAN);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodWLAN, IONetworkInterface);
++
++/* There is none (see the top); that somebody asked shows that the service was found. */
++IOReturn
++RedwoodWLAN::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties, IOUserClient ** handler)
++{
++	static unsigned said;
++
++	if (said++ < 8) {
++		IOLog("RedwoodWLAN: a user client of type %u is asked for: there is none\n", (unsigned) type);
++	}
++	return kIOReturnUnsupported;
++}
++
++/* attach, start, register: the service, or NULL */
++static IOService *
++publish(IOService * service, IOService * provider, const char * name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++/* Once, when the interface of a radio exists. */
++void
++RedwoodWLANStart(const char * interface, const uint8_t * address)
++{
++	IOService * platform = IOService::getPlatform();
++	IO80211Controller * controller = OSTypeAlloc(IO80211Controller);
++	RedwoodWLAN * wlan = OSTypeAlloc(RedwoodWLAN);
++	OSData * mac;
++	OSNumber * number;
++
++	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(wlan);
++		IOLog("RedwoodWLAN: cannot create the services\n");
++		return;
++	}
++	if ((mac = OSData::withBytes(address, 6)) != NULL) {
++		controller->setProperty("IOMACAddress", mac);
++		mac->release();
++	}
++	controller->setProperty("IOBuiltin", true);
++	if ((controller = (IO80211Controller *) publish(controller, platform, "RedwoodWLANController")) == NULL) {
++		wlan->release();
++		IOLog("RedwoodWLAN: the controller did not start\n");
++		return;
++	}
++
++	wlan->setProperty("IOInterfaceName", interface);
++	wlan->setProperty("BSD Name", interface);
++	wlan->setProperty("IOInterfaceNamePrefix", "en");
++	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
++		wlan->setProperty("IOInterfaceType", number);
++		number->release();
++	}
++	if ((number = OSNumber::withNumber((unsigned long long) (interface[2] - '0'), 32)) != NULL) {
++		wlan->setProperty("IOInterfaceUnit", number);
++		number->release();
++	}
++	wlan->setProperty("IOBuiltin", true);
++	wlan->setProperty("IOPrimaryInterface", true);
++	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (publish(wlan, controller, "RedwoodWLAN") == NULL) {
++		IOLog("RedwoodWLAN: the service did not start\n");
++	} else {
++		wlan->release();
++	}
++	controller->release();
++}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0399674..5477bd6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void sweet_mss_boot_init(void);   /* bsd/dev/sweet_mss.c: boot-arg sweetwifi=1 (0172) */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+@@ -251,6 +252,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	sweet_mss_boot_init();                  /* Wi-Fi for the session, when asked for (as topaz 0113) */
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 1dac29f..dab9d30 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -229,6 +229,49 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	/*
++	 * (from HackiOS) kAKSWrapKey / kAKSUnwrapKey: securityd wraps each keychain item's key with
++	 * its protection class before storing it. No SEP, no secret: a mark, the class and the key
++	 * mixed with a fixed pattern, 8 bytes longer like AES key wrap. Without them no keychain item
++	 * (wifid's network passwords among them) could be stored.
++	 */
++	case kAKSWrapKey: {
++		uint8_t wrapped[8 + 64];
++		size_t len = args->structureInputSize;
++		if (args->structureInput == NULL || len == 0 || len > 64 || in_scalars < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(wrapped, "HKwr", 4);
++		wrapped[4] = (uint8_t)args->scalarInput[1];
++		wrapped[5] = wrapped[6] = wrapped[7] = 0;
++		memcpy(wrapped + 8, args->structureInput, len);
++		for (size_t i = 0; i < len; i++) {
++			wrapped[8 + i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++			args->scalarOutputCount = 1;
++		}
++		ret = sweet_aks_struct_out(args, wrapped, (uint32_t)(8 + len));
++		break;
++	}
++	case kAKSUnwrapKey: {
++		uint8_t key[64];
++		const uint8_t *w = (const uint8_t *)args->structureInput;
++		size_t len = args->structureInputSize;
++		if (w == NULL || len <= 8 || len > 8 + sizeof(key) || memcmp(w, "HKwr", 4) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(key, w + 8, len - 8);
++		for (size_t i = 0; i < len - 8; i++) {
++			key[i] ^= (uint8_t)(0x5a + 37 * i);
++		}
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, key, (uint32_t)(len - 8));
++		break;
++	}
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index e45acbc..a3ca8a0 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,3 +21,5 @@ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
++iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
+-- 
+2.43.0

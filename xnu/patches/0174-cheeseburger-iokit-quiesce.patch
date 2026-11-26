@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 01:45:00 +0100
+Subject: [PATCH] cheeseburger: with sweetwifi, no registry-root busy hold for
+ the IOKit daemon (from topaz 0128)
+
+No IOKit daemon ever reports that it has launched (no kexts to manage), so the hold kept the
+registry root busy forever: IOKit never quiesced, configd's InterfaceNamer never said "quiet",
+and wifid (and SpringBoard behind it) waited for that at boot (topaz 0128). Only with boot-arg
+sweetwifi, so that boots without Wi-Fi stay as they are.
+
+---
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 59c834e..45c4ffd 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,6 +1200,12 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* the hold was not taken with sweetwifi (IOStartIOKit.cpp) */
++	int sweet_wifi = 0;
++	(void)PE_parse_boot_argn("sweetwifi", &sweet_wifi, sizeof(sweet_wifi));
++	if (sweet_wifi <= 0)
++#endif
+ 	getServiceRoot()->adjustBusy(-1);
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..b55e4b6 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,7 +188,18 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET with boot-arg sweetwifi: no IOKit daemon ever reports that it has launched, so this
++	 * hold kept the registry root busy forever and configd's InterfaceNamer (and wifid, and
++	 * SpringBoard behind it) waited for a quiet registry (topaz 0128).
++	 */
++	int sweet_wifi = 0;
++	(void)PE_parse_boot_argn("sweetwifi", &sweet_wifi, sizeof(sweet_wifi));
++	if (sweet_wifi <= 0 && OSKext::iokitDaemonAvailable()) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+-- 
+2.43.0

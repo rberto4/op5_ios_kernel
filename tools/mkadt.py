@@ -4,7 +4,10 @@
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the OnePlus 5 (cheeseburger, MSM8998) device tree: mainline
 msm8998.dtsi / msm8998-oneplus-common.dtsi and the OnePlus msm8998 kernel.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--native] [--container MAP]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--native] [--wlan] [--container MAP]
+
+--wlan: a "wlan" node, so that launchd starts wifid (boot-arg sweetwifi=1 gives it
+en0 and Apple80211, kernel 0172-0174).
 
 --container MAP: the iOS root is a file in Android's userdata (PORT-OP5.md
 "Keeping Android"); MAP is the output of `ioscont map /data/ios/root.img`.
@@ -127,7 +130,7 @@ def container_extents(path):
     return ext
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, container=None):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, container=None, wlan=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     if midmem:
         raise SystemExit('--midmem is topaz-only: on MSM8998 RAM from 0x80000000 holds XPU carve-outs')
@@ -243,8 +246,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cont
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone 8 size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
-        # No "wlan" node: launchd only starts wifid with one, and there is no
-        # Wi-Fi driver for the WCN3990 yet (topaz's lives in patches-topaz/).
+        # "wlan" only with --wlan: launchd starts wifid only when the device tree
+        # has one (com.apple.wifid _LimitLoadToDeviceTree = wlan, marconi-wifi), and
+        # wifid needs the kernel's en0 + Apple80211 (boot-arg sweetwifi=1, 0172-0174).
+        ] + ([node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('cheeseburger,wcn3990')),
+        ])] if wlan else []) + [
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -323,7 +332,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, cont
 if __name__ == '__main__':
     cmap = sys.argv[sys.argv.index('--container') + 1] if '--container' in sys.argv else None
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv, wlan='--wlan' in sys.argv,
                  container=container_extents(cmap) if cmap else None)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

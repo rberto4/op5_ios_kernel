@@ -41,6 +41,11 @@ stage2)
 	;;
 esac
 [[ -n $extra ]] && args="$args $extra"
+# WLAN=1: a "wlan" ADT node (launchd starts wifid) and boot-arg sweetwifi=1 (kernel 0172-0174)
+if [[ ${WLAN:-0} == 1 ]]; then
+	adt_args+=(--wlan)
+	args="$args sweetwifi=1"
+fi
 
 out=shim/out
 mkdir -p "$out"
