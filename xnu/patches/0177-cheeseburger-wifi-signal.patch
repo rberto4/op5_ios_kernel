@@ -1,0 +1,201 @@
+From 349e738a2f75c072129fd9bb9799adcc588a521d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 26 Nov 2026 16:34:05 +0100
+Subject: [PATCH] cheeseburger: Wi-Fi signal for wifid (the status bar's bars)
+
+RSSI_CHANGED (39) with the 0x250-byte link quality record, every 2 s while
+joined when the access point's RSSI moved by 3 dB, and at each join. NOISE (17)
+and RSSI_BOUNDS (106) answered. kev_post_msg takes messages up to a cluster:
+the record does not fit in a plain mbuf (EMSGSIZE before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/redwood_apple80211.c | 42 ++++++++++++++++++++++++++++++++----
+ bsd/dev/sweet_wifi_ios.c     | 40 ++++++++++++++++++++++++++++++++++
+ bsd/kern/kern_event.c        |  9 +++++---
+ bsd/sys/redwood_sta.h        |  3 ++-
+ 4 files changed, 86 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+index e2674ee..c4f162e 100644
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -193,7 +193,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+ 
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10 };
++       EVENT_SCAN_DONE = 10, EVENT_RSSI_CHANGED = 39 };
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -385,6 +385,11 @@ get(struct apple80211req *request)
+ 		kfree_data(bss, sizeof(*bss));
+ 		return error;
+ 	}
++	case 106: {                             /* the RSSI scale: {version, weakest, strongest, the roam trigger} in dBm */
++		struct { uint32_t version; int32_t low, high, roam; } answer = { .version = 1, .low = -90, .high = -40, .roam = -80 };
++
++		return give(request, &answer, sizeof(answer));
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -423,12 +428,13 @@ get(struct apple80211req *request)
+ 		}
+ 		break;
+ 	}
+-	case 16: {                              /* how strongly it is heard: dBm, per radio and all together, twice over */
++	case 16:                                /* how strongly it is heard: dBm, per radio and all together, twice over */
++	case 17: {                              /* the noise, in the same record (0177: the radio does not say; a quiet -95) */
++		int32_t v = request->req_type == 17 ? -95 : state->bss.rssi;
+ 		struct {
+ 			uint32_t version, radios, unit;
+ 			int32_t each[4], all, each_ext[4], all_ext;
+-		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
+-			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
++		} answer = { .version = 1, .radios = 1, .each = { v }, .all = v, .each_ext = { v }, .all_ext = v };
+ 
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+@@ -613,6 +619,34 @@ post(uint32_t code, const void *data, uint32_t length)
+ 	kev_post_msg(&message);
+ }
+ 
++/*
++ * 0177: the signal, as wifid follows it. wifid reads the RSSI request once, at the join, and from then on
++ * takes the signal (the status bar's bars, Settings') from APPLE80211_M_RSSI_CHANGED (39): a link quality
++ * record of 0x250 bytes, of which: RSSI valid (byte 0x00) and the RSSI in dBm (int32 at 0x04), noise valid
++ * (0x0e) and the noise (int16 at 0x10), the transmit and receive rates in kb/s (0x90, 0x98). The rest zero.
++ * (Layout as described by OneiOS, kernel/patches/oneios-hosted/net/OneiOSWifi.cpp; written anew here.)
++ */
++#define LQM_SIZE 0x250
++
++void
++redwood_apple80211_signal(int32_t rssi, int32_t noise, uint32_t rate_kbps)
++{
++	uint8_t *lqm = kalloc_data(LQM_SIZE, Z_WAITOK | Z_ZERO);
++	int16_t noise16 = (int16_t)noise;
++
++	if (lqm == NULL) {
++		return;
++	}
++	lqm[0x00] = 1;
++	memcpy(lqm + 0x04, &rssi, sizeof(rssi));
++	lqm[0x0e] = 1;
++	memcpy(lqm + 0x10, &noise16, sizeof(noise16));
++	memcpy(lqm + 0x90, &rate_kbps, sizeof(rate_kbps));
++	memcpy(lqm + 0x98, &rate_kbps, sizeof(rate_kbps));
++	post(EVENT_RSSI_CHANGED, lqm, LQM_SIZE);
++	kfree_data(lqm, LQM_SIZE);
++}
++
+ /* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
+ void
+ redwood_apple80211_event(enum redwood_sta_event event, int status)
+diff --git a/bsd/dev/sweet_wifi_ios.c b/bsd/dev/sweet_wifi_ios.c
+index ad6a8b0..182f183 100644
+--- a/bsd/dev/sweet_wifi_ios.c
++++ b/bsd/dev/sweet_wifi_ios.c
+@@ -156,6 +156,42 @@ static struct redwood_net_link sta_link = {
+ 	.poll = NULL,
+ };
+ 
++/*
++ * 0177: the signal for wifid (the bars): every 2 s while joined, an RSSI_CHANGED record when the join is
++ * new or the access point's RSSI (refreshed by the scans) moved by SIGNAL_STEP_DB or more.
++ */
++#define SIGNAL_PERIOD_MS        2000
++#define SIGNAL_STEP_DB          3
++#define SIGNAL_NOISE_DBM        (-95)
++#define SIGNAL_RATE_KBPS        (433u * 1000u)          /* VHT80 1x1 MCS9: the radio does not say */
++
++extern void IOSleep(unsigned int milliseconds);
++
++static void
++sta_signal_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static struct sweet_wlan_bss t;
++	bool sent = false;
++	int32_t last = 0;
++
++	for (;;) {
++		IOSleep(SIGNAL_PERIOD_MS);
++		if (!sweet_wlan_api_joined() || !sweet_wlan_api_current(&t)) {
++			sent = false;
++			continue;
++		}
++		int32_t rssi = t.rssi, step = rssi > last ? rssi - last : last - rssi;
++		if (!sent || step >= SIGNAL_STEP_DB) {
++			redwood_apple80211_signal(rssi, SIGNAL_NOISE_DBM, SIGNAL_RATE_KBPS);
++			if (!sent) {
++				printf("SWEET WIFI: signal %d dBm to wifid (RSSI_CHANGED)\n", rssi);
++			}
++			sent = true;
++			last = rssi;
++		}
++	}
++}
++
+ /* from the radio's thread, once its first scan is over: the work goes on a thread of its own */
+ static void
+ sta_bring_up(__unused void *arg, __unused wait_result_t wr)
+@@ -170,6 +206,10 @@ sta_bring_up(__unused void *arg, __unused wait_result_t wr)
+ 		if (sweet_wlan_api_joined()) {
+ 			sta_link_changed(true);         /* joined already (wlan.conf): tell configd */
+ 		}
++		thread_t signal;
++		if (kernel_thread_start(sta_signal_thread, NULL, &signal) == KERN_SUCCESS) {
++			thread_deallocate(signal);
++		}
+ 	}
+ 	thread_terminate(current_thread());
+ }
+diff --git a/bsd/kern/kern_event.c b/bsd/kern/kern_event.c
+index 849316c..2e59c1d 100644
+--- a/bsd/kern/kern_event.c
++++ b/bsd/kern/kern_event.c
+@@ -8312,7 +8312,10 @@ kev_post_msg_internal(struct kev_msg *event_msg, int wait)
+ 	}
+ #endif /* SKYWALK && XNU_TARGET_OS_OSX */
+ 
+-	/* Verify the message is small enough to fit in one mbuf w/o cluster */
++	/*
++	 * Verify the message fits in one mbuf, with a cluster when it is larger than a plain one
++	 * (cheeseburger 0177: Apple80211's RSSI_CHANGED carries a 592-byte link quality record).
++	 */
+ 	total_size = KEV_MSG_HEADER_SIZE;
+ 
+ 	for (i = 0; i < 5; i++) {
+@@ -8322,12 +8325,12 @@ kev_post_msg_internal(struct kev_msg *event_msg, int wait)
+ 		total_size += event_msg->dv[i].data_length;
+ 	}
+ 
+-	if (total_size > MLEN) {
++	if (total_size > MCLBYTES) {
+ 		os_atomic_inc(&kevtstat.kes_toobig, relaxed);
+ 		return EMSGSIZE;
+ 	}
+ 
+-	m = m_get(wait, MT_DATA);
++	m = total_size > MLEN ? m_getcl(wait, MT_DATA, 0) : m_get(wait, MT_DATA);
+ 	if (m == 0) {
+ 		os_atomic_inc(&kevtstat.kes_nomem, relaxed);
+ 		return ENOMEM;
+diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
+index c5ed067..1c357bb 100644
+--- a/bsd/sys/redwood_sta.h
++++ b/bsd/sys/redwood_sta.h
+@@ -116,7 +116,8 @@ bool     redwood_sta_address(uint8_t *address);
+ 
+ /* ---- the listener: bsd/dev/redwood_apple80211.c ---- */
+ void     redwood_apple80211_event(enum redwood_sta_event event, int status);
+-void     redwood_apple80211_summary(void);                              /* what was asked in this run, to the log */
++void     redwood_apple80211_summary(void);
++void     redwood_apple80211_signal(int32_t rssi, int32_t noise, uint32_t rate_kbps);   /* RSSI_CHANGED (0177) */                              /* what was asked in this run, to the log */
+ #endif
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+
